@@ -51,6 +51,43 @@ class EavValue
     }
 
     /**
+     * Delete specific value rows, e.g. for explicit attribute clearing.
+     * Deleting a store-scoped row makes that store fall back to the
+     * default-scope value.
+     *
+     * @param string $backendType one of BACKEND_TYPES
+     * @param array<int, array{link_id: int, attribute_id: int, store_id: int}> $keys
+     */
+    public function delete(string $backendType, array $keys): void
+    {
+        if (!$keys) {
+            return;
+        }
+        if (!in_array($backendType, self::BACKEND_TYPES, true)) {
+            throw new \InvalidArgumentException(sprintf('Unsupported EAV backend type "%s".', $backendType));
+        }
+
+        $connection = $this->resourceConnection->getConnection();
+        $table = $this->resourceConnection->getTableName('catalog_product_entity_' . $backendType);
+        $linkField = $connection->quoteIdentifier($this->productEntity->getLinkField());
+        foreach (array_chunk($keys, self::INSERT_CHUNK) as $chunk) {
+            $tuples = array_map(
+                static fn (array $key): string => sprintf(
+                    '(%d,%d,%d)',
+                    $key['link_id'],
+                    $key['attribute_id'],
+                    $key['store_id']
+                ),
+                $chunk
+            );
+            $connection->delete(
+                $table,
+                sprintf('(%s, attribute_id, store_id) IN (%s)', $linkField, implode(',', $tuples))
+            );
+        }
+    }
+
+    /**
      * @param string $backendType one of BACKEND_TYPES
      * @param array<int, array{attribute_id: int, store_id: int, value: mixed}> $rows
      *        each row must also contain the link field column (entity_id/row_id)

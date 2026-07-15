@@ -31,12 +31,28 @@ Authorization: Bearer <integration token>   (ACL: ReadyData_Import::import)
       "custom_attributes": [
         {"attribute_code": "color", "value": "Red"},
         {"attribute_code": "description", "value": "<p>Long text</p>"}
-      ]
+      ],
+      "clear_attributes": ["special_label"]
     }
   ],
   "settings": {"store_view_code": "default", "continue_on_error": true}
 }
 ```
+
+### Clearing attribute values
+
+A `null` (or absent) value in `custom_attributes` means **leave unchanged** —
+safe for sparse feeds. To actually remove a stored value, list the attribute
+code in `clear_attributes`. A clear DELETEs the EAV value row in the same
+scope a write would target: global attributes at the default scope,
+store-scoped attributes at the request's `store_view_code` (a cleared store
+row falls back to the default value, like "Use Default" in the admin).
+
+Guards (each a per-product warning in `results[].messages`, never fatal):
+unknown and static attributes are skipped; required attributes cannot be
+cleared at the default scope; when the same attribute is both written and
+cleared, the write wins. Clearing `url_key` does not remove existing URL
+rewrites.
 
 Response: summary counters (`received`, `created`, `updated`, `failed`,
 `elapsedMs`) plus a per-SKU `results` array with `status` and `messages`.

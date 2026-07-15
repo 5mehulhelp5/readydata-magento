@@ -43,6 +43,7 @@ class EavValueProcessor implements ProcessorInterface
         $linkField = $this->productEntity->getLinkField();
         $urlKeys = [];
         $rowsByType = [];
+        $deleteKeysByType = [];
 
         foreach ($context->getValidProducts() as $sku => $product) {
             $linkId = $linkIds[$sku] ?? null;
@@ -52,6 +53,7 @@ class EavValueProcessor implements ProcessorInterface
             }
 
             $values = $this->collectValues($context, $product);
+            $this->collectClearKeys($context, $product, $values, $linkId, $deleteKeysByType);
             if (isset($values['url_key'])) {
                 $urlKeys[$sku] = (string)$values['url_key'];
             }
@@ -97,8 +99,65 @@ class EavValueProcessor implements ProcessorInterface
         foreach ($rowsByType as $backendType => $rows) {
             $this->eavValue->upsert((string)$backendType, $rows);
         }
+        foreach ($deleteKeysByType as $backendType => $keys) {
+            $this->eavValue->delete((string)$backendType, $keys);
+        }
 
         $context->set(self::CONTEXT_URL_KEYS, $urlKeys);
+    }
+
+    /**
+     * Collect EAV delete keys for the product's clear_attributes list,
+     * guarded so a clear can never corrupt the product: unknown and static
+     * attributes are skipped, required attributes cannot be cleared at the
+     * default scope (store-scoped clears fall back to the default value),
+     * and an attribute both written and cleared keeps the written value.
+     *
+     * @param array<string, string|int|float> $writtenValues collectValues() output
+     * @param array<string, array<int, array{link_id: int, attribute_id: int, store_id: int}>> $deleteKeysByType
+     */
+    private function collectClearKeys(
+        BatchContext $context,
+        ProductInterface $product,
+        array $writtenValues,
+        int $linkId,
+        array &$deleteKeysByType
+    ): void {
+        $codes = array_unique(array_filter(array_map('trim', $product->getClearAttributes() ?? [])));
+        foreach ($codes as $code) {
+            $meta = $this->attributeMetadataCache->get($code);
+            if ($meta === null) {
+                $context->addMessage($product->getSku(), sprintf('Unknown attribute "%s" skipped.', $code));
+                continue;
+            }
+            if ($meta['backend_type'] === 'static') {
+                $context->addMessage(
+                    $product->getSku(),
+                    sprintf('Attribute "%s" is static and cannot be cleared.', $code)
+                );
+                continue;
+            }
+            if (isset($writtenValues[$code])) {
+                $context->addMessage(
+                    $product->getSku(),
+                    sprintf('Attribute "%s" is both written and cleared; the write wins.', $code)
+                );
+                continue;
+            }
+            $storeId = $meta['is_global'] === self::SCOPE_GLOBAL ? 0 : $context->getStoreId();
+            if ($storeId === 0 && $meta['is_required'] === 1) {
+                $context->addMessage(
+                    $product->getSku(),
+                    sprintf('Attribute "%s" is required and cannot be cleared at default scope.', $code)
+                );
+                continue;
+            }
+            $deleteKeysByType[$meta['backend_type']][] = [
+                'link_id' => $linkId,
+                'attribute_id' => $meta['attribute_id'],
+                'store_id' => $storeId,
+            ];
+        }
     }
 
     /**

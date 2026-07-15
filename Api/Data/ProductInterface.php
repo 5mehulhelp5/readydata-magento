@@ -28,6 +28,7 @@ interface ProductInterface
     public const WEBSITES = 'websites';
     public const STOCK = 'stock';
     public const CUSTOM_ATTRIBUTES = 'custom_attributes';
+    public const CLEAR_ATTRIBUTES = 'clear_attributes';
 
     /**
      * @return string
@@ -173,4 +174,22 @@ interface ProductInterface
      * @return $this
      */
     public function setCustomAttributes(array $customAttributes): self;
+
+    /**
+     * Attribute codes whose stored value should be DELETED in the request's
+     * store scope (global attributes always clear the default scope). A
+     * cleared store-scoped value falls back to the default value. Static,
+     * unknown, and — at default scope — required attributes are skipped with
+     * a per-product warning. When the same attribute is also written in this
+     * product, the write wins and the clear is skipped.
+     *
+     * @return string[]|null
+     */
+    public function getClearAttributes(): ?array;
+
+    /**
+     * @param string[] $clearAttributes
+     * @return $this
+     */
+    public function setClearAttributes(array $clearAttributes): self;
 }

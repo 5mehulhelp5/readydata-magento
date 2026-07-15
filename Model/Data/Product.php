@@ -23,6 +23,7 @@ class Product implements ProductInterface
     private ?array $websites = null;
     private ?StockDataInterface $stock = null;
     private ?array $customAttributes = null;
+    private ?array $clearAttributes = null;
 
     public function getSku(): string
     {
@@ -153,6 +154,17 @@ class Product implements ProductInterface
     public function setCustomAttributes(array $customAttributes): ProductInterface
     {
         $this->customAttributes = $customAttributes;
+        return $this;
+    }
+
+    public function getClearAttributes(): ?array
+    {
+        return $this->clearAttributes;
+    }
+
+    public function setClearAttributes(array $clearAttributes): ProductInterface
+    {
+        $this->clearAttributes = $clearAttributes;
         return $this;
     }
 }
