@@ -226,9 +226,32 @@ class EavValueProcessor implements ProcessorInterface
                 'false', 'no' => 0,
                 default => (int)$value,
             },
-            'decimal' => (float)$value,
+            'decimal' => is_numeric($value) ? (float)$value : null,
+            'datetime' => $this->normalizeDatetime($value),
             default => $value,
         };
+    }
+
+    /**
+     * Normalize any parseable date string to the MySQL DATETIME format in UTC.
+     * Offset-less values are taken as already-UTC (never the server timezone,
+     * which would shift them). Returns null for unparseable input; an empty
+     * string must not fall through to the parser, which would read it as "now".
+     */
+    private function normalizeDatetime(string $value): ?string
+    {
+        if (trim($value) === '') {
+            return null;
+        }
+
+        $utc = new \DateTimeZone('UTC');
+        try {
+            return (new \DateTimeImmutable($value, $utc))
+                ->setTimezone($utc)
+                ->format('Y-m-d H:i:s');
+        } catch (\Exception) {
+            return null;
+        }
     }
 
     public function isEnabled(): bool

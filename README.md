@@ -137,6 +137,15 @@ steps: implement `ProcessorInterface`, register in `etc/di.xml`
   category-save plugins and observers DO run for them.
 - Duplicate sibling category names are ambiguous; path resolution picks the
   lowest entity_id, deterministically.
+- **Value coercion**: datetime attribute values are normalized to UTC
+  `Y-m-d H:i:s` (offset-less input is taken as already-UTC); unparseable
+  datetime and non-numeric decimal values are skipped with a per-SKU
+  message, never written. No cross-field checks (e.g. `special_from_date`
+  vs `special_to_date`) — validate windows at the source.
+- Attribute scope handling only distinguishes global (`is_global = 1`,
+  written at store 0) from store-view scope. Website-scoped attributes
+  (e.g. prices under "Catalog Price Scope: Website") are written at the
+  request's store-view scope, not fanned out per website.
 - **Adobe Commerce (EE) staging**: updates work; creating new products on a
   staged catalog is not yet supported (clear per-product error is returned).
 - Run indexers in "Update by Schedule" mode for best throughput.
