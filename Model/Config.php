@@ -31,6 +31,7 @@ class Config
     private const XML_PATH_INDEXING_MODE = 'readydata_import/indexing/mode';
     private const XML_PATH_CLEAN_CACHE = 'readydata_import/indexing/clean_cache';
     private const XML_PATH_LOGGING_ENABLED = 'readydata_import/logging/enabled';
+    private const XML_PATH_DISPATCH_PRODUCT_EVENTS = 'readydata_import/events/dispatch_product_events';
 
     public function __construct(
         private readonly ScopeConfigInterface $scopeConfig
@@ -79,5 +80,14 @@ class Config
     public function isLoggingEnabled(): bool
     {
         return $this->scopeConfig->isSetFlag(self::XML_PATH_LOGGING_ENABLED);
+    }
+
+    /**
+     * Master switch for re-emitting product lifecycle events (commit_after +
+     * the custom import events) after each committed batch.
+     */
+    public function isDispatchProductEvents(): bool
+    {
+        return $this->scopeConfig->isSetFlag(self::XML_PATH_DISPATCH_PRODUCT_EVENTS);
     }
 }

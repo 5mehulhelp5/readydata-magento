@@ -17,6 +17,7 @@ use ReadyData\Import\Api\Data\ImportSettingsInterface;
 use ReadyData\Import\Api\Data\ProductInterface;
 use ReadyData\Import\Logger\Logger;
 use ReadyData\Import\Model\Cache\StoreWebsiteMap;
+use ReadyData\Import\Model\Event\ImportEventDispatcher;
 use ReadyData\Import\Model\Indexer\InvalidationHandler;
 use ReadyData\Import\Model\Processor\CategoryLinkProcessor;
 use ReadyData\Import\Model\Processor\ProcessorInterface;
@@ -45,6 +46,8 @@ class ImportService
         private readonly BatchContextFactory $batchContextFactory,
         private readonly StoreWebsiteMap $storeWebsiteMap,
         private readonly InvalidationHandler $invalidationHandler,
+        private readonly ImportEventDispatcher $eventDispatcher,
+        private readonly ImportState $importState,
         private readonly ImportResponseInterfaceFactory $responseFactory,
         private readonly ImportResultInterfaceFactory $resultFactory,
         private readonly Logger $logger,
@@ -87,6 +90,7 @@ class ImportService
         /** @var BatchContext[] $contexts */
         $contexts = [];
 
+        $this->importState->enter();
         try {
             foreach (array_chunk($products, $batchSize) as $batchNumber => $batch) {
                 $context = $this->batchContextFactory->create([
@@ -113,6 +117,7 @@ class ImportService
             ));
             $this->invalidationHandler->execute($affectedIds, $affectedCategoryIds);
         } finally {
+            $this->importState->leave();
             $this->lockManager->unlock(self::LOCK_NAME);
         }
 
@@ -145,7 +150,11 @@ class ImportService
                     $processor->process($context);
                 }
             }
+            // Inside the transaction: a throwing save_after observer rolls the batch back.
+            $this->eventDispatcher->dispatchBeforeCommit($context);
             $connection->commit();
+            // After commit: guarded internally so observer failures don't fail the import.
+            $this->eventDispatcher->dispatchAfterCommit($context);
 
             return true;
         } catch (\Throwable $e) {

@@ -29,10 +29,13 @@ use ReadyData\Import\Model\ResourceModel\CategoryLink;
  * Publishes to the context data bag:
  *  - "affected_category_ids": int[] category IDs whose product set changed;
  *    consumed by InvalidationHandler for FPC tag cleaning.
+ *  - "affected_product_ids": int[] product IDs whose category links changed;
+ *    consumed by ImportEventDispatcher for the category-changed event.
  */
 class CategoryLinkProcessor implements ProcessorInterface
 {
     public const CONTEXT_AFFECTED_CATEGORY_IDS = 'affected_category_ids';
+    public const CONTEXT_AFFECTED_PRODUCT_IDS = 'affected_product_ids';
 
     public function __construct(
         private readonly CategoryLink $categoryLink,
@@ -91,6 +94,7 @@ class CategoryLinkProcessor implements ProcessorInterface
         $toInsert = [];
         $toDelete = [];
         $touchedCategoryIds = [];
+        $touchedProductIds = [];
 
         foreach ($refsBySku as $sku => $refs) {
             $partial = $refs['partial'];
@@ -128,6 +132,7 @@ class CategoryLinkProcessor implements ProcessorInterface
                         'position' => 0,
                     ];
                     $touchedCategoryIds[$categoryId] = true;
+                    $touchedProductIds[$entityId] = true;
                 }
             }
 
@@ -146,6 +151,7 @@ class CategoryLinkProcessor implements ProcessorInterface
             foreach (array_keys($removals) as $categoryId) {
                 $toDelete[] = ['category_id' => $categoryId, 'product_id' => $entityId];
                 $touchedCategoryIds[$categoryId] = true;
+                $touchedProductIds[$entityId] = true;
             }
         }
 
@@ -153,6 +159,7 @@ class CategoryLinkProcessor implements ProcessorInterface
         $this->categoryLink->assign($toInsert);
 
         $context->set(self::CONTEXT_AFFECTED_CATEGORY_IDS, array_keys($touchedCategoryIds));
+        $context->set(self::CONTEXT_AFFECTED_PRODUCT_IDS, array_keys($touchedProductIds));
     }
 
     public function isEnabled(): bool

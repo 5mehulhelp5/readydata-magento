@@ -19,6 +19,9 @@
             <logging>
                 <enabled>1</enabled>
             </logging>
+            <events>
+                <dispatch_product_events>1</dispatch_product_events>
+            </events>
         </readydata_import>
     </default>
 </config>

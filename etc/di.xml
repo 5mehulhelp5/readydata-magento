@@ -51,6 +51,30 @@
         </arguments>
     </type>
 
+    <!--
+        Event dispatch. dispatchSaveAfter is a developer-only toggle:
+        set it to true to also fire catalog_product_save_after per product. When on,
+        the native URL-rewrite/inventory observers are suppressed for the duration of
+        the import (see the plugins below) so they never double-write.
+    -->
+    <type name="ReadyData\Import\Model\Event\ImportEventDispatcher">
+        <arguments>
+            <argument name="dispatchSaveAfter" xsi:type="boolean">false</argument>
+        </arguments>
+    </type>
+
+    <!-- Import-active flag consulted by the observer-suppression plugins; must be shared -->
+    <type name="ReadyData\Import\Model\ImportState" shared="true"/>
+
+    <type name="Magento\CatalogUrlRewrite\Observer\ProductProcessUrlRewriteSavingObserver">
+        <plugin name="readydata_suppress_url_rewrite_during_import"
+                type="ReadyData\Import\Plugin\CatalogUrlRewrite\SuppressUrlRewriteDuringImport"/>
+    </type>
+    <type name="Magento\CatalogInventory\Observer\SaveInventoryDataObserver">
+        <plugin name="readydata_suppress_inventory_save_during_import"
+                type="ReadyData\Import\Plugin\CatalogInventory\SuppressInventorySaveDuringImport"/>
+    </type>
+
     <!-- Request-scoped caches must be shared instances (default), listed here for clarity -->
     <type name="ReadyData\Import\Model\Cache\AttributeMetadataCache" shared="true"/>
     <type name="ReadyData\Import\Model\Cache\StoreWebsiteMap" shared="true"/>

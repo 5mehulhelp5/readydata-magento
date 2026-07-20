@@ -53,6 +53,14 @@
                     <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
                 </field>
             </group>
+            <group id="events" translate="label" type="text" sortOrder="35" showInDefault="1">
+                <label>Events</label>
+                <field id="dispatch_product_events" translate="label comment" type="select" sortOrder="10" showInDefault="1">
+                    <label>Dispatch Product Save Events</label>
+                    <comment>Re-emit catalog_product_save_commit_after (and the readydata_import_* events) after each imported batch so third-party observers react to imports. The additional catalog_product_save_after mode is a developer-only di.xml toggle, not exposed here.</comment>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                </field>
+            </group>
             <group id="logging" translate="label" type="text" sortOrder="40" showInDefault="1">
                 <label>Logging</label>
                 <field id="enabled" translate="label comment" type="select" sortOrder="10" showInDefault="1">
