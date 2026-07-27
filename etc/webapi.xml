@@ -9,6 +9,14 @@
         </resources>
     </route>
 
+    <!-- Create/update product attribute definitions (standalone; no product import required) -->
+    <route url="/V1/readydata/attributes" method="POST">
+        <service class="ReadyData\Import\Api\AttributeSyncInterface" method="sync"/>
+        <resources>
+            <resource ref="ReadyData_Import::attributes"/>
+        </resources>
+    </route>
+
     <!--
         Placeholders for further expansion:
 

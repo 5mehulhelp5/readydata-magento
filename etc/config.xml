@@ -12,6 +12,9 @@
                 <create_missing_options>1</create_missing_options>
                 <url_rewrite_conflict>append</url_rewrite_conflict>
             </behavior>
+            <attributes>
+                <auto_create>1</auto_create>
+            </attributes>
             <indexing>
                 <mode>partial</mode>
                 <clean_cache>1</clean_cache>

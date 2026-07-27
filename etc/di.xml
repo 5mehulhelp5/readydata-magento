@@ -19,6 +19,18 @@
     <preference for="ReadyData\Import\Api\Data\ImportResponseInterface"
                 type="ReadyData\Import\Model\Data\ImportResponse"/>
 
+    <!-- Attribute definition sync -->
+    <preference for="ReadyData\Import\Api\AttributeSyncInterface"
+                type="ReadyData\Import\Model\AttributeSync"/>
+    <preference for="ReadyData\Import\Api\Data\AttributeDefinitionInterface"
+                type="ReadyData\Import\Model\Data\AttributeDefinition"/>
+    <preference for="ReadyData\Import\Api\Data\AttributeSetPlacementInterface"
+                type="ReadyData\Import\Model\Data\AttributeSetPlacement"/>
+    <preference for="ReadyData\Import\Api\Data\AttributeSyncResultInterface"
+                type="ReadyData\Import\Model\Data\AttributeSyncResult"/>
+    <preference for="ReadyData\Import\Api\Data\AttributeSyncResponseInterface"
+                type="ReadyData\Import\Model\Data\AttributeSyncResponse"/>
+
     <!-- Dedicated log file: var/log/readydata_import.log -->
     <type name="ReadyData\Import\Logger\Logger">
         <arguments>
@@ -79,4 +91,5 @@
     <type name="ReadyData\Import\Model\Cache\CategoryPathResolver" shared="true"/>
     <type name="ReadyData\Import\Model\ResourceModel\AttributeOption" shared="true"/>
     <type name="ReadyData\Import\Model\ResourceModel\Category" shared="true"/>
+    <type name="ReadyData\Import\Model\ResourceModel\AttributeDefinition" shared="true"/>
 </config>

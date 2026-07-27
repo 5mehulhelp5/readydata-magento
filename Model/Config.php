@@ -33,6 +33,7 @@ class Config
     private const XML_PATH_LOGGING_ENABLED = 'readydata_import/logging/enabled';
     private const XML_PATH_DISPATCH_PRODUCT_EVENTS = 'readydata_import/events/dispatch_product_events';
     private const XML_PATH_DISPATCH_SAVE_AFTER = 'readydata_import/events/dispatch_save_after';
+    private const XML_PATH_AUTO_CREATE_ATTRIBUTES = 'readydata_import/attributes/auto_create';
 
     public function __construct(
         private readonly ScopeConfigInterface $scopeConfig
@@ -101,5 +102,15 @@ class Config
     public function isDispatchSaveAfter(): bool
     {
         return $this->scopeConfig->isSetFlag(self::XML_PATH_DISPATCH_SAVE_AFTER);
+    }
+
+    /**
+     * Master switch for the attribute-definition sync endpoint. Off by default:
+     * creating/updating attribute definitions is a catalog-structure change and
+     * must be opted into.
+     */
+    public function isAutoCreateAttributes(): bool
+    {
+        return $this->scopeConfig->isSetFlag(self::XML_PATH_AUTO_CREATE_ATTRIBUTES);
     }
 }

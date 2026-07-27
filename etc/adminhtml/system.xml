@@ -40,6 +40,14 @@
                     <source_model>ReadyData\Import\Model\Config\Source\UrlRewriteConflict</source_model>
                 </field>
             </group>
+            <group id="attributes" translate="label" type="text" sortOrder="25" showInDefault="1">
+                <label>Attribute Definitions</label>
+                <field id="auto_create" translate="label comment" type="select" sortOrder="10" showInDefault="1">
+                    <label>Enable Attribute Definition Sync</label>
+                    <comment>Allow the /V1/readydata/attributes endpoint to create/update product attribute definitions</comment>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                </field>
+            </group>
             <group id="indexing" translate="label" type="text" sortOrder="30" showInDefault="1">
                 <label>Indexing &amp; Cache</label>
                 <field id="mode" translate="label comment" type="select" sortOrder="10" showInDefault="1">

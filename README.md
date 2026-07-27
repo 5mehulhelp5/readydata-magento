@@ -154,6 +154,107 @@ Response: summary counters (`received`, `created`, `updated`, `failed`,
 `elapsedMs`) plus a per-SKU `results` array with `status` and `messages`.
 Errors are per-product; a failing product does not abort the request.
 
+## Attribute definitions
+
+A separate endpoint provisions the product attribute *definitions* a feed
+references. It is **standalone** — no product import is required before or
+after — and is normally called as a pre-flight step so the attributes exist
+before their values are imported. Off by default (see Configuration).
+
+```
+POST /rest/all/V1/readydata/attributes
+Authorization: Bearer <integration token>   (ACL: ReadyData_Import::attributes)
+```
+
+```json
+{
+  "attributes": [
+    {
+      "attribute_code": "material",
+      "frontend_input": "select",
+      "frontend_label": "Material",
+      "scope": "global",
+      "is_required": 0,
+      "is_filterable": 1,
+      "used_in_product_listing": 1,
+      "options": ["Cotton", "Wool"],
+      "placements": [{"set": "Default", "group": "General"}]
+    }
+  ]
+}
+```
+
+The **caller is the system of record** for what each attribute should be: it
+sends an already-Magento-shaped definition (`frontend_input`, and optionally
+`backend_type`, models, `scope`, flags, label, `options`, `placements`).
+`attribute_code` is always required. `frontend_input` is required to **create**
+an attribute but optional when **updating** an existing one — an omitted input
+leaves the stored shape untouched. Every other omitted property falls back to
+Magento's own column defaults. Definitions are persisted through
+Magento's `EavSetup`, so the EAV cache, attribute-set/group membership, option
+values and (where enabled) flat-catalog columns are all maintained correctly.
+
+### Reconciliation — create or update to match the source
+
+There is no create-only/update toggle. Per attribute:
+
+- **missing** → **created** to match the payload;
+- **exists, identical** → `unchanged`;
+- **exists, safe columns differ** (label, `is_required`, `default_value`,
+  searchable/filterable/listing/grid flags) → **updated** to match the payload;
+- **exists, a _structural_ column differs** (`backend_type`, `frontend_input`,
+  `is_global`) → **`skipped`** with reason `structural_change_required`.
+
+`scope` maps to `is_global`: `global`/`website`/`store`. Placement is
+**additive** — an attribute already in a set is left where it is (never moved
+between groups); a named group is created if missing; an omitted group uses the
+set's default group; an omitted set uses the entity's default set.
+
+Response: summary counters (`received`, `created`, `updated`, `unchanged`,
+`skipped`, `failed`, `elapsedMs`) plus a per-attribute `results` array with
+`status`, a machine-readable `reason`, and `messages`.
+
+### Structural changes require a deliberate migration
+
+`backend_type`, `frontend_input` and `is_global` are **create-only**: once an
+attribute exists, the sync never rewrites them, because each needs a real
+value-data migration that has no safe automatic answer —
+
+- **`backend_type`**: values live in `catalog_product_entity_<oldType>`; the new
+  type reads a different table, so values must be moved + coerced or dropped;
+- **`frontend_input` text→select/multiselect**: free-text values must become
+  options (create options from distinct values, remap to option IDs);
+- **`is_global`/scope**: value rows must be re-partitioned across stores.
+
+(Core Magento likewise blocks `backend_type` edits in the admin once an
+attribute has data.) When a definition disagrees with the stored attribute on
+one of these, the sync reports `skipped` / `structural_change_required` with the
+`have` vs `requested` values in `messages`, applies nothing, and leaves the fix
+to a deliberate, out-of-band migration (a data patch or attribute recreate, with
+backups). Re-sync afterwards reconciles the safe columns.
+
+### Concurrency & indexing
+
+Concurrent syncs serialize on a `readydata_attribute_sync` lock (with a short
+wait); the `eav_attribute` unique key is the ultimate backstop, so a create that
+loses a race is re-read and treated as an update rather than failing. Each
+attribute is processed independently (no wrapping transaction) and reported per
+code. After any change the sync cleans the `eav`/`config`/`full_page`/`block_html`
+cache types and **invalidates** (not partial-reindex — there are no product IDs)
+the `catalog_product_attribute`, `catalogsearch_fulltext` and (if enabled)
+`catalog_product_flat` indexers. **With Flat catalog enabled, a new listing/sort
+attribute is invisible until the flat indexer rebuilds** — run a flat reindex
+after a sync.
+
+### Limits (v1)
+
+Per-store labels (`store_labels`), swatch/media/weee input types, attribute
+deletion, and moving an existing attribute between groups are out of scope.
+Unsupported input types and definitions that would break a module invariant
+(e.g. a `backend_type` outside `varchar/int/decimal/text/datetime`, a
+`multiselect` on `varchar`, or a missing backend/source model class) are
+`skipped` with a clear per-attribute reason.
+
 ## What it does today
 
 - Creates/updates `catalog_product_entity` + all scalar EAV values with
@@ -182,6 +283,13 @@ Errors are per-product; a failing product does not abort the request.
 Stores → Configuration → ReadyData → Product Import: enable/disable, batch
 size, continue-on-error, option auto-creation, URL conflict strategy,
 reindex mode, cache cleaning, event dispatch, logging.
+
+The **Attribute Definitions** group has a single switch, **Enable Attribute
+Definition Sync** (`readydata_import/attributes/auto_create`, default **off**),
+the kill switch for the `POST /V1/readydata/attributes` endpoint. When off, the
+endpoint is a no-op that reports every attribute as `skipped`/`disabled`. There
+is intentionally no attribute-shape config here — scope, flags and placement are
+supplied per attribute by the caller (the system of record).
 
 ### Events
 
@@ -217,19 +325,19 @@ steps: implement `ProcessorInterface`, register in `etc/di.xml`
 
 ## Important caveats
 
-- **Attributes must already exist**: the importer resolves attribute codes
-  but never creates the attribute *definition*. An unknown code — whether a
-  `custom_attributes` entry or a configurable `super_attributes` code — is
-  skipped with a per-product warning and its value/axis is simply not written.
-  The only thing auto-created is missing **option values** on existing
-  select/multiselect attributes (config `create_missing_options`, default on).
-  This is deliberate: an attribute definition carries decisions the payload
-  cannot (frontend input, backend type, scope, required/searchable/filterable
-  flags, attribute-set placement), some effectively immutable once data
-  exists, and creating one is a catalog-structure change that belongs in a
-  version-controlled data patch, not a per-batch import. Create the attribute
-  once beforehand (for super attributes: a **global-scope select** added to
-  the product's attribute set).
+- **The product import never creates attribute _definitions_ inline**: it
+  resolves attribute codes but does not create the definition during a product
+  import. An unknown code — whether a `custom_attributes` entry or a
+  configurable `super_attributes` code — is skipped with a per-product warning
+  and its value/axis is simply not written. The only thing the *product* import
+  auto-creates is missing **option values** on existing select/multiselect
+  attributes (config `create_missing_options`, default on). This separation is
+  deliberate: an attribute definition carries decisions a product payload cannot
+  (frontend input, backend type, scope, flags, attribute-set placement), some
+  effectively immutable once data exists. Provision definitions **beforehand**
+  via the standalone **`POST /V1/readydata/attributes`** endpoint (see "Attribute
+  definitions"), a data patch, or the admin (for super attributes: a
+  **global-scope select** added to the product's attribute set).
 - **Bypasses the product model**: plugins/observers on product save do NOT
   run. That is the point, but audit your customizations before adopting.
   Exception: **auto-created categories** are saved through the category
