@@ -26,6 +26,10 @@
                 type="ReadyData\Import\Model\Data\AttributeDefinition"/>
     <preference for="ReadyData\Import\Api\Data\AttributeSetPlacementInterface"
                 type="ReadyData\Import\Model\Data\AttributeSetPlacement"/>
+    <preference for="ReadyData\Import\Api\Data\AmastyAttributeSettingsInterface"
+                type="ReadyData\Import\Model\Data\AmastyAttributeSettings"/>
+    <preference for="ReadyData\Import\Api\Data\AmastyOptionSettingInterface"
+                type="ReadyData\Import\Model\Data\AmastyOptionSetting"/>
     <preference for="ReadyData\Import\Api\Data\AttributeSyncResultInterface"
                 type="ReadyData\Import\Model\Data\AttributeSyncResult"/>
     <preference for="ReadyData\Import\Api\Data\AttributeSyncResponseInterface"
@@ -90,6 +94,7 @@
     <type name="ReadyData\Import\Model\Cache\StoreWebsiteMap" shared="true"/>
     <type name="ReadyData\Import\Model\Cache\CategoryPathResolver" shared="true"/>
     <type name="ReadyData\Import\Model\ResourceModel\AttributeOption" shared="true"/>
+    <type name="ReadyData\Import\Model\ResourceModel\AmastyAttribute" shared="true"/>
     <type name="ReadyData\Import\Model\ResourceModel\Category" shared="true"/>
     <type name="ReadyData\Import\Model\ResourceModel\AttributeDefinition" shared="true"/>
 </config>

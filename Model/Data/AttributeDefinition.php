@@ -6,6 +6,7 @@ declare(strict_types=1);
 
 namespace ReadyData\Import\Model\Data;
 
+use ReadyData\Import\Api\Data\AmastyAttributeSettingsInterface;
 use ReadyData\Import\Api\Data\AttributeDefinitionInterface;
 
 class AttributeDefinition implements AttributeDefinitionInterface
@@ -38,6 +39,7 @@ class AttributeDefinition implements AttributeDefinitionInterface
     private ?int $isUserDefined = null;
     private ?string $note = null;
     private ?array $placements = null;
+    private ?AmastyAttributeSettingsInterface $amasty = null;
 
     public function getAttributeCode(): string
     {
@@ -344,6 +346,17 @@ class AttributeDefinition implements AttributeDefinitionInterface
     public function setPlacements(?array $placements): AttributeDefinitionInterface
     {
         $this->placements = $placements;
+        return $this;
+    }
+
+    public function getAmasty(): ?AmastyAttributeSettingsInterface
+    {
+        return $this->amasty;
+    }
+
+    public function setAmasty(?AmastyAttributeSettingsInterface $amasty): AttributeDefinitionInterface
+    {
+        $this->amasty = $amasty;
         return $this;
     }
 }

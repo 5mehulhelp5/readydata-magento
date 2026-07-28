@@ -25,6 +25,7 @@ use ReadyData\Import\Model\Data\AttributeDefinition;
 use ReadyData\Import\Model\Data\AttributeSetPlacement;
 use ReadyData\Import\Model\Data\AttributeSyncResponse;
 use ReadyData\Import\Model\Data\AttributeSyncResult;
+use ReadyData\Import\Model\Amasty\AmastyAttributeWriter;
 use ReadyData\Import\Model\Indexer\AttributeInvalidationHandler;
 use ReadyData\Import\Model\ResourceModel\AttributeDefinition as AttributeDefinitionResource;
 use ReadyData\Import\Model\ResourceModel\AttributeOption;
@@ -42,6 +43,7 @@ class AttributeSyncServiceTest extends TestCase
     private AttributeMetadataCache&MockObject $metadataCache;
     private AttributeDefinitionResource&MockObject $resource;
     private AttributeOption&MockObject $attributeOption;
+    private AmastyAttributeWriter&MockObject $amastyWriter;
     private AttributeInvalidationHandler&MockObject $invalidationHandler;
     private AttributeSyncService $service;
 
@@ -69,6 +71,7 @@ class AttributeSyncServiceTest extends TestCase
         $this->resource = $this->createMock(AttributeDefinitionResource::class);
         $this->attributeOption = $this->createMock(AttributeOption::class);
         $this->attributeOption->method('createOptions')->willReturn([]);
+        $this->amastyWriter = $this->createMock(AmastyAttributeWriter::class);
         $this->invalidationHandler = $this->createMock(AttributeInvalidationHandler::class);
 
         $resultFactory = $this->createMock(AttributeSyncResultInterfaceFactory::class);
@@ -86,6 +89,7 @@ class AttributeSyncServiceTest extends TestCase
             $this->metadataCache,
             $this->resource,
             $this->attributeOption,
+            $this->amastyWriter,
             $this->invalidationHandler,
             $responseFactory,
             $resultFactory,
@@ -361,6 +365,7 @@ class AttributeSyncServiceTest extends TestCase
             $this->metadataCache,
             $this->resource,
             $this->attributeOption,
+            $this->amastyWriter,
             $this->invalidationHandler,
             $responseFactory,
             $resultFactory,

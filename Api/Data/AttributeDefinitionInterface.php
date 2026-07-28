@@ -52,6 +52,7 @@ interface AttributeDefinitionInterface
     public const IS_USER_DEFINED = 'is_user_defined';
     public const NOTE = 'note';
     public const PLACEMENTS = 'placements';
+    public const AMASTY = 'amasty';
 
     /**
      * Attribute value scope; maps to catalog_eav_attribute.is_global.
@@ -383,4 +384,19 @@ interface AttributeDefinitionInterface
      * @return $this
      */
     public function setPlacements(?array $placements): self;
+
+    /**
+     * Amasty layered-navigation properties (filter settings, brand designation,
+     * per-option brand data). Applied only when the matching Amasty module is
+     * present; null = nothing Amasty-related to sync.
+     *
+     * @return \ReadyData\Import\Api\Data\AmastyAttributeSettingsInterface|null
+     */
+    public function getAmasty(): ?AmastyAttributeSettingsInterface;
+
+    /**
+     * @param \ReadyData\Import\Api\Data\AmastyAttributeSettingsInterface|null $amasty
+     * @return $this
+     */
+    public function setAmasty(?AmastyAttributeSettingsInterface $amasty): self;
 }

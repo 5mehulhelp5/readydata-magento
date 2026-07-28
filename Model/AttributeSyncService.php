@@ -18,6 +18,7 @@ use ReadyData\Import\Api\Data\AttributeSyncResponseInterfaceFactory;
 use ReadyData\Import\Api\Data\AttributeSyncResultInterface;
 use ReadyData\Import\Api\Data\AttributeSyncResultInterfaceFactory;
 use ReadyData\Import\Logger\Logger;
+use ReadyData\Import\Model\Amasty\AmastyAttributeWriter;
 use ReadyData\Import\Model\Cache\AttributeMetadataCache;
 use ReadyData\Import\Model\Exception\AttributeValidationException;
 use ReadyData\Import\Model\Indexer\AttributeInvalidationHandler;
@@ -59,6 +60,7 @@ class AttributeSyncService
         private readonly AttributeMetadataCache $metadataCache,
         private readonly AttributeDefinitionResource $resource,
         private readonly AttributeOption $attributeOption,
+        private readonly AmastyAttributeWriter $amastyWriter,
         private readonly AttributeInvalidationHandler $invalidationHandler,
         private readonly AttributeSyncResponseInterfaceFactory $responseFactory,
         private readonly AttributeSyncResultInterfaceFactory $resultFactory,
@@ -438,6 +440,13 @@ class AttributeSyncService
             if ($this->attributeOption->createOptions($attributeId, $options) !== []) {
                 $changed = true;
             }
+        }
+
+        // Amasty layered-navigation properties are applied last, after options
+        // exist (per-option brand data resolves option labels to IDs). Fully
+        // guarded: a store without Amasty just collects skip messages here.
+        if ($this->amastyWriter->apply($definition, $attributeId, $messages)) {
+            $changed = true;
         }
 
         return $changed;
