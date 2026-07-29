@@ -29,6 +29,7 @@ Authorization: Bearer <integration token>   (ACL: ReadyData_Import::import)
       "categories": ["Default Category/Men/Shirts", "42"],
       "stock": {"qty": 100, "is_in_stock": true},
       "url_key": "example-product",
+      "links": {"related": ["DEF-456"], "cross_sell": ["GHI-789"]},
       "custom_attributes": [
         {"attribute_code": "color", "value": "Red"},
         {"attribute_code": "description", "value": "<p>Long text</p>"}
@@ -104,6 +105,46 @@ untouched; `[]` removes them all.
   is a literal backslash. A digits-only *name* is referenceable as an
   escaped segment (`"Default Category/\42"`), while a bare `"42"` entry
   stays a numeric ID.
+
+### Related, up-sell & cross-sell links
+
+A `links` block declares the product's merchandising links, each type an
+ordered list of target SKUs:
+
+```json
+{
+  "sku": "SHIRT-01",
+  "links": {
+    "related":    ["BELT-01", "SOCKS-02"],
+    "up_sell":    ["SHIRT-01-PREMIUM"],
+    "cross_sell": []
+  }
+}
+```
+
+- Semantics are **replace**, per sub-field: a present `related`, `up_sell` or
+  `cross_sell` array (including `[]`) makes that link type become exactly the
+  resolved set, while an omitted sub-field leaves that link type untouched. So
+  `{"related": [...]}` rewrites only the related products. `null`/omitted
+  `links` leaves all links untouched.
+- **Position follows the array order** (0-based) and is written to
+  `catalog_product_link_attribute_int`. Because the payload owns the whole set
+  for a link type, it also owns the order: admin-set positions on the link types
+  the feed sends are overwritten, while omitted link types keep theirs.
+- Targets must **already exist**; any product type may be a target. Unknown SKUs
+  are skipped with a per-product warning. Targets are resolved against the
+  database, so **send targets before (or in the same batch as) the linking
+  product** — a target scheduled in a later batch will not resolve.
+- **Safety valve** (as with categories), scoped **per link type**: if a target in
+  `related` fails to resolve, only the related removals are withheld — new links
+  are still added and a clean `cross_sell` set still applies in full (a warning
+  explains this).
+- A product **linking to itself** is skipped with a warning and does *not* trip
+  the safety valve, so a feed that echoes the linking SKU into its own related
+  list still gets its obsolete links removed. Duplicate SKUs within one array are
+  deduplicated, first occurrence wins.
+- Links are **global** (no store dimension) — send them on one store pass only.
+- Grouped-product children are a different link type and are not touched.
 
 ### Configurable products
 
@@ -328,6 +369,9 @@ Unsupported input types and definitions that would break a module invariant
   missing subtrees — see "Category assignments" above).
 - Configurable products: super attributes + child links (replace semantics,
   additive safety valve — see "Configurable products" above).
+- Related / up-sell / cross-sell links: replace semantics per link type with a
+  per-type additive safety valve and payload-order positions (see "Related,
+  up-sell & cross-sell links" above).
 - Stock: legacy `cataloginventory_stock_item` + MSI `inventory_source_item`
   when MSI is installed.
 - URL rewrites: generates `url_key` from the name when absent, regenerates
@@ -377,8 +421,7 @@ own URL-rewrite and inventory save observers for the duration of the import
 
 ## Placeholders (registered, disabled)
 
-Media gallery, related/up-sell/cross-sell links,
-tier prices — see
+Media gallery and tier prices — see
 `Model/Processor/*Processor.php` docblocks for the planned scope of each.
 Implement `execute()` and flip `isEnabled()` to activate. Third-party
 steps: implement `ProcessorInterface`, register in `etc/di.xml`
@@ -406,6 +449,16 @@ steps: implement `ProcessorInterface`, register in `etc/di.xml`
   category-save plugins and observers DO run for them.
 - Duplicate sibling category names are ambiguous; path resolution picks the
   lowest entity_id, deterministically.
+- **Referenced SKUs are matched case-sensitively** — configurable `children` and
+  the SKUs in a `links` block are looked up by their **stored** spelling, so
+  `"belt-01"` against a stored `"BELT-01"` is reported as not found (and trips
+  that dimension's safety valve). Two products differing only by case are
+  physically possible, so the importer does not fold case; send SKUs exactly as
+  stored.
+- Product links (related/up-sell/cross-sell) feed no catalog indexer, and links
+  are directional — only the linking product's FPC tags are cleaned, which the
+  normal post-import invalidation already covers. Link targets are not
+  invalidated.
 - **Value coercion**: datetime attribute values are normalized to UTC
   `Y-m-d H:i:s` (offset-less input is taken as already-UTC); unparseable
   datetime and non-numeric decimal values are skipped with a per-SKU

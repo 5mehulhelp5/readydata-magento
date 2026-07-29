@@ -31,6 +31,7 @@ interface ProductInterface
     public const CUSTOM_ATTRIBUTES = 'custom_attributes';
     public const CLEAR_ATTRIBUTES = 'clear_attributes';
     public const CONFIGURABLE = 'configurable';
+    public const LINKS = 'links';
 
     /**
      * @return string
@@ -233,4 +234,27 @@ interface ProductInterface
      * @return $this
      */
     public function setConfigurable(ConfigurableDataInterface $configurable): self;
+
+    /**
+     * Related, up-sell and cross-sell links:
+     * {"related": ["BELT-01", "SOCKS-02"], "up_sell": [...], "cross_sell": []}.
+     * Each sub-field, when present (including []), REPLACES exactly that link
+     * type's set in the given order — the array order becomes the storefront
+     * position, so the feed owns the ordering of the types it sends. An omitted
+     * sub-field leaves that link type untouched, and null/omitted links leaves
+     * all of them untouched. Targets must already exist and are matched
+     * case-sensitively against the stored SKU; unknown SKUs are skipped with a
+     * per-product warning, so send targets before/with the linking product. A
+     * product may not link to itself. Links are global (not store-scoped) —
+     * send them on one store pass only.
+     *
+     * @return \ReadyData\Import\Api\Data\ProductLinksInterface|null
+     */
+    public function getLinks(): ?ProductLinksInterface;
+
+    /**
+     * @param \ReadyData\Import\Api\Data\ProductLinksInterface $links
+     * @return $this
+     */
+    public function setLinks(ProductLinksInterface $links): self;
 }

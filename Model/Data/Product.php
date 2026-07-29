@@ -8,6 +8,7 @@ namespace ReadyData\Import\Model\Data;
 
 use ReadyData\Import\Api\Data\ConfigurableDataInterface;
 use ReadyData\Import\Api\Data\ProductInterface;
+use ReadyData\Import\Api\Data\ProductLinksInterface;
 use ReadyData\Import\Api\Data\StockDataInterface;
 
 class Product implements ProductInterface
@@ -27,6 +28,7 @@ class Product implements ProductInterface
     private ?array $customAttributes = null;
     private ?array $clearAttributes = null;
     private ?ConfigurableDataInterface $configurable = null;
+    private ?ProductLinksInterface $links = null;
 
     public function getSku(): string
     {
@@ -190,6 +192,17 @@ class Product implements ProductInterface
     public function setConfigurable(ConfigurableDataInterface $configurable): ProductInterface
     {
         $this->configurable = $configurable;
+        return $this;
+    }
+
+    public function getLinks(): ?ProductLinksInterface
+    {
+        return $this->links;
+    }
+
+    public function setLinks(ProductLinksInterface $links): ProductInterface
+    {
+        $this->links = $links;
         return $this;
     }
 }

@@ -12,6 +12,8 @@
                 type="ReadyData\Import\Model\Data\StockData"/>
     <preference for="ReadyData\Import\Api\Data\ConfigurableDataInterface"
                 type="ReadyData\Import\Model\Data\ConfigurableData"/>
+    <preference for="ReadyData\Import\Api\Data\ProductLinksInterface"
+                type="ReadyData\Import\Model\Data\ProductLinks"/>
     <preference for="ReadyData\Import\Api\Data\ImportSettingsInterface"
                 type="ReadyData\Import\Model\Data\ImportSettings"/>
     <preference for="ReadyData\Import\Api\Data\ImportResultInterface"
@@ -60,10 +62,10 @@
                 <item name="stock" xsi:type="object">ReadyData\Import\Model\Processor\StockProcessor</item>
                 <item name="url_rewrites" xsi:type="object">ReadyData\Import\Model\Processor\UrlRewriteProcessor</item>
                 <item name="category_links" xsi:type="object">ReadyData\Import\Model\Processor\CategoryLinkProcessor</item>
-                <!-- Placeholders for further expansion -->
-                <item name="media" xsi:type="object">ReadyData\Import\Model\Processor\MediaProcessor</item>
                 <item name="links" xsi:type="object">ReadyData\Import\Model\Processor\LinkProcessor</item>
                 <item name="configurables" xsi:type="object">ReadyData\Import\Model\Processor\ConfigurableProcessor</item>
+                <!-- Placeholders for further expansion -->
+                <item name="media" xsi:type="object">ReadyData\Import\Model\Processor\MediaProcessor</item>
                 <item name="tier_prices" xsi:type="object">ReadyData\Import\Model\Processor\TierPriceProcessor</item>
             </argument>
         </arguments>
@@ -97,4 +99,5 @@
     <type name="ReadyData\Import\Model\ResourceModel\AmastyAttribute" shared="true"/>
     <type name="ReadyData\Import\Model\ResourceModel\Category" shared="true"/>
     <type name="ReadyData\Import\Model\ResourceModel\AttributeDefinition" shared="true"/>
+    <type name="ReadyData\Import\Model\ResourceModel\ProductLink" shared="true"/>
 </config>
