@@ -186,7 +186,8 @@ Authorization: Bearer <integration token>   (ACL: ReadyData_Import::attributes)
 
 The **caller is the system of record** for what each attribute should be: it
 sends an already-Magento-shaped definition (`frontend_input`, and optionally
-`backend_type`, models, `scope`, flags, label, `options`, `placements`).
+`backend_type`, models, `scope`, flags, label, `options`, `placements`, and an
+`amasty` block for layered-navigation data — see "Amasty layered navigation").
 `attribute_code` is always required. `frontend_input` is required to **create**
 an attribute but optional when **updating** an existing one — an omitted input
 leaves the stored shape untouched. Every other omitted property falls back to
@@ -213,6 +214,66 @@ set's default group; an omitted set uses the entity's default set.
 Response: summary counters (`received`, `created`, `updated`, `unchanged`,
 `skipped`, `failed`, `elapsedMs`) plus a per-attribute `results` array with
 `status`, a machine-readable `reason`, and `messages`.
+
+### Amasty layered navigation
+
+An attribute definition may carry an optional `amasty` block that drives
+[Amasty Improved Layered Navigation](https://amasty.com/) and Shop by Brand data
+alongside the base attribute sync. It is **optional and soft-dependent**: omit
+it and nothing Amasty-related is touched; send it on a store without the matching
+Amasty module and the unsupported parts are simply skipped (see below).
+
+```json
+{
+  "attribute_code": "brand",
+  "frontend_input": "select",
+  "scope": "global",
+  "options": ["Nike", "Adidas"],
+  "amasty": {
+    "display_mode": 4,
+    "is_multiselect": 1,
+    "url_alias": "brand",
+    "is_expanded": 0,
+    "tooltip": "Pick a brand",
+    "slider_step": 1,
+    "is_brand": 1,
+    "filter_extra": {"block_position": 2},
+    "option_settings": [
+      {"option": "Nike", "title": "Nike", "image": "brands/nike.png",
+       "url": "nike", "description": "Just do it."}
+    ]
+  }
+}
+```
+
+The block groups three independent concerns, each guarded and applied on its own:
+
+- **Filter settings** → the ILN per-attribute row (`amasty_amshopby_filter_setting`,
+  keyed by `attribute_code`). `display_mode` is Amasty's numeric enum — `0` Labels,
+  `1` Dropdown, `2` Slider, `3` From-To only, `4` Images, `5` Images+Labels,
+  `6` Text swatch. `url_alias` is written to the `attribute_url_alias` column;
+  `is_multiselect`, `is_expanded`, `tooltip` and `slider_step` map to their
+  like-named columns.
+- **Brand designation** (`is_brand: 1`) → points Amasty Shop by Brand at this
+  attribute (sets `amshopby_brand/general/attribute_code`). Any other value
+  leaves the brand config untouched.
+- **Per-option brand/landing data** (`option_settings[]`) → one row per option in
+  the option-setting table. Each entry is keyed by `option`, the option's
+  **admin-scope label** (resolved to its option ID), plus optional `store_id`
+  (default `0` = admin/all-store), `title`, `image`, `url` (written to the
+  `url_alias` column), `description`, `meta_title`, `meta_description`.
+
+`filter_extra` and each option's `extra` are verbatim passthrough maps for
+version-specific columns: keys must be **real Amasty column names**, merged over
+the friendly fields and intersected with the live table.
+
+**Soft dependency, never fatal.** The module has no hard dependency on Amasty.
+Table names vary across Amasty releases (the first existing candidate is used),
+and every column is checked against the live table. A missing module, table,
+column, or an unresolved option label is collected as a per-attribute entry in
+the response `messages` — the base attribute sync always succeeds regardless.
+Amasty properties are applied **last**, after options exist, so per-option data
+can resolve option labels to IDs.
 
 ### Structural changes require a deliberate migration
 
