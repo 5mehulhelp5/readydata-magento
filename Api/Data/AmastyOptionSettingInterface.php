@@ -129,12 +129,16 @@ interface AmastyOptionSettingInterface
      * Version-specific extra values, already keyed by real Amasty column name.
      * Merged over the friendly fields and intersected with the live table.
      *
-     * @return array<string, string|int>|null
+     * A free-form column => scalar map, so the annotation is `mixed` — see
+     * AmastyAttributeSettingsInterface::getFilterExtra() for why anything more
+     * specific breaks the webapi type processor.
+     *
+     * @return mixed
      */
     public function getExtra(): ?array;
 
     /**
-     * @param array<string, string|int>|null $extra
+     * @param mixed $extra column => scalar map
      * @return $this
      */
     public function setExtra(?array $extra): self;

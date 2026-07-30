@@ -130,12 +130,18 @@ interface AmastyAttributeSettingsInterface
      * Version-specific filter columns, already keyed by real Amasty column
      * name. Merged over the friendly fields, intersected with the live table.
      *
-     * @return array<string, string|int>|null
+     * A free-form column => scalar map, so the annotation is `mixed`: the webapi
+     * type processor reads only the getter's `@return` tag and resolves anything
+     * it cannot parse as a class name — `array<string, string|int>` and a plain
+     * `array` both end up as the class "array", which fails the request with
+     * `Class "array" does not exist`. `mixed` passes the map through verbatim.
+     *
+     * @return mixed
      */
     public function getFilterExtra(): ?array;
 
     /**
-     * @param array<string, string|int>|null $filterExtra
+     * @param mixed $filterExtra column => scalar map
      * @return $this
      */
     public function setFilterExtra(?array $filterExtra): self;
