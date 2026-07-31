@@ -51,6 +51,46 @@ class EavValue
     }
 
     /**
+     * Bulk-read stored values of several attributes across ALL store scopes.
+     *
+     * Needed where a default-scope write is not the whole story: a store view
+     * that already overrides an attribute keeps its own row, so the caller has to
+     * know the override exists before it can keep it in sync (see MediaProcessor
+     * and the store-scoped image role attributes).
+     *
+     * @param int[] $attributeIds
+     * @param int[] $linkIds
+     * @return array<int, array<int, array<int, string>>> link_id => attribute_id => store_id => value
+     */
+    public function getValuesForStores(string $backendType, array $attributeIds, array $linkIds): array
+    {
+        if (!$attributeIds || !$linkIds) {
+            return [];
+        }
+        if (!in_array($backendType, self::BACKEND_TYPES, true)) {
+            throw new \InvalidArgumentException(sprintf('Unsupported EAV backend type "%s".', $backendType));
+        }
+
+        $connection = $this->resourceConnection->getConnection();
+        $linkField = $this->productEntity->getLinkField();
+        $select = $connection->select()
+            ->from(
+                $this->resourceConnection->getTableName('catalog_product_entity_' . $backendType),
+                [$linkField, 'attribute_id', 'store_id', 'value']
+            )
+            ->where('attribute_id IN (?)', $attributeIds)
+            ->where($linkField . ' IN (?)', $linkIds);
+
+        $values = [];
+        foreach ($connection->fetchAll($select) as $row) {
+            $values[(int)$row[$linkField]][(int)$row['attribute_id']][(int)$row['store_id']]
+                = (string)$row['value'];
+        }
+
+        return $values;
+    }
+
+    /**
      * Delete specific value rows, e.g. for explicit attribute clearing.
      * Deleting a store-scoped row makes that store fall back to the
      * default-scope value.

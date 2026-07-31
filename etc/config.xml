@@ -15,6 +15,15 @@
             <attributes>
                 <auto_create>1</auto_create>
             </attributes>
+            <media>
+                <enabled>1</enabled>
+                <download_timeout>15</download_timeout>
+                <max_file_size_kb>10240</max_file_size_kb>
+                <allowed_extensions>jpg,jpeg,png,gif,webp</allowed_extensions>
+                <allowed_hosts/>
+                <redownload_existing>0</redownload_existing>
+                <auto_assign_roles>1</auto_assign_roles>
+            </media>
             <indexing>
                 <mode>partial</mode>
                 <clean_cache>1</clean_cache>

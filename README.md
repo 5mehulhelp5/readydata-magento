@@ -30,6 +30,13 @@ Authorization: Bearer <integration token>   (ACL: ReadyData_Import::import)
       "stock": {"qty": 100, "is_in_stock": true},
       "url_key": "example-product",
       "links": {"related": ["DEF-456"], "cross_sell": ["GHI-789"]},
+      "media": [
+        {"file": "https://cdn.example.com/img/shirt-front.jpg", "label": "Front",
+         "roles": ["image", "small_image", "thumbnail"]},
+        {"file": "/s/h/shirt-back.jpg", "label": "Back"},
+        {"file": "/s/h/shirt-video-preview.jpg",
+         "video_url": "https://www.youtube.com/watch?v=abc123", "video_title": "How it fits"}
+      ],
       "custom_attributes": [
         {"attribute_code": "color", "value": "Red"},
         {"attribute_code": "description", "value": "<p>Long text</p>"}
@@ -190,6 +197,68 @@ payloads that carry their own option values in `custom_attributes`:
   links are added, but nothing existing is removed (a warning explains this).
 - The parent's price index is refreshed after linking so it reflects the
   children's prices.
+
+### Product media gallery
+
+A `media` array owns the product's gallery. Each entry names a `file` that is
+either an **http(s) URL** the module downloads into `pub/media/catalog/product`
+with Magento's standard dispersion (`hero.jpg` → `/h/e/hero.jpg`) or a **path
+relative to `pub/media/catalog/product`** for a file pushed out of band
+(`/s/h/shirt-back.jpg`; a leading `catalog/product/` is accepted and stripped).
+The two forms are told apart by the scheme.
+
+```json
+"media": [
+  {"file": "https://cdn.example.com/img/front.jpg", "label": "Front",
+   "roles": ["image", "small_image", "thumbnail"]},
+  {"file": "/s/h/back.jpg", "label": "Back", "position": 5, "disabled": true},
+  {"file": "/s/h/preview.jpg", "video_url": "https://youtu.be/abc123",
+   "video_title": "How it fits", "video_description": "Fit guide"}
+]
+```
+
+- **Downloads run before the batch transaction opens**, so no database locks are
+  ever held across network I/O.
+- Semantics are **replace**: a present `media` array makes the gallery exactly
+  that ordered set, `[]` removes every entry, `null`/omitted leaves the gallery
+  untouched. Entries are matched against the **stored file path**, so a
+  re-import of an unchanged gallery performs **no writes at all** and existing
+  entries keep their rows — and with them their video records and any per-store
+  data the admin added.
+- **Position follows the array order** (0-based, gap-free over the entries that
+  resolved) unless an entry sets `position` explicitly. Duplicate files within
+  one product are skipped, first occurrence wins.
+- `label` is the alt text; `disabled` hides the entry from the storefront
+  without deleting the file.
+- `roles` may contain `image`, `small_image`, `thumbnail` and `swatch_image`. A
+  role claimed by more than one entry keeps its first claim (with a warning). A
+  role whose file this import removes is cleared in **every** scope, so no store
+  view is left asking for a deleted file. With **Auto-Assign Media Roles** on
+  (default), a product whose `media` block declares no roles at all and has no
+  image role yet gets `image`/`small_image`/`thumbnail` pointed at its first
+  enabled entry; `swatch_image` is never auto-assigned, and a role a merchant
+  already chose is never overwritten. Roles sent through `custom_attributes` are
+  overwritten for products carrying a `media` block — **send roles inside
+  `media`**.
+- **External video**: an entry with `video_url` becomes `media_type =
+  "external-video"`; `file` is still required and is its preview image.
+  `video_provider` is derived from the URL host (`youtube`, `vimeo`) when
+  omitted, and an unrecognised provider skips the entry with a warning.
+  `video_title`, `video_description` and `video_metadata` are stored verbatim.
+  Without `Magento_ProductVideo` the entry is imported as a plain image, with a
+  warning.
+- **Safety valve** (as with categories), scoped per product: if any entry fails
+  to resolve, that product is applied additively — new entries and metadata
+  updates apply, nothing existing is removed.
+- Media is written at the **default scope only** (`store_id = 0`):
+  `store_view_code` does not affect it, so **send media on one store pass only**.
+  Store-scoped labels and positions are out of scope. The one exception is a role
+  attribute that already has a store-scoped row, which is kept in sync.
+- A URL whose target file already exists is **not fetched again** (see
+  *Re-Download Existing Files*). Publish a changed image under a new filename,
+  replace the file out of band, or turn that setting on.
+- Two different URLs whose file names collide are disambiguated by a suffix
+  derived from the URL, so the mapping stays stable across runs.
 
 Response: summary counters (`received`, `created`, `updated`, `failed`,
 `elapsedMs`) plus a per-SKU `results` array with `status` and `messages`.
@@ -372,6 +441,13 @@ Unsupported input types and definitions that would break a module invariant
 - Related / up-sell / cross-sell links: replace semantics per link type with a
   per-type additive safety valve and payload-order positions (see "Related,
   up-sell & cross-sell links" above).
+- Media gallery: downloads image URLs into `pub/media/catalog/product` (or
+  accepts pre-uploaded paths), writes `catalog_product_entity_media_gallery`
+  and its `_value` / `_value_to_entity` / `_value_video` children with replace
+  semantics diffed by file path, an additive safety valve, per-entry
+  label/position/disabled, external-video entries and the
+  `image`/`small_image`/`thumbnail`/`swatch_image` roles (see "Product media
+  gallery" above). All file I/O runs before the batch transaction opens.
 - Stock: legacy `cataloginventory_stock_item` + MSI `inventory_source_item`
   when MSI is installed.
 - URL rewrites: generates `url_key` from the name when absent, regenerates
@@ -386,8 +462,8 @@ Unsupported input types and definitions that would break a module invariant
 ## Configuration
 
 Stores → Configuration → ReadyData → Product Import: enable/disable, batch
-size, continue-on-error, option auto-creation, URL conflict strategy,
-reindex mode, cache cleaning, event dispatch, logging.
+size, continue-on-error, option auto-creation, URL conflict strategy, media
+downloads, reindex mode, cache cleaning, event dispatch, logging.
 
 The **Attribute Definitions** group has a single switch, **Enable Attribute
 Definition Sync** (`readydata_import/attributes/auto_create`, default **off**),
@@ -395,6 +471,20 @@ the kill switch for the `POST /V1/readydata/attributes` endpoint. When off, the
 endpoint is a no-op that reports every attribute as `skipped`/`disabled`. There
 is intentionally no attribute-shape config here — scope, flags and placement are
 supplied per attribute by the caller (the system of record).
+
+### Media gallery
+
+The **Media Gallery** group governs the `media` block:
+
+| Setting | Default | Notes |
+|---|---|---|
+| Enable Media Gallery Import | on | Off skips the block entirely, downloads included. |
+| Download Timeout | 15 s | Per image. |
+| Maximum File Size | 10240 KB | Checked against `Content-Length` and against the body. |
+| Allowed File Extensions | `jpg,jpeg,png,gif,webp` | Applies to downloads and pre-uploaded paths. SVG is deliberately absent — it can carry script. A download whose extension has no known image signature is refused even if allow-listed. |
+| Allowed Download Hosts | *(empty)* | **Empty means any host.** See the caveats below. |
+| Re-Download Existing Files | off | Off makes re-imports do no network I/O at all. |
+| Auto-Assign Media Roles | on | See "Product media gallery" above. |
 
 ### Events
 
@@ -421,11 +511,11 @@ own URL-rewrite and inventory save observers for the duration of the import
 
 ## Placeholders (registered, disabled)
 
-Media gallery and tier prices — see
-`Model/Processor/*Processor.php` docblocks for the planned scope of each.
-Implement `execute()` and flip `isEnabled()` to activate. Third-party
-steps: implement `ProcessorInterface`, register in `etc/di.xml`
-(`ImportService`, argument `processors`).
+Tier prices — see `Model/Processor/TierPriceProcessor.php` for the planned
+scope. Implement `execute()` and flip `isEnabled()` to activate. Third-party
+steps: implement `ProcessorInterface` (plus `PreparableInterface` when the step
+needs network or filesystem access before the transaction opens) and register in
+`etc/di.xml` (`ImportService`, argument `processors`).
 
 ## Important caveats
 
@@ -470,6 +560,33 @@ steps: implement `ProcessorInterface`, register in `etc/di.xml`
   view per website is enough; other websites keep their own values.
 - **Adobe Commerce (EE) staging**: updates work; creating new products on a
   staged catalog is not yet supported (clear per-product error is returned).
+  Media is written against the product's *current* row, with no staging-update
+  awareness — the same posture as the rest of the module.
+- **Media is written at the default scope only**; `store_view_code` does not
+  affect it. Send media roles inside `media`, never in `custom_attributes`: a
+  store-scoped `custom_attributes` role write happens earlier in the pipeline
+  and the default-scope role write cannot shadow it.
+- Each product gets its **own** gallery row per file, even when several products
+  share the same file on disk. The row carries `media_type`, `disabled` and the
+  video record, none of which have a product dimension, and a shared row would
+  let one product's removal cascade the image away from all the others. The file
+  itself is shared.
+- A **rolled-back batch can leave downloaded files in `pub/media`** unreferenced.
+  They are re-used, never re-downloaded, on retry, and are not garbage-collected.
+- **Image URLs are fetched by the store.** With *Allowed Download Hosts* empty, a
+  compromised feed can make the store request any URL it can reach, including
+  internal ones. Downloads are extension-filtered, signature-verified before
+  anything is written, size-capped, timeout-capped and redirect-capped, and the
+  framework's cURL client is restricted to HTTP/HTTPS. DNS rebinding and
+  IP-literal hosts are not solved — set an allow-list in hardened environments.
+- Database media storage (`Magento_MediaStorage`) is **not supported** for media
+  import: files written to the local media directory would be invisible to the
+  storefront. Media is refused with a clear per-product message.
+- Third-party product-save observers do **not** see the gallery: the lightweight
+  product object the event dispatcher builds carries the payload's scalars only.
+- Media downloads are serial. For a large first-time import the knob is
+  `batch_size`; raise `max_execution_time` accordingly, or pre-upload the files
+  and send relative paths.
 - Run indexers in "Update by Schedule" mode for best throughput.
 
 ## Installation

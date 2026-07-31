@@ -14,6 +14,8 @@
                 type="ReadyData\Import\Model\Data\ConfigurableData"/>
     <preference for="ReadyData\Import\Api\Data\ProductLinksInterface"
                 type="ReadyData\Import\Model\Data\ProductLinks"/>
+    <preference for="ReadyData\Import\Api\Data\MediaEntryInterface"
+                type="ReadyData\Import\Model\Data\MediaEntry"/>
     <preference for="ReadyData\Import\Api\Data\ImportSettingsInterface"
                 type="ReadyData\Import\Model\Data\ImportSettings"/>
     <preference for="ReadyData\Import\Api\Data\ImportResultInterface"
@@ -64,8 +66,8 @@
                 <item name="category_links" xsi:type="object">ReadyData\Import\Model\Processor\CategoryLinkProcessor</item>
                 <item name="links" xsi:type="object">ReadyData\Import\Model\Processor\LinkProcessor</item>
                 <item name="configurables" xsi:type="object">ReadyData\Import\Model\Processor\ConfigurableProcessor</item>
-                <!-- Placeholders for further expansion -->
                 <item name="media" xsi:type="object">ReadyData\Import\Model\Processor\MediaProcessor</item>
+                <!-- Placeholders for further expansion -->
                 <item name="tier_prices" xsi:type="object">ReadyData\Import\Model\Processor\TierPriceProcessor</item>
             </argument>
         </arguments>
@@ -100,4 +102,6 @@
     <type name="ReadyData\Import\Model\ResourceModel\Category" shared="true"/>
     <type name="ReadyData\Import\Model\ResourceModel\AttributeDefinition" shared="true"/>
     <type name="ReadyData\Import\Model\ResourceModel\ProductLink" shared="true"/>
+    <!-- Memoizes the link field and the ProductVideo table probe for the request -->
+    <type name="ReadyData\Import\Model\ResourceModel\ProductMediaGallery" shared="true"/>
 </config>

@@ -32,6 +32,7 @@ interface ProductInterface
     public const CLEAR_ATTRIBUTES = 'clear_attributes';
     public const CONFIGURABLE = 'configurable';
     public const LINKS = 'links';
+    public const MEDIA = 'media';
 
     /**
      * @return string
@@ -257,4 +258,30 @@ interface ProductInterface
      * @return $this
      */
     public function setLinks(ProductLinksInterface $links): self;
+
+    /**
+     * Media gallery entries in display order. Each entry's "file" is either an
+     * http(s) URL the module downloads into pub/media/catalog/product (standard
+     * Magento dispersion, /a/b/abc.jpg) or a path relative to
+     * pub/media/catalog/product for a file pushed out of band. When present,
+     * REPLACES the gallery: it becomes exactly this ordered set and entries not
+     * listed are removed (an empty array removes them all); null/omitted leaves
+     * the gallery unchanged. Existing entries are matched by their stored file
+     * path, so a re-import is idempotent and keeps its rows — and with them any
+     * per-store data the admin added. Entries that cannot be resolved (download
+     * failure, missing local file, unusable video URL) are skipped with a
+     * per-product warning and make that product additive: inserts and updates
+     * apply, no existing entry is removed. Media is written at the DEFAULT scope
+     * only — store_view_code does not affect it, so send media on one store pass
+     * only.
+     *
+     * @return \ReadyData\Import\Api\Data\MediaEntryInterface[]|null
+     */
+    public function getMedia(): ?array;
+
+    /**
+     * @param \ReadyData\Import\Api\Data\MediaEntryInterface[] $media
+     * @return $this
+     */
+    public function setMedia(array $media): self;
 }

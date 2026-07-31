@@ -29,6 +29,7 @@ class Product implements ProductInterface
     private ?array $clearAttributes = null;
     private ?ConfigurableDataInterface $configurable = null;
     private ?ProductLinksInterface $links = null;
+    private ?array $media = null;
 
     public function getSku(): string
     {
@@ -203,6 +204,17 @@ class Product implements ProductInterface
     public function setLinks(ProductLinksInterface $links): ProductInterface
     {
         $this->links = $links;
+        return $this;
+    }
+
+    public function getMedia(): ?array
+    {
+        return $this->media;
+    }
+
+    public function setMedia(array $media): ProductInterface
+    {
+        $this->media = $media;
         return $this;
     }
 }

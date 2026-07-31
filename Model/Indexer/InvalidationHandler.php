@@ -45,6 +45,9 @@ class InvalidationHandler
             'cataloginventory_stock',
             'inventory',
             'catalogsearch_fulltext',
+            // The image role attributes are used_in_product_listing, so a new
+            // base image only reaches category listings once flat rebuilds.
+            'catalog_product_flat',
         ]
     ) {
         $this->indexerIds = $indexerIds;

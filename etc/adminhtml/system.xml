@@ -48,6 +48,60 @@
                     <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
                 </field>
             </group>
+            <group id="media" translate="label" type="text" sortOrder="27" showInDefault="1">
+                <label>Media Gallery</label>
+                <field id="enabled" translate="label comment" type="select" sortOrder="10" showInDefault="1">
+                    <label>Enable Media Gallery Import</label>
+                    <comment>Import the "media" block of the product payload. Off: media is skipped entirely, including image downloads.</comment>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                </field>
+                <field id="download_timeout" translate="label comment" type="text" sortOrder="20" showInDefault="1">
+                    <label>Download Timeout</label>
+                    <comment>Seconds to wait for a single image download. Default: 15.</comment>
+                    <validate>validate-digits validate-greater-than-zero</validate>
+                    <depends>
+                        <field id="enabled">1</field>
+                    </depends>
+                </field>
+                <field id="max_file_size_kb" translate="label comment" type="text" sortOrder="30" showInDefault="1">
+                    <label>Maximum File Size (KB)</label>
+                    <comment>Largest accepted image. Default: 10240 (10 MB).</comment>
+                    <validate>validate-digits validate-greater-than-zero</validate>
+                    <depends>
+                        <field id="enabled">1</field>
+                    </depends>
+                </field>
+                <field id="allowed_extensions" translate="label comment" type="text" sortOrder="40" showInDefault="1">
+                    <label>Allowed File Extensions</label>
+                    <comment>Comma-separated extensions accepted for downloads and for pre-uploaded paths. SVG is deliberately absent: it can carry script.</comment>
+                    <depends>
+                        <field id="enabled">1</field>
+                    </depends>
+                </field>
+                <field id="allowed_hosts" translate="label comment" type="text" sortOrder="50" showInDefault="1">
+                    <label>Allowed Download Hosts</label>
+                    <comment>Comma-separated host allow-list for image URLs. EMPTY MEANS ANY HOST, which lets a compromised feed make the store fetch arbitrary URLs it can reach, including internal ones. Set it in hardened environments.</comment>
+                    <depends>
+                        <field id="enabled">1</field>
+                    </depends>
+                </field>
+                <field id="redownload_existing" translate="label comment" type="select" sortOrder="60" showInDefault="1">
+                    <label>Re-Download Existing Files</label>
+                    <comment>Re-fetch a URL even when its target file already exists, replacing it when the bytes differ. Off (default) makes re-imports do zero network I/O; publish a changed image under a new filename or replace the file out of band instead.</comment>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                    <depends>
+                        <field id="enabled">1</field>
+                    </depends>
+                </field>
+                <field id="auto_assign_roles" translate="label comment" type="select" sortOrder="70" showInDefault="1">
+                    <label>Auto-Assign Media Roles</label>
+                    <comment>When a "media" block declares no roles and the product has no image role yet, point image/small_image/thumbnail at its first enabled entry. swatch_image is never auto-assigned.</comment>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                    <depends>
+                        <field id="enabled">1</field>
+                    </depends>
+                </field>
+            </group>
             <group id="indexing" translate="label" type="text" sortOrder="30" showInDefault="1">
                 <label>Indexing &amp; Cache</label>
                 <field id="mode" translate="label comment" type="select" sortOrder="10" showInDefault="1">

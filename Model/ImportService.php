@@ -20,6 +20,7 @@ use ReadyData\Import\Model\Cache\StoreWebsiteMap;
 use ReadyData\Import\Model\Event\ImportEventDispatcher;
 use ReadyData\Import\Model\Indexer\InvalidationHandler;
 use ReadyData\Import\Model\Processor\CategoryLinkProcessor;
+use ReadyData\Import\Model\Processor\PreparableInterface;
 use ReadyData\Import\Model\Processor\ProcessorInterface;
 
 /**
@@ -141,6 +142,10 @@ class ImportService
      */
     private function processBatch(BatchContext $context, int $batchNumber): bool
     {
+        if (!$this->prepareBatch($context, $batchNumber)) {
+            return false;
+        }
+
         $connection = $this->resourceConnection->getConnection();
         $connection->beginTransaction();
 
@@ -166,6 +171,66 @@ class ImportService
             );
 
             return false;
+        }
+    }
+
+    /**
+     * Pre-transaction phase: steps implementing PreparableInterface do their
+     * network/filesystem work here, OUTSIDE the batch transaction, so no row
+     * locks are held across remote I/O — a batch of image downloads would
+     * otherwise hold write locks on the gallery and EAV tables for minutes.
+     * Same sort order and same isEnabled() gate as the pipeline itself.
+     *
+     * A throw here is a batch-level failure and is reported WITHOUT rollBack():
+     * no transaction is open yet, and calling it would raise a second,
+     * misleading error.
+     *
+     * @return bool true when the batch may proceed to its transaction
+     */
+    private function prepareBatch(BatchContext $context, int $batchNumber): bool
+    {
+        $preparables = array_filter(
+            $this->processors,
+            static fn (ProcessorInterface $p): bool => $p instanceof PreparableInterface && $p->isEnabled()
+        );
+        if (!$preparables) {
+            return true;
+        }
+
+        try {
+            foreach ($preparables as $processor) {
+                /** @var PreparableInterface $processor */
+                $processor->prepare($context);
+            }
+            $this->assertConnectionAlive();
+
+            return true;
+        } catch (\Throwable $e) {
+            $message = sprintf('Batch %d preparation failed: %s', $batchNumber + 1, $e->getMessage());
+            $context->failAll($message);
+            $this->logger->error($message, ['exception' => $e]);
+
+            return false;
+        }
+    }
+
+    /**
+     * A long preparation phase leaves the database connection idle and can trip
+     * MySQL's wait_timeout. That matters twice over: the transaction below would
+     * fail on a dead connection anyway, and the import lock is a GET_LOCK on
+     * this very connection, so a silent reconnect would release it and let a
+     * second import run concurrently. Probe both before committing to the batch.
+     *
+     * @throws \RuntimeException when the connection or the lock was lost
+     */
+    private function assertConnectionAlive(): void
+    {
+        $this->resourceConnection->getConnection()->fetchOne('SELECT 1');
+
+        if (!$this->lockManager->isLocked(self::LOCK_NAME)) {
+            throw new \RuntimeException(
+                'the import lock was lost during preparation, most likely with the database connection'
+            );
         }
     }
 

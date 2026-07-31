@@ -34,7 +34,7 @@ Processor pipeline (sorted pool, injected via di.xml — the extension point)
         ├─ StockProcessor            cataloginventory_stock_item + MSI inventory_source_item
         ├─ UrlRewriteProcessor       url_rewrite (+ url_key generation/dedup)
         ├─ CategoryLinkProcessor     catalog_category_product            [placeholder]
-        ├─ MediaProcessor            gallery tables + file handling      [placeholder]
+        ├─ MediaProcessor            gallery tables + file handling
         ├─ LinkProcessor             related/upsell/crosssell            [placeholder]
         ├─ ConfigurableProcessor     super link/attribute tables         [placeholder]
         └─ TierPriceProcessor        catalog_product_entity_tier_price   [placeholder]
@@ -119,6 +119,14 @@ Example request body:
   single bulk conflict lookup), upsert `url_rewrite` rows per store, honoring the
   "Create Permanent Redirect" config. Conflict resolution strategy configurable:
   error / append-suffix / skip.
+- **Media gallery:** files are acquired *before* the batch transaction opens
+  (`PreparableInterface::prepare()`), so no row locks are held across network I/O. Gallery
+  rows are bulk-inserted and their AUTO_INCREMENT `value_id`s read back by `MAX(value_id)`
+  watermark plus positional verification — the row has no natural key to re-select by.
+  `..._media_gallery_value` is written delete-then-insert because its
+  `(entity_id, value_id, store_id)` index is **not** unique; `_value_to_entity` and
+  `_value_video` are upserted on their real primary keys. Removals delete the bindings and
+  then the gallery rows left unbound, which cascades the rest.
 - All raw SQL isolated in `Model/ResourceModel/*` classes; processors contain the logic,
   resource models contain the SQL. Chunk very large multi-row inserts (~1k rows/statement)
   to stay under `max_allowed_packet`.
@@ -140,6 +148,13 @@ Example request body:
 | `readydata_import/general/continue_on_error` | 1 | per-batch fail-fast vs. continue |
 | `readydata_import/behavior/create_missing_options` | 1 | auto-create select options |
 | `readydata_import/behavior/url_rewrite_conflict` | append | error/append/skip |
+| `readydata_import/media/enabled` | 1 | media gallery step (downloads included) |
+| `readydata_import/media/download_timeout` | 15 | seconds per image |
+| `readydata_import/media/max_file_size_kb` | 10240 | largest accepted image |
+| `readydata_import/media/allowed_extensions` | jpg,jpeg,png,gif,webp | downloads and pre-uploaded paths |
+| `readydata_import/media/allowed_hosts` | *(empty)* | download host allow-list; empty = any host |
+| `readydata_import/media/redownload_existing` | 0 | re-fetch a URL whose target file exists |
+| `readydata_import/media/auto_assign_roles` | 1 | base roles → first enabled entry |
 | `readydata_import/indexing/mode` | partial | none/invalidate/partial |
 | `readydata_import/logging/enabled` | 1 | dedicated log file |
 
@@ -172,8 +187,9 @@ app/code/ReadyData/Import/
 │   │   ├── WebsiteProcessor.php
 │   │   ├── StockProcessor.php
 │   │   ├── UrlRewriteProcessor.php
+│   │   ├── PreparableInterface.php        # opt-in pre-transaction phase
 │   │   ├── CategoryLinkProcessor.php      [P]
-│   │   ├── MediaProcessor.php             [P]
+│   │   ├── MediaProcessor.php
 │   │   ├── LinkProcessor.php              [P]
 │   │   ├── ConfigurableProcessor.php      [P]
 │   │   └── TierPriceProcessor.php         [P]
@@ -182,8 +198,11 @@ app/code/ReadyData/Import/
 │   │   ├── EavValue.php                   # per-backend-type value upserts
 │   │   ├── AttributeOption.php            # option lookup/bulk create
 │   │   ├── Stock.php                      # stock_item + MSI source items
+│   │   ├── ProductMediaGallery.php        # the four media gallery tables
 │   │   ├── UrlRewrite.php
 │   │   └── Website.php
+│   ├── Media/
+│   │   └── FileResolver.php               # downloads/validates payload file references
 │   ├── Cache/
 │   │   ├── AttributeMetadataCache.php
 │   │   └── StoreWebsiteMap.php
@@ -231,3 +250,13 @@ the body, flip the flag.
 - **Async mode:** for very large feeds, accept-and-queue (bulk API pattern with
   `operation` status endpoint) is the planned expansion — hence the status endpoint
   placeholder.
+- **Media `value_id` read-back:** a gallery row has no natural key, so the watermark
+  re-select is not provably unambiguous — a concurrent admin product save can interleave
+  its own rows. Guarded by three stacked predicates plus a positional `value` comparison
+  that aborts to "no inserts" rather than guessing. If it ever fires in the field, the
+  escalation is per-row `insert()` + `lastInsertId()` for new files only.
+- **Orphan media files:** a rolled-back batch leaves whatever `prepare()` downloaded in
+  `pub/media`. Deterministic target paths make retries converge on the same file instead
+  of accumulating copies, but nothing garbage-collects the unreferenced ones.
+- **Media downloads are serial and synchronous**, bounded per batch. The async path above
+  is also the answer for large first-time image imports.
