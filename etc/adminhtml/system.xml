@@ -63,6 +63,14 @@
                         <field id="enabled">1</field>
                     </depends>
                 </field>
+                <field id="download_concurrency" translate="label comment" type="text" sortOrder="25" showInDefault="1">
+                    <label>Download Concurrency</label>
+                    <comment>How many images to download at once. 1 is fully sequential (the escape hatch if an origin rate-limits). Default: 4, maximum 32. Each in-flight download holds up to 2 MB in memory before spilling to disk, so this setting multiplies the transfer-time memory footprint.</comment>
+                    <validate>validate-digits validate-greater-than-zero</validate>
+                    <depends>
+                        <field id="enabled">1</field>
+                    </depends>
+                </field>
                 <field id="max_file_size_kb" translate="label comment" type="text" sortOrder="30" showInDefault="1">
                     <label>Maximum File Size (KB)</label>
                     <comment>Largest accepted image. Default: 10240 (10 MB).</comment>

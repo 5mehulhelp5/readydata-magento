@@ -150,6 +150,7 @@ Example request body:
 | `readydata_import/behavior/url_rewrite_conflict` | append | error/append/skip |
 | `readydata_import/media/enabled` | 1 | media gallery step (downloads included) |
 | `readydata_import/media/download_timeout` | 15 | seconds per image |
+| `readydata_import/media/download_concurrency` | 4 | images fetched at once (1 = sequential, max 32) |
 | `readydata_import/media/max_file_size_kb` | 10240 | largest accepted image |
 | `readydata_import/media/allowed_extensions` | jpg,jpeg,png,gif,webp | downloads and pre-uploaded paths |
 | `readydata_import/media/allowed_hosts` | *(empty)* | download host allow-list; empty = any host |
@@ -202,7 +203,9 @@ app/code/ReadyData/Import/
 │   │   ├── UrlRewrite.php
 │   │   └── Website.php
 │   ├── Media/
-│   │   └── FileResolver.php               # downloads/validates payload file references
+│   │   ├── FileResolver.php               # validates payload file references, writes them
+│   │   ├── DownloaderInterface.php
+│   │   └── PooledDownloader.php           # bounded concurrent fetch (Guzzle Pool)
 │   ├── Cache/
 │   │   ├── AttributeMetadataCache.php
 │   │   └── StoreWebsiteMap.php

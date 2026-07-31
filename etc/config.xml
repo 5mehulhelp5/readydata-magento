@@ -18,6 +18,7 @@
             <media>
                 <enabled>1</enabled>
                 <download_timeout>15</download_timeout>
+                <download_concurrency>4</download_concurrency>
                 <max_file_size_kb>10240</max_file_size_kb>
                 <allowed_extensions>jpg,jpeg,png,gif,webp</allowed_extensions>
                 <allowed_hosts/>

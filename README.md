@@ -218,7 +218,12 @@ The two forms are told apart by the scheme.
 ```
 
 - **Downloads run before the batch transaction opens**, so no database locks are
-  ever held across network I/O.
+  ever held across network I/O, and they run **concurrently** up to *Download
+  Concurrency* (default 4; set it to 1 for fully sequential).
+- A downloaded file is stored under its sanitised name plus a short digest of its
+  URL — `https://cdn.example.com/img/hero.jpg` becomes `/h/e/hero_1a2b3c4d.jpg`.
+  The digest makes the path a pure function of the URL, so two suppliers whose
+  images are both called `hero.jpg` can never collide on one file.
 - Semantics are **replace**: a present `media` array makes the gallery exactly
   that ordered set, `[]` removes every entry, `null`/omitted leaves the gallery
   untouched. Entries are matched against the **stored file path**, so a
@@ -255,10 +260,14 @@ The two forms are told apart by the scheme.
   Store-scoped labels and positions are out of scope. The one exception is a role
   attribute that already has a store-scoped row, which is kept in sync.
 - A URL whose target file already exists is **not fetched again** (see
-  *Re-Download Existing Files*). Publish a changed image under a new filename,
-  replace the file out of band, or turn that setting on.
-- Two different URLs whose file names collide are disambiguated by a suffix
-  derived from the URL, so the mapping stays stable across runs.
+  *Re-Download Existing Files*). Publish a changed image under a new URL, replace
+  the file out of band, or turn that setting on — with it on, a changed image
+  replaces the stored bytes and a warning notes that the resized renditions under
+  `pub/media/catalog/product/cache` are then stale for that file.
+- Files are streamed to a temporary name and renamed into place, and their
+  content is verified against the extension they claim before a byte is written,
+  so neither a disguised payload nor a half-written file can end up somewhere a
+  later run would trust.
 
 Response: summary counters (`received`, `created`, `updated`, `failed`,
 `elapsedMs`) plus a per-SKU `results` array with `status` and `messages`.
@@ -480,7 +489,8 @@ The **Media Gallery** group governs the `media` block:
 |---|---|---|
 | Enable Media Gallery Import | on | Off skips the block entirely, downloads included. |
 | Download Timeout | 15 s | Per image. |
-| Maximum File Size | 10240 KB | Checked against `Content-Length` and against the body. |
+| Download Concurrency | 4 | Images fetched at once, max 32. `1` is fully sequential. Each in-flight download holds up to 2 MB in memory before spilling to disk, so this multiplies the transfer-time footprint. |
+| Maximum File Size | 10240 KB | Refused from `Content-Length` before the body transfers, and enforced again while streaming for origins that omit or understate it. |
 | Allowed File Extensions | `jpg,jpeg,png,gif,webp` | Applies to downloads and pre-uploaded paths. SVG is deliberately absent — it can carry script. A download whose extension has no known image signature is refused even if allow-listed. |
 | Allowed Download Hosts | *(empty)* | **Empty means any host.** See the caveats below. |
 | Re-Download Existing Files | off | Off makes re-imports do no network I/O at all. |
@@ -576,17 +586,21 @@ needs network or filesystem access before the transaction opens) and register in
 - **Image URLs are fetched by the store.** With *Allowed Download Hosts* empty, a
   compromised feed can make the store request any URL it can reach, including
   internal ones. Downloads are extension-filtered, signature-verified before
-  anything is written, size-capped, timeout-capped and redirect-capped, and the
-  framework's cURL client is restricted to HTTP/HTTPS. DNS rebinding and
-  IP-literal hosts are not solved — set an allow-list in hardened environments.
+  anything is written, size-capped, timeout-capped and redirect-capped, and a
+  redirect may only target HTTP/HTTPS. DNS rebinding and IP-literal hosts are not
+  solved — set an allow-list in hardened environments. *Download Concurrency*
+  also bounds how hard a single feed can make the store hit one origin.
 - Database media storage (`Magento_MediaStorage`) is **not supported** for media
   import: files written to the local media directory would be invisible to the
   storefront. Media is refused with a clear per-product message.
 - Third-party product-save observers do **not** see the gallery: the lightweight
   product object the event dispatcher builds carries the payload's scalars only.
-- Media downloads are serial. For a large first-time import the knob is
-  `batch_size`; raise `max_execution_time` accordingly, or pre-upload the files
-  and send relative paths.
+- Media downloads run concurrently, but the whole batch still happens inside one
+  request. For a large first-time import raise *Download Concurrency*, and use
+  `batch_size` and `max_execution_time` to keep each request within its timeout —
+  or pre-upload the files and send relative paths. The cap is per import and
+  shared across hosts, so a feed pulling from several origins divides it between
+  them.
 - Run indexers in "Update by Schedule" mode for best throughput.
 
 ## Installation

@@ -6,17 +6,18 @@ declare(strict_types=1);
 
 namespace ReadyData\Import\Test\Unit\Model\Media;
 
+use GuzzleHttp\Psr7\Utils;
 use Magento\Catalog\Model\Product\Media\Config as MediaConfig;
 use Magento\Framework\Filesystem;
 use Magento\Framework\Filesystem\Directory\WriteInterface;
 use Magento\Framework\Filesystem\DriverInterface;
-use Magento\Framework\HTTP\ClientFactory;
-use Magento\Framework\HTTP\ClientInterface;
+use Magento\Framework\Filesystem\File\WriteInterface as FileWriteInterface;
 use Magento\MediaStorage\Helper\File\Storage\Database as StorageDatabase;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
 use ReadyData\Import\Logger\Logger;
 use ReadyData\Import\Model\Config;
+use ReadyData\Import\Model\Media\DownloaderInterface;
 use ReadyData\Import\Model\Media\FileResolver;
 
 class FileResolverTest extends TestCase
@@ -27,26 +28,41 @@ class FileResolverTest extends TestCase
     private const JPEG = "\xFF\xD8\xFFbody";
     private const PNG = "\x89PNG\r\n\x1A\nbody";
 
+    /** sha1('https://cdn.example.com/img/hero.jpg') truncated as the resolver does. */
+    private const HERO_URL = 'https://cdn.example.com/img/hero.jpg';
+
     private Filesystem&MockObject $filesystem;
     private WriteInterface&MockObject $directory;
     private DriverInterface&MockObject $driver;
     private MediaConfig&MockObject $mediaConfig;
-    private ClientFactory&MockObject $clientFactory;
-    private ClientInterface&MockObject $client;
+    private DownloaderInterface&MockObject $downloader;
     private StorageDatabase&MockObject $storageDatabase;
     private Config&MockObject $config;
     private Logger&MockObject $logger;
     private FileResolver $resolver;
 
+    /** @var array<string, string> path => bytes written through openFile() */
+    private array $written = [];
+    /** @var array<int, array{0: string, 1: string}> renameFile(from, to) calls */
+    private array $renamed = [];
+    /** @var string[] delete() calls */
+    private array $deleted = [];
+    /** @var array<string, string> path => contents, for isExist/readFile */
+    private array $existing = [];
+
     protected function setUp(): void
     {
+        $this->written = [];
+        $this->renamed = [];
+        $this->deleted = [];
+        $this->existing = [];
+
         $this->driver = $this->createMock(DriverInterface::class);
-        $this->directory = $this->createMock(WriteInterface::class);
-        $this->directory->method('getDriver')->willReturn($this->driver);
-        $this->directory->method('getAbsolutePath')
-            ->willReturnCallback(static fn (string $p): string => '/var/www/pub/media/' . ltrim($p, '/'));
         // By default every path resolves inside the product media directory.
         $this->driver->method('getRealPath')->willReturnArgument(0);
+
+        $this->directory = $this->createMock(WriteInterface::class);
+        $this->configureDirectory($this->directory);
 
         $this->filesystem = $this->createMock(Filesystem::class);
         $this->filesystem->method('getDirectoryWrite')->willReturn($this->directory);
@@ -54,9 +70,7 @@ class FileResolverTest extends TestCase
         $this->mediaConfig = $this->createMock(MediaConfig::class);
         $this->mediaConfig->method('getBaseMediaPath')->willReturn(self::BASE);
 
-        $this->client = $this->createMock(ClientInterface::class);
-        $this->clientFactory = $this->createMock(ClientFactory::class);
-        $this->clientFactory->method('create')->willReturn($this->client);
+        $this->downloader = $this->createMock(DownloaderInterface::class);
 
         $this->storageDatabase = $this->createMock(StorageDatabase::class);
         $this->storageDatabase->method('checkDbUsage')->willReturn(false);
@@ -64,26 +78,19 @@ class FileResolverTest extends TestCase
         $this->config = $this->createMock(Config::class);
         $this->config->method('getMediaAllowedExtensions')->willReturn(['jpg', 'jpeg', 'png', 'gif', 'webp']);
         $this->config->method('getMediaAllowedHosts')->willReturn([]);
-        $this->config->method('getMediaDownloadTimeout')->willReturn(15);
         $this->config->method('getMediaMaxFileSizeKb')->willReturn(10240);
         $this->config->method('isMediaRedownloadExisting')->willReturn(false);
 
         $this->logger = $this->createMock(Logger::class);
 
-        $this->resolver = new FileResolver(
-            $this->filesystem,
-            $this->mediaConfig,
-            $this->clientFactory,
-            $this->storageDatabase,
-            $this->config,
-            $this->logger
-        );
+        $this->resolver = $this->resolverWith();
     }
+
+    // ---------------------------------------------------------------- local
 
     public function testExistingLocalPathIsAccepted(): void
     {
-        $this->directory->method('isExist')->with(self::BASE . '/s/h/shirt.jpg')->willReturn(true);
-        $this->directory->method('isFile')->willReturn(true);
+        $this->existing[self::BASE . '/s/h/shirt.jpg'] = 'bytes';
 
         self::assertSame(
             ['/s/h/shirt.jpg' => ['file' => '/s/h/shirt.jpg', 'message' => null]],
@@ -96,8 +103,7 @@ class FileResolverTest extends TestCase
      */
     public function testEquivalentLocalReferencesNormaliseToOnePath(string $reference): void
     {
-        $this->directory->method('isExist')->willReturn(true);
-        $this->directory->method('isFile')->willReturn(true);
+        $this->existing[self::BASE . '/s/h/shirt.jpg'] = 'bytes';
 
         self::assertSame('/s/h/shirt.jpg', $this->resolver->resolve([$reference])[$reference]['file']);
     }
@@ -118,8 +124,6 @@ class FileResolverTest extends TestCase
 
     public function testMissingLocalFileIsReportedNotThrown(): void
     {
-        $this->directory->method('isExist')->willReturn(false);
-
         $result = $this->resolver->resolve(['/s/h/shirt.jpg']);
 
         self::assertNull($result['/s/h/shirt.jpg']['file']);
@@ -131,17 +135,12 @@ class FileResolverTest extends TestCase
         // realpath() cannot resolve a path that is not there, so the containment
         // check must not run first: a plain typo would be reported as a security
         // problem and send whoever reads the message on a hunt.
-        $driver = $this->createMock(DriverInterface::class);
-        $driver->method('getRealPath')->willReturnCallback(
-            static fn (string $p): string|false => str_contains($p, 'ghost') ? false : $p
-        );
-        $directory = $this->createMock(WriteInterface::class);
-        $directory->method('getDriver')->willReturn($driver);
-        $directory->method('getAbsolutePath')
-            ->willReturnCallback(static fn (string $p): string => '/var/www/pub/media/' . ltrim($p, '/'));
-        $directory->method('isExist')->willReturn(false);
+        $this->driver = $this->createMock(DriverInterface::class);
+        $this->driver->method('getRealPath')->willReturn(false);
+        $this->directory = $this->createMock(WriteInterface::class);
+        $this->configureDirectory($this->directory);
 
-        $result = $this->resolverWithDirectory($directory)->resolve(['/g/h/ghost.jpg']);
+        $result = $this->resolverWithDirectory($this->directory)->resolve(['/g/h/ghost.jpg']);
 
         self::assertStringContainsString('was not found', $result['/g/h/ghost.jpg']['message']);
     }
@@ -151,8 +150,7 @@ class FileResolverTest extends TestCase
      */
     public function testTraversalAndAbsoluteEscapesAreRejected(string $reference): void
     {
-        $this->directory->method('isExist')->willReturn(true);
-        $this->directory->method('isFile')->willReturn(true);
+        $this->existing = ['any' => 'bytes'];
 
         $result = $this->resolver->resolve([$reference]);
 
@@ -181,9 +179,6 @@ class FileResolverTest extends TestCase
      */
     public function testDisallowedLocalExtensionIsRejected(string $reference): void
     {
-        $this->directory->method('isExist')->willReturn(true);
-        $this->directory->method('isFile')->willReturn(true);
-
         $result = $this->resolver->resolve([$reference]);
 
         self::assertNull($result[$reference]['file']);
@@ -205,214 +200,246 @@ class FileResolverTest extends TestCase
 
     public function testLocalPathResolvingOutsideTheMediaDirectoryIsRejected(): void
     {
-        $driver = $this->createMock(DriverInterface::class);
         // A symlink out of the tree: the syntactic whitelist passes, the
         // containment check does not.
-        $driver->method('getRealPath')->willReturnCallback(
+        $this->driver = $this->createMock(DriverInterface::class);
+        $this->driver->method('getRealPath')->willReturnCallback(
             static fn (string $p): string => str_contains($p, 'escape') ? '/etc/passwd' : $p
         );
         $this->directory = $this->createMock(WriteInterface::class);
-        $this->directory->method('getDriver')->willReturn($driver);
-        $this->directory->method('getAbsolutePath')
-            ->willReturnCallback(static fn (string $p): string => '/var/www/pub/media/' . ltrim($p, '/'));
-        $this->directory->method('isExist')->willReturn(true);
-        $this->directory->method('isFile')->willReturn(true);
-        $resolver = $this->resolverWithDirectory($this->directory);
+        $this->configureDirectory($this->directory);
+        $this->existing[self::BASE . '/e/s/escape.jpg'] = 'bytes';
 
-        $result = $resolver->resolve(['/e/s/escape.jpg']);
+        $result = $this->resolverWithDirectory($this->directory)->resolve(['/e/s/escape.jpg']);
 
         self::assertNull($result['/e/s/escape.jpg']['file']);
         self::assertStringContainsString('resolves outside', $result['/e/s/escape.jpg']['message']);
     }
 
-    public function testUrlIsDownloadedToItsDispersedPath(): void
+    // ----------------------------------------------------------- downloads
+
+    public function testUrlIsDownloadedToItsHashedDispersedPath(): void
     {
         $url = 'https://cdn.example.com/img/Hero%20Shot.JPG';
-        $this->directory->method('isExist')->willReturn(false);
-        $this->client->method('getStatus')->willReturn(200);
-        $this->client->method('getHeaders')->willReturn([]);
-        $this->client->method('getBody')->willReturn(self::JPEG);
+        $this->stubDownload([$url => self::JPEG]);
 
-        $this->client->expects(self::once())->method('get')->with($url);
-        $this->directory->expects(self::once())->method('create')
-            ->with(self::BASE . '/h/e');
-        $this->directory->expects(self::once())->method('writeFile')
-            ->with(self::BASE . '/h/e/hero_20shot.jpg', self::JPEG);
+        $expected = '/h/e/hero_20shot_' . substr(sha1($url), 0, 8) . '.jpg';
 
-        self::assertSame('/h/e/hero_20shot.jpg', $this->resolver->resolve([$url])[$url]['file']);
+        self::assertSame($expected, $this->resolver->resolve([$url])[$url]['file']);
+        // Written under a temporary name, then renamed: a killed process must
+        // never leave a truncated file where skip-if-present would trust it.
+        self::assertSame([self::BASE . $expected . '.rd-part' => self::JPEG], $this->written);
+        self::assertSame([[self::BASE . $expected . '.rd-part', self::BASE . $expected]], $this->renamed);
+    }
+
+    public function testHashedNameIsStableAcrossRuns(): void
+    {
+        $this->stubDownload([self::HERO_URL => self::JPEG]);
+        $first = $this->resolver->resolve([self::HERO_URL])[self::HERO_URL]['file'];
+
+        $this->written = [];
+        $this->renamed = [];
+        $this->stubDownload([self::HERO_URL => self::JPEG]);
+        $second = $this->resolver->resolve([self::HERO_URL])[self::HERO_URL]['file'];
+
+        self::assertSame($first, $second);
+    }
+
+    public function testTwoUrlsSharingABasenameGetDistinctStablePaths(): void
+    {
+        // The bug this naming scheme exists to prevent: with a shared
+        // "/h/e/hero.jpg" the second product silently adopts the first
+        // product's image on the next run, via skip-if-present.
+        $a = 'https://a.example.com/img/hero.jpg';
+        $b = 'https://b.example.com/img/hero.jpg';
+        $bytesB = self::JPEG . 'a different picture';
+
+        $fetched = 0;
+        $this->downloader->method('fetchAll')->willReturnCallback(
+            function (array $urls, callable $onEach) use ($a, $bytesB, &$fetched): void {
+                foreach ($urls as $key => $url) {
+                    $fetched++;
+                    $onEach($key, Utils::streamFor($url === $a ? self::JPEG : $bytesB), 200, null);
+                }
+            }
+        );
+
+        $first = $this->resolver->resolve([$a, $b]);
+
+        self::assertSame(2, $fetched);
+        self::assertNotSame($first[$a]['file'], $first[$b]['file']);
+
+        // Second run: both files are published, so neither is fetched and each
+        // reference still resolves to its own path.
+        $this->existing[self::BASE . $first[$a]['file']] = self::JPEG;
+        $this->existing[self::BASE . $first[$b]['file']] = $bytesB;
+
+        $second = $this->resolver->resolve([$a, $b]);
+
+        self::assertSame(2, $fetched, 'a published image must never be fetched again');
+
+        self::assertSame($first[$a]['file'], $second[$a]['file']);
+        self::assertSame($first[$b]['file'], $second[$b]['file']);
+    }
+
+    public function testOnlyUrlsThatNeedFetchingReachTheDownloader(): void
+    {
+        $published = 'https://cdn.example.com/img/published.jpg';
+        $fresh = 'https://cdn.example.com/img/fresh.jpg';
+        $this->existing[self::BASE . '/p/u/published_' . substr(sha1($published), 0, 8) . '.jpg'] = self::JPEG;
+
+        $requested = null;
+        $this->downloader->expects(self::once())->method('fetchAll')
+            ->willReturnCallback(function (array $urls, callable $onEach) use (&$requested): void {
+                $requested = $urls;
+                foreach ($urls as $key => $url) {
+                    $onEach($key, Utils::streamFor(self::JPEG), 200, null);
+                }
+            });
+
+        $this->resolver->resolve([$published, '/s/h/local.jpg', $fresh]);
+
+        self::assertSame([$fresh => $fresh], $requested);
     }
 
     public function testExistingTargetIsNotDownloadedAgain(): void
     {
-        $url = 'https://cdn.example.com/img/hero.jpg';
-        $this->directory->method('isExist')->willReturn(true);
+        $this->existing[self::BASE . '/h/e/hero_' . substr(sha1(self::HERO_URL), 0, 8) . '.jpg'] = self::JPEG;
 
-        // The whole point of skip-if-present: a re-import makes no request at all.
-        $this->clientFactory->expects(self::never())->method('create');
-        $this->directory->expects(self::never())->method('writeFile');
+        $this->downloader->expects(self::never())->method('fetchAll');
 
-        self::assertSame('/h/e/hero.jpg', $this->resolver->resolve([$url])[$url]['file']);
+        self::assertSame(
+            '/h/e/hero_' . substr(sha1(self::HERO_URL), 0, 8) . '.jpg',
+            $this->resolver->resolve([self::HERO_URL])[self::HERO_URL]['file']
+        );
     }
 
-    public function testRedownloadOfIdenticalBytesLeavesTheFileAlone(): void
+    public function testRedownloadOfIdenticalBytesLeavesThePublishedFileAlone(): void
     {
-        $config = $this->configWithRedownload();
-        $resolver = $this->resolverWithConfig($config);
+        $resolver = $this->resolverWithConfig($this->configWithRedownload());
+        $target = '/h/e/hero_' . substr(sha1(self::HERO_URL), 0, 8) . '.jpg';
+        $this->existing[self::BASE . $target] = self::JPEG;
+        $this->stubDownload([self::HERO_URL => self::JPEG]);
 
-        $url = 'https://cdn.example.com/img/hero.jpg';
-        $this->directory->method('isExist')->willReturn(true);
-        $this->directory->method('readFile')->willReturn(self::JPEG);
-        $this->client->method('getStatus')->willReturn(200);
-        $this->client->method('getHeaders')->willReturn([]);
-        $this->client->method('getBody')->willReturn(self::JPEG);
-
-        $this->directory->expects(self::never())->method('writeFile');
-
-        self::assertSame('/h/e/hero.jpg', $resolver->resolve([$url])[$url]['file']);
+        self::assertSame($target, $resolver->resolve([self::HERO_URL])[self::HERO_URL]['file']);
+        // The part file is written, found identical, and discarded.
+        self::assertSame([], $this->renamed);
+        self::assertSame([self::BASE . $target . '.rd-part'], $this->deleted);
     }
 
-    public function testDifferentBytesUnderTheSameNameGetAStableUrlDerivedSuffix(): void
+    public function testRedownloadOfChangedBytesReplacesTheFileAndWarns(): void
     {
-        $config = $this->configWithRedownload();
-        $resolver = $this->resolverWithConfig($config);
+        $resolver = $this->resolverWithConfig($this->configWithRedownload());
+        $target = '/h/e/hero_' . substr(sha1(self::HERO_URL), 0, 8) . '.jpg';
+        $this->existing[self::BASE . $target] = 'stale bytes';
+        $this->stubDownload([self::HERO_URL => self::JPEG]);
 
-        $url = 'https://cdn.example.com/img/hero.jpg';
-        // Dispersion follows the new name, which still starts "he".
-        $expected = '/h/e/hero_' . substr(sha1($url), 0, 8) . '.jpg';
+        $this->logger->expects(self::once())->method('warning')
+            ->with(self::stringContains('renditions'));
 
-        $this->directory->method('isExist')
-            ->willReturnCallback(static fn (string $p): bool => !str_contains($p, '_'));
-        $this->directory->method('readFile')->willReturn('other bytes');
-        $this->client->method('getStatus')->willReturn(200);
-        $this->client->method('getHeaders')->willReturn([]);
-        $this->client->method('getBody')->willReturn(self::JPEG);
-
-        $this->directory->expects(self::once())->method('writeFile')
-            ->with(self::BASE . $expected, self::JPEG);
-
-        self::assertSame($expected, $resolver->resolve([$url])[$url]['file']);
+        self::assertSame($target, $resolver->resolve([self::HERO_URL])[self::HERO_URL]['file']);
+        self::assertSame([[self::BASE . $target . '.rd-part', self::BASE . $target]], $this->renamed);
     }
 
     public function testNonOkStatusIsReported(): void
     {
-        $url = 'https://cdn.example.com/img/hero.jpg';
-        $this->directory->method('isExist')->willReturn(false);
-        $this->client->method('getStatus')->willReturn(404);
+        $this->stubDownload([self::HERO_URL => self::JPEG], 404);
 
-        $result = $this->resolver->resolve([$url]);
+        $result = $this->resolver->resolve([self::HERO_URL]);
 
-        self::assertNull($result[$url]['file']);
-        self::assertStringContainsString('HTTP 404', $result[$url]['message']);
+        self::assertNull($result[self::HERO_URL]['file']);
+        self::assertStringContainsString('HTTP 404', $result[self::HERO_URL]['message']);
+        self::assertSame([], $this->written);
     }
 
-    public function testAnnouncedOversizeIsRejectedWithoutWriting(): void
+    public function testTransportErrorIsReported(): void
     {
-        $url = 'https://cdn.example.com/img/hero.jpg';
-        $this->directory->method('isExist')->willReturn(false);
-        $this->client->method('getStatus')->willReturn(200);
-        $this->client->method('getHeaders')->willReturn(['content-length' => (string)(20 * 1024 * 1024)]);
+        $this->downloader->method('fetchAll')->willReturnCallback(
+            static function (array $urls, callable $onEach): void {
+                foreach (array_keys($urls) as $key) {
+                    $onEach($key, null, 0, new \RuntimeException('Connection refused'));
+                }
+            }
+        );
 
-        $this->directory->expects(self::never())->method('writeFile');
+        $result = $this->resolver->resolve([self::HERO_URL]);
 
-        $result = $this->resolver->resolve([$url]);
-
-        self::assertNull($result[$url]['file']);
-        self::assertStringContainsString('above the', $result[$url]['message']);
-    }
-
-    public function testOversizeBodyIsRejected(): void
-    {
-        $config = $this->createMock(Config::class);
-        $config->method('getMediaAllowedExtensions')->willReturn(['jpg']);
-        $config->method('getMediaAllowedHosts')->willReturn([]);
-        $config->method('getMediaDownloadTimeout')->willReturn(15);
-        $config->method('getMediaMaxFileSizeKb')->willReturn(1);
-        $config->method('isMediaRedownloadExisting')->willReturn(false);
-        $resolver = $this->resolverWithConfig($config);
-
-        $url = 'https://cdn.example.com/img/hero.jpg';
-        $this->directory->method('isExist')->willReturn(false);
-        $this->client->method('getStatus')->willReturn(200);
-        // A lying origin: no Content-Length, oversize body.
-        $this->client->method('getHeaders')->willReturn([]);
-        $this->client->method('getBody')->willReturn(self::JPEG . str_repeat('x', 2048));
-
-        $this->directory->expects(self::never())->method('writeFile');
-
-        self::assertNull($resolver->resolve([$url])[$url]['file']);
-    }
-
-    public function testEmptyBodyIsRejected(): void
-    {
-        $url = 'https://cdn.example.com/img/hero.jpg';
-        $this->directory->method('isExist')->willReturn(false);
-        $this->client->method('getStatus')->willReturn(200);
-        $this->client->method('getHeaders')->willReturn([]);
-        $this->client->method('getBody')->willReturn('');
-
-        self::assertStringContainsString('no content', $this->resolver->resolve([$url])[$url]['message']);
+        self::assertNull($result[self::HERO_URL]['file']);
+        self::assertStringContainsString('Connection refused', $result[self::HERO_URL]['message']);
     }
 
     public function testContentNotMatchingTheClaimedTypeIsNeverWritten(): void
     {
-        $url = 'https://cdn.example.com/img/hero.jpg';
-        $this->directory->method('isExist')->willReturn(false);
-        $this->client->method('getStatus')->willReturn(200);
-        $this->client->method('getHeaders')->willReturn([]);
         // A PHP payload wearing a .jpg name.
-        $this->client->method('getBody')->willReturn('<?php echo "pwned";');
+        $this->stubDownload([self::HERO_URL => '<?php echo "pwned";']);
 
-        $this->directory->expects(self::never())->method('writeFile');
+        $result = $this->resolver->resolve([self::HERO_URL]);
 
-        $result = $this->resolver->resolve([$url]);
-
-        self::assertNull($result[$url]['file']);
-        self::assertStringContainsString('is not a valid jpg image', $result[$url]['message']);
+        self::assertNull($result[self::HERO_URL]['file']);
+        self::assertStringContainsString('is not a valid jpg image', $result[self::HERO_URL]['message']);
+        self::assertSame([], $this->written);
+        self::assertSame([], $this->renamed);
     }
 
     public function testExtensionAndContentMustAgree(): void
     {
         $url = 'https://cdn.example.com/img/hero.png';
-        $this->directory->method('isExist')->willReturn(false);
-        $this->client->method('getStatus')->willReturn(200);
-        $this->client->method('getHeaders')->willReturn([]);
-        $this->client->method('getBody')->willReturn(self::PNG);
+        $this->stubDownload([$url => self::PNG]);
 
-        self::assertSame('/h/e/hero.png', $this->resolver->resolve([$url])[$url]['file']);
+        self::assertSame(
+            '/h/e/hero_' . substr(sha1($url), 0, 8) . '.png',
+            $this->resolver->resolve([$url])[$url]['file']
+        );
     }
 
     public function testWebpRequiresTheRiffFormMarker(): void
     {
         $url = 'https://cdn.example.com/img/hero.webp';
-        $this->directory->method('isExist')->willReturn(false);
-        $this->client->method('getStatus')->willReturn(200);
-        $this->client->method('getHeaders')->willReturn([]);
-        $this->client->method('getBody')->willReturn('RIFF' . '1234' . 'AVI body');
+        $this->stubDownload([$url => 'RIFF' . '1234' . 'AVI body']);
 
         self::assertNull($this->resolver->resolve([$url])[$url]['file']);
     }
 
-    public function testTimeoutAndRedirectCapsComeFromConfiguration(): void
+    public function testEmptyBodyIsRejected(): void
     {
-        $url = 'https://cdn.example.com/img/hero.jpg';
-        $this->directory->method('isExist')->willReturn(false);
-        $this->client->method('getStatus')->willReturn(200);
-        $this->client->method('getHeaders')->willReturn([]);
-        $this->client->method('getBody')->willReturn(self::JPEG);
+        $this->stubDownload([self::HERO_URL => '']);
 
-        $this->client->expects(self::once())->method('setTimeout')->with(15);
-        $options = [];
-        $this->client->method('setOption')->willReturnCallback(
-            function (int $key, mixed $value) use (&$options): void {
-                $options[$key] = $value;
-            }
+        self::assertStringContainsString(
+            'no content',
+            $this->resolver->resolve([self::HERO_URL])[self::HERO_URL]['message']
         );
+    }
 
-        $this->resolver->resolve([$url]);
+    public function testOversizeBodyIsStoppedMidStreamAndThePartFileRemoved(): void
+    {
+        $config = $this->createMock(Config::class);
+        $config->method('getMediaAllowedExtensions')->willReturn(['jpg']);
+        $config->method('getMediaAllowedHosts')->willReturn([]);
+        $config->method('getMediaMaxFileSizeKb')->willReturn(1);
+        $config->method('isMediaRedownloadExisting')->willReturn(false);
+        $resolver = $this->resolverWithConfig($config);
 
-        self::assertSame(5, $options[CURLOPT_CONNECTTIMEOUT]);
-        self::assertTrue($options[CURLOPT_FOLLOWLOCATION]);
-        self::assertSame(3, $options[CURLOPT_MAXREDIRS]);
+        // A lying origin: no Content-Length, oversize body.
+        $this->stubDownload([self::HERO_URL => self::JPEG . str_repeat('x', 4096)]);
+
+        $result = $resolver->resolve([self::HERO_URL]);
+
+        self::assertNull($result[self::HERO_URL]['file']);
+        self::assertStringContainsString('exceeds the', $result[self::HERO_URL]['message']);
+        self::assertSame([], $this->renamed);
+        self::assertCount(1, $this->deleted, 'the partial file must be removed');
+    }
+
+    public function testLongFileNamesStayWithinTheFilesystemLimit(): void
+    {
+        $url = 'https://cdn.example.com/img/' . str_repeat('a', 400) . '.jpg';
+        $this->stubDownload([$url => self::JPEG]);
+
+        $file = $this->resolver->resolve([$url])[$url]['file'];
+
+        self::assertNotNull($file);
+        self::assertLessThanOrEqual(255, strlen(basename($file)));
+        self::assertStringEndsWith('_' . substr(sha1($url), 0, 8) . '.jpg', $file);
     }
 
     public function testHostAllowListIsEnforcedWhenConfigured(): void
@@ -420,13 +447,11 @@ class FileResolverTest extends TestCase
         $config = $this->createMock(Config::class);
         $config->method('getMediaAllowedExtensions')->willReturn(['jpg']);
         $config->method('getMediaAllowedHosts')->willReturn(['cdn.example.com']);
-        $config->method('getMediaDownloadTimeout')->willReturn(15);
         $config->method('getMediaMaxFileSizeKb')->willReturn(10240);
         $config->method('isMediaRedownloadExisting')->willReturn(false);
         $resolver = $this->resolverWithConfig($config);
 
-        $this->directory->method('isExist')->willReturn(false);
-        $this->clientFactory->expects(self::never())->method('create');
+        $this->downloader->expects(self::never())->method('fetchAll');
 
         $url = 'http://169.254.169.254/latest/meta-data/hero.jpg';
         $result = $resolver->resolve([$url]);
@@ -440,8 +465,7 @@ class FileResolverTest extends TestCase
      */
     public function testUnusableUrlsAreReported(string $url, string $expected): void
     {
-        $this->directory->method('isExist')->willReturn(false);
-        $this->directory->method('isFile')->willReturn(false);
+        $this->downloader->expects(self::never())->method('fetchAll');
 
         $result = $this->resolver->resolve([$url]);
 
@@ -462,10 +486,7 @@ class FileResolverTest extends TestCase
             'javascript' => ['javascript:alert(1)', 'not a valid path'],
             'host only' => ['https://example.com', 'could not be parsed'],
             'directory url' => ['https://example.com/img/', 'no usable file name'],
-            'extension without a signature' => [
-                'https://example.com/img/hero.gif2',
-                'not allowed',
-            ],
+            'extension without a signature' => ['https://example.com/img/hero.gif2', 'not allowed'],
         ];
     }
 
@@ -475,13 +496,11 @@ class FileResolverTest extends TestCase
         // A merchant widened the allow-list to a format we cannot verify.
         $config->method('getMediaAllowedExtensions')->willReturn(['jpg', 'svg']);
         $config->method('getMediaAllowedHosts')->willReturn([]);
-        $config->method('getMediaDownloadTimeout')->willReturn(15);
         $config->method('getMediaMaxFileSizeKb')->willReturn(10240);
         $config->method('isMediaRedownloadExisting')->willReturn(false);
         $resolver = $this->resolverWithConfig($config);
 
-        $this->directory->method('isExist')->willReturn(false);
-        $this->clientFactory->expects(self::never())->method('create');
+        $this->downloader->expects(self::never())->method('fetchAll');
 
         $url = 'https://cdn.example.com/img/logo.svg';
         $result = $resolver->resolve([$url]);
@@ -490,35 +509,23 @@ class FileResolverTest extends TestCase
         self::assertStringContainsString('no known image signature', $result[$url]['message']);
     }
 
-    public function testThrowingHttpClientIsCaughtAndLogged(): void
+    public function testUnexpectedFailureIsCaughtAndLogged(): void
     {
-        $url = 'https://cdn.example.com/img/hero.jpg';
-        $this->directory->method('isExist')->willReturn(false);
-        $this->client->method('get')->willThrowException(new \Exception('Error 28: Operation timed out'));
+        $this->downloader->method('fetchAll')->willReturnCallback(
+            static function (array $urls, callable $onEach): void {
+                foreach (array_keys($urls) as $key) {
+                    $onEach($key, Utils::streamFor(self::JPEG), 200, null);
+                }
+            }
+        );
+        $this->directory->method('openFile')->willThrowException(new \RuntimeException('disk is full'));
 
         $this->logger->expects(self::once())->method('warning');
 
-        $result = $this->resolver->resolve([$url]);
+        $result = $this->resolver->resolve([self::HERO_URL]);
 
-        self::assertNull($result[$url]['file']);
-        self::assertStringContainsString('Operation timed out', $result[$url]['message']);
-    }
-
-    public function testEachDistinctReferenceIsFetchedOnce(): void
-    {
-        $this->directory->method('isExist')->willReturn(false);
-        $this->client->method('getStatus')->willReturn(200);
-        $this->client->method('getHeaders')->willReturn([]);
-        $this->client->method('getBody')->willReturn(self::JPEG);
-
-        $this->clientFactory->expects(self::exactly(2))->method('create')->willReturn($this->client);
-
-        $result = $this->resolver->resolve([
-            'https://cdn.example.com/img/a.jpg',
-            'https://cdn.example.com/img/b.jpg',
-        ]);
-
-        self::assertCount(2, $result);
+        self::assertNull($result[self::HERO_URL]['file']);
+        self::assertStringContainsString('disk is full', $result[self::HERO_URL]['message']);
     }
 
     public function testDatabaseMediaStorageRefusesEverything(): void
@@ -528,19 +535,75 @@ class FileResolverTest extends TestCase
         $resolver = new FileResolver(
             $this->filesystem,
             $this->mediaConfig,
-            $this->clientFactory,
+            $this->downloader,
             $storageDatabase,
             $this->config,
             $this->logger
         );
 
-        $this->clientFactory->expects(self::never())->method('create');
+        $this->downloader->expects(self::never())->method('fetchAll');
         $this->logger->expects(self::once())->method('error');
 
-        $result = $resolver->resolve(['/s/h/shirt.jpg', 'https://cdn.example.com/img/hero.jpg']);
+        $result = $resolver->resolve(['/s/h/shirt.jpg', self::HERO_URL]);
 
         self::assertNull($result['/s/h/shirt.jpg']['file']);
         self::assertStringContainsString('database media storage', $result['/s/h/shirt.jpg']['message']);
+    }
+
+    // ------------------------------------------------------------- helpers
+
+    /**
+     * Make the downloader hand each URL the given bytes.
+     *
+     * @param array<string, string> $bodies url => bytes
+     */
+    private function stubDownload(array $bodies, int $status = 200): void
+    {
+        $this->downloader->method('fetchAll')->willReturnCallback(
+            static function (array $urls, callable $onEach) use ($bodies, $status): void {
+                foreach ($urls as $key => $url) {
+                    $onEach($key, Utils::streamFor($bodies[$url] ?? ''), $status, null);
+                }
+            }
+        );
+    }
+
+    private function configureDirectory(WriteInterface&MockObject $directory): void
+    {
+        $directory->method('getDriver')->willReturn($this->driver);
+        $directory->method('getAbsolutePath')
+            ->willReturnCallback(static fn (string $p): string => '/var/www/pub/media/' . ltrim($p, '/'));
+        $directory->method('isExist')
+            ->willReturnCallback(fn (string $p): bool => isset($this->existing[$p]));
+        $directory->method('isFile')
+            ->willReturnCallback(fn (string $p): bool => isset($this->existing[$p]));
+        $directory->method('readFile')
+            ->willReturnCallback(fn (string $p): string => $this->existing[$p] ?? '');
+        $directory->method('renameFile')
+            ->willReturnCallback(function (string $from, string $to): bool {
+                $this->renamed[] = [$from, $to];
+                return true;
+            });
+        $directory->method('delete')
+            ->willReturnCallback(function (string $p): bool {
+                $this->deleted[] = $p;
+                unset($this->existing[$p]);
+                return true;
+            });
+        $directory->method('openFile')
+            ->willReturnCallback(function (string $path): FileWriteInterface {
+                $this->written[$path] = '';
+                $file = $this->createMock(FileWriteInterface::class);
+                $file->method('write')->willReturnCallback(function (string $data) use ($path): int {
+                    $this->written[$path] .= $data;
+                    // A part file exists as soon as it is opened, so the cleanup
+                    // path can find and remove it.
+                    $this->existing[$path] = $this->written[$path];
+                    return strlen($data);
+                });
+
+                return $file;
+            });
     }
 
     private function configWithRedownload(): Config&MockObject
@@ -548,11 +611,22 @@ class FileResolverTest extends TestCase
         $config = $this->createMock(Config::class);
         $config->method('getMediaAllowedExtensions')->willReturn(['jpg', 'jpeg', 'png']);
         $config->method('getMediaAllowedHosts')->willReturn([]);
-        $config->method('getMediaDownloadTimeout')->willReturn(15);
         $config->method('getMediaMaxFileSizeKb')->willReturn(10240);
         $config->method('isMediaRedownloadExisting')->willReturn(true);
 
         return $config;
+    }
+
+    private function resolverWith(): FileResolver
+    {
+        return new FileResolver(
+            $this->filesystem,
+            $this->mediaConfig,
+            $this->downloader,
+            $this->storageDatabase,
+            $this->config,
+            $this->logger
+        );
     }
 
     private function resolverWithConfig(Config $config): FileResolver
@@ -560,7 +634,7 @@ class FileResolverTest extends TestCase
         return new FileResolver(
             $this->filesystem,
             $this->mediaConfig,
-            $this->clientFactory,
+            $this->downloader,
             $this->storageDatabase,
             $config,
             $this->logger
@@ -575,7 +649,7 @@ class FileResolverTest extends TestCase
         return new FileResolver(
             $filesystem,
             $this->mediaConfig,
-            $this->clientFactory,
+            $this->downloader,
             $this->storageDatabase,
             $this->config,
             $this->logger

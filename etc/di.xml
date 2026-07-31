@@ -39,6 +39,28 @@
     <preference for="ReadyData\Import\Api\Data\AttributeSyncResponseInterface"
                 type="ReadyData\Import\Model\Data\AttributeSyncResponse"/>
 
+    <!--
+        Image downloads. Per-request options (sink, timeouts, redirect cap) are
+        set by PooledDownloader; the client itself only carries what must be
+        fixed for every request. Kept as a dedicated virtual type so module
+        traffic can never inherit another module's client configuration.
+    -->
+    <virtualType name="ReadyData\Import\Model\Media\GuzzleClient" type="GuzzleHttp\Client">
+        <arguments>
+            <argument name="config" xsi:type="array">
+                <item name="http_errors" xsi:type="boolean">false</item>
+                <item name="verify" xsi:type="boolean">true</item>
+            </argument>
+        </arguments>
+    </virtualType>
+    <preference for="ReadyData\Import\Model\Media\DownloaderInterface"
+                type="ReadyData\Import\Model\Media\PooledDownloader"/>
+    <type name="ReadyData\Import\Model\Media\PooledDownloader">
+        <arguments>
+            <argument name="httpClient" xsi:type="object">ReadyData\Import\Model\Media\GuzzleClient</argument>
+        </arguments>
+    </type>
+
     <!-- Dedicated log file: var/log/readydata_import.log -->
     <type name="ReadyData\Import\Logger\Logger">
         <arguments>

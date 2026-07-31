@@ -20,6 +20,8 @@ class Config
     public const INDEXING_MODE_PARTIAL = 'partial';
 
     public const DEFAULT_MEDIA_DOWNLOAD_TIMEOUT = 15;
+    public const DEFAULT_MEDIA_DOWNLOAD_CONCURRENCY = 4;
+    public const MAX_MEDIA_DOWNLOAD_CONCURRENCY = 32;
     public const DEFAULT_MEDIA_MAX_FILE_SIZE_KB = 10240;
     public const DEFAULT_MEDIA_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp'];
 
@@ -40,6 +42,7 @@ class Config
     private const XML_PATH_AUTO_CREATE_ATTRIBUTES = 'readydata_import/attributes/auto_create';
     private const XML_PATH_MEDIA_ENABLED = 'readydata_import/media/enabled';
     private const XML_PATH_MEDIA_DOWNLOAD_TIMEOUT = 'readydata_import/media/download_timeout';
+    private const XML_PATH_MEDIA_DOWNLOAD_CONCURRENCY = 'readydata_import/media/download_concurrency';
     private const XML_PATH_MEDIA_MAX_FILE_SIZE_KB = 'readydata_import/media/max_file_size_kb';
     private const XML_PATH_MEDIA_ALLOWED_EXTENSIONS = 'readydata_import/media/allowed_extensions';
     private const XML_PATH_MEDIA_ALLOWED_HOSTS = 'readydata_import/media/allowed_hosts';
@@ -139,6 +142,23 @@ class Config
         $timeout = (int)$this->scopeConfig->getValue(self::XML_PATH_MEDIA_DOWNLOAD_TIMEOUT);
 
         return $timeout > 0 ? $timeout : self::DEFAULT_MEDIA_DOWNLOAD_TIMEOUT;
+    }
+
+    /**
+     * How many image downloads may be in flight at once. 1 is fully sequential.
+     *
+     * Clamped: this multiplies the transfer-time memory footprint (each in-flight
+     * response holds up to 2 MB in memory before spilling to disk) and the load
+     * put on the image origin, so an unbounded value would be a foot-gun.
+     */
+    public function getMediaDownloadConcurrency(): int
+    {
+        $concurrency = (int)$this->scopeConfig->getValue(self::XML_PATH_MEDIA_DOWNLOAD_CONCURRENCY);
+        if ($concurrency < 1) {
+            $concurrency = self::DEFAULT_MEDIA_DOWNLOAD_CONCURRENCY;
+        }
+
+        return min($concurrency, self::MAX_MEDIA_DOWNLOAD_CONCURRENCY);
     }
 
     public function getMediaMaxFileSizeKb(): int

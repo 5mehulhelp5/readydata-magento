@@ -11,8 +11,8 @@ use Magento\Framework\App\Filesystem\DirectoryList;
 use Magento\Framework\File\Uploader;
 use Magento\Framework\Filesystem;
 use Magento\Framework\Filesystem\Directory\WriteInterface;
-use Magento\Framework\HTTP\ClientFactory;
 use Magento\MediaStorage\Helper\File\Storage\Database as StorageDatabase;
+use Psr\Http\Message\StreamInterface;
 use ReadyData\Import\Logger\Logger;
 use ReadyData\Import\Model\Config;
 use ReadyData\Import\Model\Exception\MediaReferenceException;
@@ -26,18 +26,25 @@ use ReadyData\Import\Model\Exception\MediaReferenceException;
  * failure comes back as a per-reference message the processor turns into a
  * per-product warning.
  *
- * A URL maps to a DETERMINISTIC target path — sanitized basename under
- * Magento's standard two-character dispersion — so a re-import resolves to the
- * same path, the gallery diff matches the existing row and, unless
- * "Re-Download Existing Files" is on, no request is made at all. Two different
- * URLs whose basenames collide are disambiguated by a suffix derived from the URL
- * itself rather than a counter, so the mapping stays stable across runs (a
- * counter would hand the same image a different name on every import).
+ * Downloads run through a bounded concurrent pool (see DownloaderInterface),
+ * and resolve() is organised in three passes so they can: everything that can
+ * be decided without the network is decided first, the URLs that genuinely need
+ * fetching go to the pool in one call, and each body is validated and written
+ * inside the completion callback so no more than the configured concurrency is
+ * ever held.
+ *
+ * A URL maps to a DETERMINISTIC target path: the sanitized basename plus a short
+ * digest of the URL itself, under Magento's standard two-character dispersion.
+ * The digest is not decoration — without it two suppliers' "hero.jpg" collide on
+ * one path, and skip-if-present then hands the same file to both products. With
+ * it, a re-import resolves to the same path, the gallery diff matches the stored
+ * row, and nothing is re-downloaded.
  *
  * Downloaded bytes are verified against the file signature of the extension they
- * claim BEFORE anything is written, so a payload disguised as an image never
- * lands under pub/media and a rejected download leaves no partial file behind.
- * All I/O goes through the media directory's driver, never PHP's filesystem
+ * claim before anything is written, and are streamed to a temporary name and
+ * renamed into place, so neither a disguised payload nor a half-written file can
+ * ever be left where the next run's skip-if-present check would trust it. All
+ * I/O goes through the media directory's driver, never PHP's filesystem
  * primitives, so remote-storage set-ups are honoured.
  */
 class FileResolver
@@ -59,13 +66,18 @@ class FileResolver
         'avif' => ["\x00\x00\x00 ftypavif", "\x00\x00\x00\x1Cftypavif"],
     ];
 
-    private const CONNECT_TIMEOUT_SEC = 5;
-    private const MAX_REDIRECTS = 3;
+    /** Enough for the longest signature plus the WEBP form marker at offset 8. */
+    private const SIGNATURE_PROBE_BYTES = 16;
+
+    private const COPY_CHUNK_BYTES = 262144;
+    private const TMP_SUFFIX = '.rd-part';
+    private const MAX_FILE_NAME_LENGTH = 255;
+    private const URL_DIGEST_LENGTH = 8;
 
     public function __construct(
         private readonly Filesystem $filesystem,
         private readonly MediaConfig $mediaConfig,
-        private readonly ClientFactory $httpClientFactory,
+        private readonly DownloaderInterface $downloader,
         private readonly StorageDatabase $storageDatabase,
         private readonly Config $config,
         private readonly Logger $logger
@@ -98,28 +110,92 @@ class FileResolver
         $directory = $this->filesystem->getDirectoryWrite(DirectoryList::MEDIA);
         $base = $this->mediaConfig->getBaseMediaPath();
 
+        // 1. Decide everything that needs no network: local paths resolve now,
+        //    URLs are validated and reduced to a target path, and those already
+        //    published are answered without a request.
+        /** @var array<string, array{url: string, target: string, extension: string}> $pending */
+        $pending = [];
         foreach ($references as $reference) {
             $reference = (string)$reference;
-            try {
-                $file = preg_match('#^https?://#i', $reference) === 1
-                    ? $this->resolveUrl($directory, $base, $reference)
-                    : $this->resolveLocal($directory, $base, $reference);
-                $results[$reference] = ['file' => $file, 'message' => null];
-            } catch (MediaReferenceException $e) {
-                // Expected, per-reference problems: reported, not logged as errors.
-                $results[$reference] = ['file' => null, 'message' => $e->getMessage()];
-            } catch (\Throwable $e) {
-                $message = sprintf(
-                    'Media reference "%s" could not be resolved: %s',
-                    $reference,
-                    $e->getMessage()
-                );
-                $results[$reference] = ['file' => null, 'message' => $message];
-                $this->logger->warning($message, ['exception' => $e]);
-            }
+            $results[$reference] = $this->guard($reference, function () use (
+                $directory,
+                $base,
+                $reference,
+                &$pending
+            ): ?string {
+                if (preg_match('#^https?://#i', $reference) !== 1) {
+                    return $this->resolveLocal($directory, $base, $reference);
+                }
+
+                $plan = $this->planDownload($reference);
+                if (!$this->config->isMediaRedownloadExisting()
+                    && $directory->isExist($base . $plan['target'])
+                ) {
+                    // Already published: no request, no write. This is what makes
+                    // a re-import free and a retry after a rolled-back batch
+                    // converge on the same file.
+                    return $plan['target'];
+                }
+
+                $pending[$reference] = $plan;
+
+                return null;
+            });
+        }
+
+        // 2. Fetch what is left, concurrently, validating and writing each body
+        //    as it lands so only the in-flight ones are ever held.
+        if ($pending) {
+            $this->downloader->fetchAll(
+                array_map(static fn (array $plan): string => $plan['url'], $pending),
+                function (
+                    string $reference,
+                    ?StreamInterface $body,
+                    int $status,
+                    ?\Throwable $error
+                ) use (&$results, $pending, $directory, $base): void {
+                    $results[$reference] = $this->guard(
+                        $reference,
+                        fn (): string => $this->completeDownload(
+                            $directory,
+                            $base,
+                            $pending[$reference],
+                            $body,
+                            $status,
+                            $error
+                        )
+                    );
+                }
+            );
         }
 
         return $results;
+    }
+
+    /**
+     * Run one reference's resolution, converting anything it throws into the
+     * result shape. Expected problems carry a ready-to-report sentence;
+     * genuinely unexpected ones are additionally logged.
+     *
+     * @param callable(): (string|null) $resolve
+     * @return array{file: string|null, message: string|null}
+     */
+    private function guard(string $reference, callable $resolve): array
+    {
+        try {
+            return ['file' => $resolve(), 'message' => null];
+        } catch (MediaReferenceException $e) {
+            return ['file' => null, 'message' => $e->getMessage()];
+        } catch (\Throwable $e) {
+            $message = sprintf(
+                'Media reference "%s" could not be resolved: %s',
+                $reference,
+                $e->getMessage()
+            );
+            $this->logger->warning($message, ['exception' => $e]);
+
+            return ['file' => null, 'message' => $message];
+        }
     }
 
     /**
@@ -179,11 +255,12 @@ class FileResolver
     }
 
     /**
-     * Download a URL into pub/media/catalog/product and return its stored path.
+     * Validate a URL and derive the path its content will be stored at.
      *
+     * @return array{url: string, target: string, extension: string}
      * @throws MediaReferenceException
      */
-    private function resolveUrl(WriteInterface $directory, string $base, string $url): string
+    private function planDownload(string $url): array
     {
         $parts = parse_url($url);
         if (!is_array($parts) || empty($parts['host']) || empty($parts['path'])) {
@@ -200,9 +277,10 @@ class FileResolver
             );
         }
 
-        $name = mb_strtolower(Uploader::getCorrectFileName(basename($parts['path'])));
+        $name = mb_strtolower(Uploader::getCorrectFileName($this->trimToLimit(basename($parts['path']))));
         $extension = mb_strtolower((string)pathinfo($name, PATHINFO_EXTENSION));
-        if (pathinfo($name, PATHINFO_FILENAME) === '' || $extension === '') {
+        $stem = (string)pathinfo($name, PATHINFO_FILENAME);
+        if ($stem === '' || $extension === '') {
             throw new MediaReferenceException(
                 sprintf('Media URL "%s" has no usable file name; skipped.', $url)
             );
@@ -218,70 +296,101 @@ class FileResolver
             ));
         }
 
-        $target = Uploader::getDispersionPath($name) . '/' . $name;
-        if ($directory->isExist($base . $target) && !$this->config->isMediaRedownloadExisting()) {
-            // Already published: no request, no write. This is what makes a
-            // re-import free and a retry after a rolled-back batch converge.
-            return $target;
-        }
+        $name = $this->targetName($stem, $extension, $url);
 
-        $body = $this->download($url);
-        $this->assertSignature($url, $extension, $body);
-
-        return $this->store($directory, $base, $target, $name, $extension, $url, $body);
+        return [
+            'url' => $url,
+            'target' => Uploader::getDispersionPath($name) . '/' . $name,
+            'extension' => $extension,
+        ];
     }
 
     /**
+     * Keep a basename inside the filesystem limit, preserving its extension.
+     *
+     * Applied before core's sanitizer, which throws a LengthException on an
+     * over-long name rather than trimming it — a feed with a verbose filename
+     * would otherwise fail the entry outright. Sanitising can only shorten the
+     * result further, so trimming first is safe.
+     */
+    private function trimToLimit(string $basename): string
+    {
+        if (strlen($basename) <= self::MAX_FILE_NAME_LENGTH) {
+            return $basename;
+        }
+
+        $extension = (string)pathinfo($basename, PATHINFO_EXTENSION);
+        $stem = (string)pathinfo($basename, PATHINFO_FILENAME);
+        $room = self::MAX_FILE_NAME_LENGTH - ($extension === '' ? 0 : strlen($extension) + 1);
+        $stem = substr($stem, 0, max(1, $room));
+
+        return $extension === '' ? $stem : $stem . '.' . $extension;
+    }
+
+    /**
+     * "hero.jpg" from https://cdn/x/hero.jpg becomes "hero_1a2b3c4d.jpg".
+     *
+     * The digest makes the name a pure function of the URL, so two different
+     * URLs sharing a basename cannot land on one path — the collision that would
+     * otherwise let skip-if-present serve one supplier's image for another's.
+     */
+    private function targetName(string $stem, string $extension, string $url): string
+    {
+        $digest = substr(sha1($url), 0, self::URL_DIGEST_LENGTH);
+        $room = self::MAX_FILE_NAME_LENGTH - (strlen($digest) + strlen($extension) + 2);
+        if (strlen($stem) > $room) {
+            $stem = substr($stem, 0, max(1, $room));
+        }
+
+        return sprintf('%s_%s.%s', $stem, $digest, $extension);
+    }
+
+    /**
+     * Validate a completed download and put it in place.
+     *
+     * @param array{url: string, target: string, extension: string} $plan
      * @throws MediaReferenceException
      */
-    private function download(string $url): string
-    {
-        // A fresh client per reference: Curl is stateful, so options, headers and
-        // cookies must not leak from one download into the next.
-        $client = $this->httpClientFactory->create();
-        $client->setTimeout($this->config->getMediaDownloadTimeout());
-        $client->setOption(CURLOPT_CONNECTTIMEOUT, self::CONNECT_TIMEOUT_SEC);
-        $client->setOption(CURLOPT_FOLLOWLOCATION, true);
-        $client->setOption(CURLOPT_MAXREDIRS, self::MAX_REDIRECTS);
-        $client->get($url);
-
-        $status = (int)$client->getStatus();
+    private function completeDownload(
+        WriteInterface $directory,
+        string $base,
+        array $plan,
+        ?StreamInterface $body,
+        int $status,
+        ?\Throwable $error
+    ): string {
+        $url = $plan['url'];
+        if ($error !== null) {
+            throw new MediaReferenceException(
+                sprintf('Download of "%s" failed: %s; skipped.', $url, $error->getMessage())
+            );
+        }
         if ($status !== 200) {
             throw new MediaReferenceException(
                 sprintf('Download of "%s" failed with HTTP %d; skipped.', $url, $status)
             );
         }
-
-        $maxBytes = $this->config->getMediaMaxFileSizeKb() * 1024;
-        $headers = $client->getHeaders();
-        $declared = (int)($headers['content-length'] ?? $headers['Content-Length'] ?? 0);
-        if ($declared > $maxBytes) {
-            throw new MediaReferenceException(sprintf(
-                'Download of "%s" announced %d bytes, above the %d byte limit; skipped.',
-                $url,
-                $declared,
-                $maxBytes
-            ));
-        }
-
-        $body = (string)$client->getBody();
-        if ($body === '') {
+        if ($body === null) {
             throw new MediaReferenceException(sprintf('Download of "%s" returned no content; skipped.', $url));
         }
-        if (strlen($body) > $maxBytes) {
-            throw new MediaReferenceException(sprintf(
-                'Download of "%s" is %d bytes, above the %d byte limit; skipped.',
-                $url,
-                strlen($body),
-                $maxBytes
-            ));
-        }
 
-        return $body;
+        // Sniff before a single byte is written: this is what stops a payload
+        // wearing a .jpg name from reaching pub/media at all.
+        $probe = $body->read(self::SIGNATURE_PROBE_BYTES);
+        if ($probe === '') {
+            throw new MediaReferenceException(sprintf('Download of "%s" returned no content; skipped.', $url));
+        }
+        $this->assertSignature($url, $plan['extension'], $probe);
+
+        return $this->store($directory, $base, $plan['target'], $url, $probe, $body);
     }
 
     /**
-     * Write the downloaded bytes, reusing or side-stepping an existing file.
+     * Stream the body to a temporary name, then rename it into place.
+     *
+     * Never written directly to the target: a process killed mid-write would
+     * leave a truncated file exactly where the next run's skip-if-present check
+     * trusts it, and that file would then be served forever.
      *
      * @throws MediaReferenceException
      */
@@ -289,39 +398,74 @@ class FileResolver
         WriteInterface $directory,
         string $base,
         string $target,
-        string $name,
-        string $extension,
         string $url,
-        string $body
+        string $probe,
+        StreamInterface $body
     ): string {
+        $maxBytes = $this->config->getMediaMaxFileSizeKb() * 1024;
+        $tmpPath = $base . $target . self::TMP_SUFFIX;
+        $directory->create($base . dirname($target));
+
+        $hash = hash_init('sha1');
+        $written = 0;
+        $file = $directory->openFile($tmpPath, 'w');
+        try {
+            for ($chunk = $probe; $chunk !== ''; $chunk = $body->read(self::COPY_CHUNK_BYTES)) {
+                $written += strlen($chunk);
+                if ($written > $maxBytes) {
+                    // The true streaming cap: an origin that lies about (or
+                    // omits) Content-Length is stopped here rather than after a
+                    // whole body has been accepted.
+                    throw new MediaReferenceException(sprintf(
+                        'Download of "%s" exceeds the %d byte limit; skipped.',
+                        $url,
+                        $maxBytes
+                    ));
+                }
+                hash_update($hash, $chunk);
+                $file->write($chunk);
+            }
+        } catch (\Throwable $e) {
+            $file->close();
+            $this->discard($directory, $tmpPath);
+            throw $e;
+        }
+        $file->close();
+
         if ($directory->isExist($base . $target)) {
-            if (sha1((string)$directory->readFile($base . $target)) === sha1($body)) {
-                // Byte-identical: keep the published file untouched.
+            // Only reachable with "Re-Download Existing Files" on.
+            if (sha1((string)$directory->readFile($base . $target)) === hash_final($hash)) {
+                $this->discard($directory, $tmpPath);
+
                 return $target;
             }
-            // A different image under the same dispersed name. Suffix from the
-            // URL, so this reference always lands on the same alternative path
-            // instead of accumulating a new copy per import.
-            $stem = pathinfo($name, PATHINFO_FILENAME);
-            $name = sprintf('%s_%s.%s', $stem, substr(sha1($url), 0, 8), $extension);
-            $target = Uploader::getDispersionPath($name) . '/' . $name;
-
-            if ($directory->isExist($base . $target)) {
-                if (sha1((string)$directory->readFile($base . $target)) === sha1($body)) {
-                    return $target;
-                }
-                throw new MediaReferenceException(sprintf(
-                    'Download of "%s" collides with a different file already stored at "%s"; skipped.',
-                    $url,
-                    $target
-                ));
-            }
+            $this->logger->warning(sprintf(
+                'Replaced the stored bytes of "%s" from "%s"; resized renditions under'
+                . ' pub/media/catalog/product/cache are now stale for it.',
+                $target,
+                $url
+            ));
+            $directory->delete($base . $target);
         }
 
-        $directory->create($base . dirname($target));
-        $directory->writeFile($base . $target, $body);
+        $directory->renameFile($tmpPath, $base . $target);
 
         return $target;
+    }
+
+    private function discard(WriteInterface $directory, string $path): void
+    {
+        try {
+            if ($directory->isExist($path)) {
+                $directory->delete($path);
+            }
+        } catch (\Throwable $e) {
+            // A leftover part file is untidy, not harmful: it can never be
+            // mistaken for a published image because of its suffix.
+            $this->logger->warning(
+                sprintf('Could not remove the temporary media file "%s": %s', $path, $e->getMessage())
+            );
+        }
     }
 
     /**
@@ -341,12 +485,12 @@ class FileResolver
     /**
      * @throws MediaReferenceException
      */
-    private function assertSignature(string $url, string $extension, string $body): void
+    private function assertSignature(string $url, string $extension, string $probe): void
     {
         foreach (self::SIGNATURES[$extension] as $signature) {
-            if (str_starts_with($body, $signature)) {
+            if (str_starts_with($probe, $signature)) {
                 // RIFF containers carry their type after the four size bytes.
-                if ($extension === 'webp' && substr($body, 8, 4) !== 'WEBP') {
+                if ($extension === 'webp' && substr($probe, 8, 4) !== 'WEBP') {
                     continue;
                 }
 
