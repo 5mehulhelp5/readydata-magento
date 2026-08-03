@@ -259,6 +259,9 @@ The two forms are told apart by the scheme.
   `store_view_code` does not affect it, so **send media on one store pass only**.
   Store-scoped labels and positions are out of scope. The one exception is a role
   attribute that already has a store-scoped row, which is kept in sync.
+- **What observers see**: by default the products handed to product-save
+  observers carry no gallery, and what this import changed is published as a
+  batch event instead. Both are covered under "Events".
 - A URL whose target file already exists is **not fetched again** (see
   *Re-Download Existing Files*). Publish a changed image under a new URL, replace
   the file out of band, or turn that setting on — with it on, a changed image
@@ -456,7 +459,9 @@ Unsupported input types and definitions that would break a module invariant
   semantics diffed by file path, an additive safety valve, per-entry
   label/position/disabled, external-video entries and the
   `image`/`small_image`/`thumbnail`/`swatch_image` roles (see "Product media
-  gallery" above). All file I/O runs before the batch transaction opens.
+  gallery" above). All file I/O runs before the batch transaction opens. What
+  changed per product is published as `readydata_import_product_media_changed`,
+  and dispatched products can carry the gallery itself (see "Events").
 - Stock: legacy `cataloginventory_stock_item` + MSI `inventory_source_item`
   when MSI is installed.
 - URL rewrites: generates `url_key` from the name when absent, regenerates
@@ -514,10 +519,76 @@ third-party observers still react to imports:
   **throwing observer rolls the whole batch back**. Only enable it when a
   specific third-party observer must run on this in-transaction event.
   Depends on "Dispatch Product Save Events" being on.
+- **Include Media Gallery In Dispatched Events** (`hydrate_media`, default
+  off) — before dispatching, read the batch's galleries and image roles in
+  **two bulk queries** and put them on each dispatched product, so
+  `getMediaGallery('images')`, `getMediaGalleryImages()` and
+  `getMediaGalleryEntries()` (including each entry's `types` and
+  `video_content`) return what a loaded product returns. Applies to **every**
+  product in the batch, including ones whose payload carried no `media` block,
+  and is **independent of "Enable Media Gallery Import"** — the gallery in the
+  database is the product's gallery whether or not this import wrote it. Off by
+  default because it changes what existing observers see; turn it on when a
+  media-aware observer needs to run on imports. Depends on "Dispatch Product
+  Save Events" being on.
 
 Whenever product-save events are dispatched, the module suppresses Magento's
 own URL-rewrite and inventory save observers for the duration of the import
 (they are re-implemented in bulk by the pipeline), so they never double-write.
+
+The dispatched product is a **notification carrier, not a persistable entity**.
+It carries **no `origData`**: `getOrigData()` is empty and `dataHasChangedFor()`
+reports every field as changed. That is deliberate — the importer never reads
+pre-image state, so a partial `origData` would answer "unchanged" for fields
+nobody snapshotted, and populating it at all makes Magento skip the protective
+reload it does for an entity with no original data. It also has no attribute
+set, so saving it through the EAV resource would schedule value-row deletions.
+Read from it; do not save it. When both per-product toggles are on, the
+`*_save_after` and `*_save_commit_after` events receive the **same instance**
+for a product, as core does.
+
+### Custom events
+
+Batch-level events for integrations that want the delta rather than a
+per-product callback. All fire after the batch commits, and only when they have
+something to report:
+
+| Event | Payload |
+|---|---|
+| `readydata_import_products_save_after` | `store_id`, `sku_to_id`, `created_skus`, `updated_skus`, `entity_ids` |
+| `readydata_import_attribute_options_created` | `options_by_attribute` |
+| `readydata_import_category_products_changed` | `store_id`, `category_ids`, `product_ids` |
+| `readydata_import_product_media_changed` | `store_id`, `changes`, `sku_to_id`, `created_files`, `removed_files` |
+
+`readydata_import_product_media_changed` is the one to hook for image CDNs,
+optimisers and cache warmers. `changes` is keyed by SKU and carries:
+
+| Key | Meaning |
+|---|---|
+| `entity_id` | the product's ID |
+| `created` | files whose gallery row this batch inserted |
+| `updated` | kept files whose label, position, `disabled`, media type or video record changed |
+| `removed` | files whose gallery rows this batch deleted from **this** product |
+| `roles` | role code => the file it now points at, or `null` where it was cleared as stale — only the roles this batch actually wrote |
+| `partial` | the safety valve withheld removals, so the desired set was incomplete |
+
+`roles` is a dimension of its own because a role can move between two files that
+are both already in the gallery: a base-image swap changes no gallery row, and
+without it the most storefront-visible media change there is would report
+nothing. Products whose media this batch left exactly as it was are **absent**,
+so a re-import of an unchanged feed reports nothing at all.
+
+`created_files` and `removed_files` are deduplicated unions across the batch,
+for consumers that work per file rather than per product. Read `removed_files`
+as *"detached from the products this batch touched"*, **not** as "safe to
+delete": a file that one product dropped and another kept or gained is excluded
+from it, but the module cannot know about products outside the batch, so a
+disk-level delete still needs its own reference check. The per-SKU `removed` is
+exact and is not filtered this way.
+
+Two things it does not report: a re-download that replaced the **bytes** behind
+an existing path (the path is unchanged — see *Re-Download Existing Files*), and
+removals of legacy junk rows whose stored path was NULL or a duplicate.
 
 ## Placeholders (registered, disabled)
 
@@ -573,9 +644,11 @@ needs network or filesystem access before the transaction opens) and register in
   Media is written against the product's *current* row, with no staging-update
   awareness — the same posture as the rest of the module.
 - **Media is written at the default scope only**; `store_view_code` does not
-  affect it. Send media roles inside `media`, never in `custom_attributes`: a
-  store-scoped `custom_attributes` role write happens earlier in the pipeline
-  and the default-scope role write cannot shadow it.
+  affect it. Send media roles inside `media`, never in `custom_attributes`: for
+  a product carrying a `media` block the media role write happens last and
+  repoints the default scope **and** every store view that already had a row —
+  including one a `custom_attributes` role just created earlier in the same
+  batch — so the `custom_attributes` value is silently overwritten.
 - Each product gets its **own** gallery row per file, even when several products
   share the same file on disk. The row carries `media_type`, `disabled` and the
   video record, none of which have a product dimension, and a shared row would
@@ -595,8 +668,22 @@ needs network or filesystem access before the transaction opens) and register in
 - Database media storage (`Magento_MediaStorage`) is **not supported** for media
   import: files written to the local media directory would be invisible to the
   storefront. Media is refused with a clear per-product message.
-- Third-party product-save observers do **not** see the gallery: the lightweight
+- Third-party product-save observers see the gallery **only with *Include Media
+  Gallery In Dispatched Events* on** (default off) — otherwise the lightweight
   product object the event dispatcher builds carries the payload's scalars only.
+  With it on, the gallery and image roles are read from the database, so a
+  product whose payload omitted `media` still reports its full gallery, but
+  `label`, `position` and per-entry `disabled` are the **default-scope** values
+  (an admin-authored store override is not reflected). Everything else on the
+  object is still payload-only, not a database read. See "Events".
+- With that setting on, an observer that calls `$product->save()` makes
+  Magento's gallery save handler run. It cannot create or delete gallery rows
+  and cannot move files (every hydrated entry carries its `value_id` and none is
+  flagged `removed`), and the module **locks** `media_gallery` on the object so
+  the handler bails before writing the store-scoped `gallery_value` rows this
+  module never creates. An observer that means to rewrite the gallery must
+  `unlockAttribute('media_gallery')` first — and see the note in "Events" about
+  not saving the dispatched object at all.
 - Media downloads run concurrently, but the whole batch still happens inside one
   request. For a large first-time import raise *Download Concurrency*, and use
   `batch_size` and `max_execution_time` to keep each request within its timeout —

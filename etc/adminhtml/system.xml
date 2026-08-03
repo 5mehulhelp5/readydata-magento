@@ -138,6 +138,14 @@
                         <field id="dispatch_product_events">1</field>
                     </depends>
                 </field>
+                <field id="hydrate_media" translate="label comment" type="select" sortOrder="30" showInDefault="1">
+                    <label>Include Media Gallery In Dispatched Events</label>
+                    <comment>Read each dispatched product's media gallery and image roles from the database (two extra queries per batch) so observers see the same media_gallery, getMediaGalleryImages() and getMediaGalleryEntries() data a loaded product has. Applies to every product in the batch, including ones whose payload carried no "media" block, and is independent of "Enable Media Gallery Import". Leave off if a third-party observer calls $product->save(): a populated gallery makes Magento's gallery save handler run. Requires "Dispatch Product Save Events".</comment>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                    <depends>
+                        <field id="dispatch_product_events">1</field>
+                    </depends>
+                </field>
             </group>
             <group id="logging" translate="label" type="text" sortOrder="40" showInDefault="1">
                 <label>Logging</label>

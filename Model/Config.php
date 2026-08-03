@@ -39,6 +39,7 @@ class Config
     private const XML_PATH_LOGGING_ENABLED = 'readydata_import/logging/enabled';
     private const XML_PATH_DISPATCH_PRODUCT_EVENTS = 'readydata_import/events/dispatch_product_events';
     private const XML_PATH_DISPATCH_SAVE_AFTER = 'readydata_import/events/dispatch_save_after';
+    private const XML_PATH_HYDRATE_MEDIA = 'readydata_import/events/hydrate_media';
     private const XML_PATH_AUTO_CREATE_ATTRIBUTES = 'readydata_import/attributes/auto_create';
     private const XML_PATH_MEDIA_ENABLED = 'readydata_import/media/enabled';
     private const XML_PATH_MEDIA_DOWNLOAD_TIMEOUT = 'readydata_import/media/download_timeout';
@@ -116,6 +117,19 @@ class Config
     public function isDispatchSaveAfter(): bool
     {
         return $this->scopeConfig->isSetFlag(self::XML_PATH_DISPATCH_SAVE_AFTER);
+    }
+
+    /**
+     * Whether the dispatched product objects carry their media gallery and image
+     * roles, read back in bulk once per batch. Gated by
+     * {@see isDispatchProductEvents()} at the call site, and deliberately
+     * independent of {@see isMediaEnabled()}: the gallery in the database is the
+     * product's gallery whether or not this import wrote it. Costs two queries
+     * per batch, so it is opt-in.
+     */
+    public function isHydrateEventMedia(): bool
+    {
+        return $this->scopeConfig->isSetFlag(self::XML_PATH_HYDRATE_MEDIA);
     }
 
     /**

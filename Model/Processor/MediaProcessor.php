@@ -56,18 +56,47 @@ use ReadyData\Import\Model\ResourceModel\ProductMediaGallery;
  * Publishes to the context data bag:
  *  - "media_resolved_files": array<string reference, array{file: string|null,
  *    message: string|null}> produced by prepare(), consumed by process().
+ *  - "media_changes_by_sku": what this batch changed per product, consumed by
+ *    ImportEventDispatcher for its media-changed event.
+ *  - "media_retained_files": every file the batch leaves attached to a product
+ *    it touched, so the dispatcher can tell a genuine detachment from a file
+ *    that merely moved between products.
  */
 class MediaProcessor implements ProcessorInterface, PreparableInterface
 {
     public const CONTEXT_RESOLVED_FILES = 'media_resolved_files';
 
-    private const MEDIA_GALLERY_CODE = 'media_gallery';
+    /**
+     * Per-SKU gallery delta, for SKUs whose gallery actually changed:
+     * array<string sku, array{entity_id: int, created: string[], updated: string[],
+     * removed: string[], roles: array<string, string|null>, partial: bool}>.
+     * "created" are files whose gallery row this batch inserted, "updated" kept
+     * files whose metadata or video record changed, "removed" files whose rows
+     * were deleted, "roles" the role attributes this batch wrote (code => new
+     * default-scope file, or null for a role cleared as stale). Products with a
+     * media block that resolved to no change at all are absent, which is the
+     * point: a re-import must not tell a CDN to reprocess everything.
+     */
+    public const CONTEXT_CHANGES = 'media_changes_by_sku';
+
+    /**
+     * Flat, deduplicated list of every file still attached to one of the
+     * products this batch touched, once it is done. A file in one product's
+     * "removed" and in here has only moved, and no consumer should treat it as
+     * gone. Says nothing about products the batch did not touch.
+     */
+    public const CONTEXT_RETAINED_FILES = 'media_retained_files';
+
+    public const MEDIA_GALLERY_CODE = 'media_gallery';
 
     /**
      * Role attributes in scope. All four are varchar / frontend_input
      * "media_image" and store-scoped.
+     *
+     * Public because ProductMediaHydrator reads the same set back for the
+     * dispatched product events; two hand-synced copies drift.
      */
-    private const ROLE_CODES = ['image', 'small_image', 'thumbnail', 'swatch_image'];
+    public const ROLE_CODES = ['image', 'small_image', 'thumbnail', 'swatch_image'];
 
     /**
      * Roles pointed at the first enabled entry when the payload declares none.
@@ -175,6 +204,7 @@ class MediaProcessor implements ProcessorInterface, PreparableInterface
         $videoDeletes = [];
         $galleryStates = [];
         $rolePlans = [];
+        $changes = [];
 
         // 4. Diff each product's desired set against its stored gallery.
         foreach ($sources as $sku => $source) {
@@ -195,6 +225,7 @@ class MediaProcessor implements ProcessorInterface, PreparableInterface
             }
 
             $keptFiles = [];
+            $updatedFiles = [];
             foreach ($desired as $file => $entry) {
                 $existing = $currentByFile[$file] ?? null;
                 if ($existing === null) {
@@ -223,14 +254,19 @@ class MediaProcessor implements ProcessorInterface, PreparableInterface
                         'position' => $entry['position'],
                         'disabled' => $entry['disabled'],
                     ];
+                    $updatedFiles[$file] = true;
                 }
                 if ($existing['media_type'] !== $entry['media_type'] || $existing['gallery_disabled'] !== 0) {
                     $galleryStates[$entry['media_type'] . '|0'][] = $existing['value_id'];
+                    $updatedFiles[$file] = true;
                 }
-                $this->planVideo($existing['value_id'], $entry, $existing['video'], $videoRows, $videoDeletes);
+                if ($this->planVideo($existing['value_id'], $entry, $existing['video'], $videoRows, $videoDeletes)) {
+                    $updatedFiles[$file] = true;
+                }
             }
 
-            $removable = array_merge(array_values(array_diff_key($currentByFile, $keptFiles)), $unmatchable);
+            $goneByFile = array_diff_key($currentByFile, $keptFiles);
+            $removable = array_merge(array_values($goneByFile), $unmatchable);
             if ($partial && $removable) {
                 $context->addMessage(
                     $sku,
@@ -243,13 +279,25 @@ class MediaProcessor implements ProcessorInterface, PreparableInterface
                 }
             }
 
+            // Legacy junk (NULL or repeated paths) is removed but not reported:
+            // its path is either nothing or still held by the row that won.
+            $removedFiles = $partial ? [] : array_keys($goneByFile);
+
             $rolePlans[$sku] = [
                 'link_id' => $linkId,
                 'desired' => $desired,
                 'kept_files' => $keptFiles,
-                'removed_files' => $partial
-                    ? []
-                    : array_keys(array_diff_key($currentByFile, $keptFiles)),
+                'removed_files' => $removedFiles,
+            ];
+            $changes[$sku] = [
+                'entity_id' => (int)$context->getEntityId($sku),
+                // Filled in by step 7, once the inserts have their value_ids.
+                'created' => [],
+                'updated' => array_keys($updatedFiles),
+                'removed' => $removedFiles,
+                // Filled in by step 9, which is where roles are decided.
+                'roles' => [],
+                'partial' => $partial,
             ];
         }
 
@@ -278,6 +326,7 @@ class MediaProcessor implements ProcessorInterface, PreparableInterface
             ];
             $this->planVideo($valueId, $entry, null, $videoRows, $videoDeletes);
             $rolePlans[$meta['sku']]['kept_files'][$entry['file']] = $valueId;
+            $changes[$meta['sku']]['created'][] = $entry['file'];
         }
 
         $this->productMediaGallery->bindToEntities($bindRows);
@@ -288,8 +337,35 @@ class MediaProcessor implements ProcessorInterface, PreparableInterface
         // 8. Normalise media_type/disabled on the rows that were kept.
         $this->productMediaGallery->updateGalleryRows($galleryStates);
 
-        // 9. Role attributes.
-        $this->writeRoles($context, $rolePlans, $roleAttributeIds);
+        // 9. Role attributes. A role can move between two files that are both
+        //    already in the gallery, so this is a dimension of its own: without
+        //    it a base-image swap would be a change nothing reported.
+        foreach ($this->writeRoles($context, $rolePlans, $roleAttributeIds) as $sku => $roles) {
+            $changes[$sku]['roles'] = $roles;
+        }
+
+        // 10. Publish the delta for the media-changed event, dropping the
+        //     products this batch left exactly as they were.
+        $changes = array_filter(
+            $changes,
+            static fn (array $change): bool => $change['created']
+                || $change['updated']
+                || $change['removed']
+                || $change['roles']
+        );
+        if ($changes) {
+            $context->set(self::CONTEXT_CHANGES, $changes);
+            // Step 7 folded the new entries into kept_files, so this is every
+            // file the batch leaves attached, not just the pre-existing ones.
+            // array_values() before the spread: $rolePlans is keyed by SKU, and
+            // spreading string keys makes them named arguments.
+            $context->set(self::CONTEXT_RETAINED_FILES, array_values(array_unique(array_merge(
+                ...array_values(array_map(
+                    static fn (array $plan): array => array_keys($plan['kept_files']),
+                    $rolePlans
+                ))
+            ))));
+        }
     }
 
     /**
@@ -462,6 +538,8 @@ class MediaProcessor implements ProcessorInterface, PreparableInterface
      * @param array<string, string|null>|null $storedVideo
      * @param array<int, array<string, mixed>> $videoRows
      * @param int[] $videoDeletes
+     * @return bool whether it queued a write or a delete, so the caller can
+     *         report a video-only change as a change
      */
     private function planVideo(
         int $valueId,
@@ -469,13 +547,15 @@ class MediaProcessor implements ProcessorInterface, PreparableInterface
         ?array $storedVideo,
         array &$videoRows,
         array &$videoDeletes
-    ): void {
+    ): bool {
         if ($entry['video'] === null) {
             if ($storedVideo !== null) {
                 $videoDeletes[] = $valueId;
+
+                return true;
             }
 
-            return;
+            return false;
         }
 
         if ($storedVideo !== null) {
@@ -487,11 +567,13 @@ class MediaProcessor implements ProcessorInterface, PreparableInterface
                 }
             }
             if ($unchanged) {
-                return;
+                return false;
             }
         }
 
         $videoRows[] = array_merge(['value_id' => $valueId], $entry['video']);
+
+        return true;
     }
 
     /**
@@ -521,11 +603,15 @@ class MediaProcessor implements ProcessorInterface, PreparableInterface
      * @param array<string, array{link_id: int, desired: array<string, array<string, mixed>>,
      *         kept_files: array<string, int>, removed_files: string[]}> $plans
      * @param array<string, int> $roleAttributeIds
+     * @return array<string, array<string, string|null>> sku => role code => the
+     *         file the role now points at, or null where it was cleared, for
+     *         the roles this actually wrote. Only the roles it touched appear,
+     *         so an empty entry means "the roles were already right".
      */
-    private function writeRoles(BatchContext $context, array $plans, array $roleAttributeIds): void
+    private function writeRoles(BatchContext $context, array $plans, array $roleAttributeIds): array
     {
         if (!$roleAttributeIds) {
-            return;
+            return [];
         }
 
         $linkField = $this->productEntity->getLinkField();
@@ -537,8 +623,10 @@ class MediaProcessor implements ProcessorInterface, PreparableInterface
 
         $rows = [];
         $deleteKeys = [];
+        $written = [];
 
         foreach ($plans as $sku => $plan) {
+            $written[$sku] = [];
             $linkId = $plan['link_id'];
             $storedByAttribute = $stored[$linkId] ?? [];
             $assignments = $this->collectRoleAssignments($context, (string)$sku, $plan, $roleAttributeIds);
@@ -579,6 +667,7 @@ class MediaProcessor implements ProcessorInterface, PreparableInterface
                             'attribute_id' => $attributeId,
                             'store_id' => $storeId,
                         ];
+                        $written[$sku][$code] = null;
                     }
                     continue;
                 }
@@ -601,12 +690,19 @@ class MediaProcessor implements ProcessorInterface, PreparableInterface
                         'store_id' => $storeId,
                         'value' => $target,
                     ];
+                    // Reported even when only a store view moved and the default
+                    // scope already matched: a row was still written, and a
+                    // consumer asking "did this import touch the base image"
+                    // deserves a yes.
+                    $written[$sku][$code] = $target;
                 }
             }
         }
 
         $this->eavValue->upsert('varchar', $rows);
         $this->eavValue->delete('varchar', $deleteKeys);
+
+        return $written;
     }
 
     /**

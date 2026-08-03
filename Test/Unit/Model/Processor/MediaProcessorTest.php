@@ -1114,6 +1114,298 @@ class MediaProcessorTest extends TestCase
         self::assertSame(710, $this->processor->getSortOrder());
     }
 
+    public function testPublishesInsertedFilesAsCreated(): void
+    {
+        $context = $this->contextFor('P1', [
+            $this->entry(self::FILE_A),
+            $this->entry(self::FILE_B),
+        ], 10);
+
+        $this->gallery->method('getGallery')->willReturn([]);
+        $this->eavValue->method('getValuesForStores')->willReturn([]);
+        $this->gallery->method('insertGalleryRows')->willReturnCallback(
+            static function (array $rows): array {
+                $ids = [];
+                $next = 900;
+                foreach (array_keys($rows) as $key) {
+                    $ids[$key] = $next++;
+                }
+
+                return $ids;
+            }
+        );
+
+        $this->processor->process($context);
+
+        self::assertSame([
+            'P1' => [
+                'entity_id' => 10,
+                'created' => [self::FILE_A, self::FILE_B],
+                'updated' => [],
+                'removed' => [],
+                'roles' => [],
+                'partial' => false,
+            ],
+        ], $context->get(MediaProcessor::CONTEXT_CHANGES));
+        self::assertSame(
+            [self::FILE_A, self::FILE_B],
+            $context->get(MediaProcessor::CONTEXT_RETAINED_FILES)
+        );
+    }
+
+    public function testAnUnchangedGalleryPublishesNothing(): void
+    {
+        // A re-import must not tell a CDN to reprocess everything it hears about.
+        $context = $this->contextFor('P1', [$this->entry(self::FILE_A, ['label' => 'Front'])], 10);
+
+        $this->gallery->method('getGallery')->willReturn([
+            10 => [$this->galleryRow(501, self::FILE_A, ['label' => 'Front', 'position' => 0])],
+        ]);
+        $this->eavValue->method('getValuesForStores')->willReturn([]);
+        $this->gallery->method('insertGalleryRows')->willReturn([]);
+
+        $this->processor->process($context);
+
+        self::assertNull($context->get(MediaProcessor::CONTEXT_CHANGES));
+    }
+
+    public function testPublishesMetadataChangesAsUpdated(): void
+    {
+        $context = $this->contextFor('P1', [$this->entry(self::FILE_A, ['label' => 'New'])], 10);
+
+        $this->gallery->method('getGallery')->willReturn([
+            10 => [$this->galleryRow(501, self::FILE_A, ['label' => 'Old', 'position' => 0])],
+        ]);
+        $this->eavValue->method('getValuesForStores')->willReturn([]);
+        $this->gallery->method('insertGalleryRows')->willReturn([]);
+
+        $this->processor->process($context);
+
+        $changes = $context->get(MediaProcessor::CONTEXT_CHANGES);
+        self::assertSame([self::FILE_A], $changes['P1']['updated']);
+        self::assertSame([], $changes['P1']['created']);
+        self::assertSame([], $changes['P1']['removed']);
+    }
+
+    public function testPublishesAVideoOnlyChangeAsUpdated(): void
+    {
+        $context = $this->contextFor('P1', [
+            $this->entry(self::FILE_A, ['position' => 0, 'video_url' => 'https://youtu.be/new']),
+        ], 10);
+
+        $this->gallery->method('getGallery')->willReturn([
+            10 => [$this->galleryRow(501, self::FILE_A, [
+                'media_type' => ProductMediaGallery::MEDIA_TYPE_EXTERNAL_VIDEO,
+                'position' => 0,
+                'video' => [
+                    'provider' => 'youtube',
+                    'url' => 'https://youtu.be/old',
+                    'title' => null,
+                    'description' => null,
+                    'metadata' => null,
+                ],
+            ])],
+        ]);
+        $this->eavValue->method('getValuesForStores')->willReturn([]);
+        $this->gallery->method('insertGalleryRows')->willReturn([]);
+
+        $this->processor->process($context);
+
+        self::assertSame([self::FILE_A], $context->get(MediaProcessor::CONTEXT_CHANGES)['P1']['updated']);
+    }
+
+    public function testPublishesDeletedFilesAsRemoved(): void
+    {
+        $context = $this->contextFor('P1', [$this->entry(self::FILE_A, ['position' => 0])], 10);
+
+        $this->gallery->method('getGallery')->willReturn([
+            10 => [
+                $this->galleryRow(501, self::FILE_A, ['position' => 0]),
+                $this->galleryRow(502, self::FILE_B, ['position' => 1]),
+            ],
+        ]);
+        $this->eavValue->method('getValuesForStores')->willReturn([]);
+        $this->gallery->method('insertGalleryRows')->willReturn([]);
+
+        $this->processor->process($context);
+
+        $changes = $context->get(MediaProcessor::CONTEXT_CHANGES);
+        self::assertSame([self::FILE_B], $changes['P1']['removed']);
+        self::assertSame([], $changes['P1']['updated']);
+    }
+
+    public function testWithheldRemovalsAreNotPublishedButThePartialFlagIs(): void
+    {
+        $context = $this->contextFor('P1', [
+            $this->entry(self::FILE_A, ['position' => 0]),
+            $this->entry(self::FILE_B),
+            $this->entry('missing.jpg'),
+        ], 10);
+
+        $this->gallery->method('getGallery')->willReturn([
+            10 => [
+                $this->galleryRow(501, self::FILE_A, ['position' => 0]),
+                $this->galleryRow(502, '/g/o/gone.jpg', ['position' => 1]),
+            ],
+        ]);
+        $this->eavValue->method('getValuesForStores')->willReturn([]);
+        $this->gallery->method('insertGalleryRows')->willReturn(["P1\0" . self::FILE_B => 900]);
+
+        $this->processor->process($context);
+
+        $changes = $context->get(MediaProcessor::CONTEXT_CHANGES);
+        self::assertTrue($changes['P1']['partial']);
+        self::assertSame([self::FILE_B], $changes['P1']['created']);
+        self::assertSame([], $changes['P1']['removed']);
+    }
+
+    public function testProductsWithoutAMediaBlockAreNotPublished(): void
+    {
+        $withMedia = (new Product())->setSku('P1');
+        $withMedia->setMedia([$this->entry(self::FILE_A)]);
+        $context = new BatchContext([$withMedia, (new Product())->setSku('P2')]);
+        $context->setEntityId('P1', 10);
+        $context->setEntityId('P2', 20);
+        $context->set(EntityProcessor::CONTEXT_LINK_IDS, ['P1' => 10, 'P2' => 20]);
+        $context->set(MediaProcessor::CONTEXT_RESOLVED_FILES, [
+            self::FILE_A => ['file' => self::FILE_A, 'message' => null],
+        ]);
+
+        $this->gallery->method('getGallery')->willReturn([]);
+        $this->eavValue->method('getValuesForStores')->willReturn([]);
+        $this->gallery->method('insertGalleryRows')->willReturn(["P1\0" . self::FILE_A => 900]);
+
+        $this->processor->process($context);
+
+        self::assertSame(['P1'], array_keys($context->get(MediaProcessor::CONTEXT_CHANGES)));
+    }
+
+    public function testNumericSkusSurviveArrayKeyCoercion(): void
+    {
+        $context = $this->contextFor('1234', [$this->entry(self::FILE_A)], 10);
+
+        $this->gallery->method('getGallery')->willReturn([]);
+        $this->eavValue->method('getValuesForStores')->willReturn([]);
+        $this->gallery->method('insertGalleryRows')->willReturn(["1234\0" . self::FILE_A => 900]);
+
+        $this->processor->process($context);
+
+        $changes = $context->get(MediaProcessor::CONTEXT_CHANGES);
+        self::assertCount(1, $changes);
+        self::assertSame([self::FILE_A], array_values($changes)[0]['created']);
+        self::assertSame(10, array_values($changes)[0]['entity_id']);
+    }
+
+    public function testARoleMovingBetweenTwoUnchangedFilesIsPublished(): void
+    {
+        // Nothing about the gallery rows changes — only which file the base
+        // image points at. That is the single most storefront-visible media
+        // fact there is, so it cannot be the change that reports nothing.
+        $context = $this->contextFor('P1', [
+            $this->entry(self::FILE_A, ['position' => 0]),
+            $this->entry(self::FILE_B, ['position' => 1, 'roles' => ['image']]),
+        ], 10);
+
+        $this->gallery->method('getGallery')->willReturn([
+            10 => [
+                $this->galleryRow(501, self::FILE_A, ['position' => 0]),
+                $this->galleryRow(502, self::FILE_B, ['position' => 1]),
+            ],
+        ]);
+        $this->eavValue->method('getValuesForStores')->willReturn([
+            10 => [self::ROLE_IDS['image'] => [0 => self::FILE_A]],
+        ]);
+        $this->gallery->method('insertGalleryRows')->willReturn([]);
+
+        $this->processor->process($context);
+
+        $changes = $context->get(MediaProcessor::CONTEXT_CHANGES);
+        self::assertNotNull($changes, 'A base-image swap must not be filtered out as "no change".');
+        self::assertSame(['image' => self::FILE_B], $changes['P1']['roles']);
+        self::assertSame([], $changes['P1']['created']);
+        self::assertSame([], $changes['P1']['updated']);
+        self::assertSame([], $changes['P1']['removed']);
+    }
+
+    public function testAStaleRoleIsPublishedAsCleared(): void
+    {
+        $context = $this->contextFor('P1', [$this->entry(self::FILE_A, ['position' => 0])], 10);
+
+        $this->gallery->method('getGallery')->willReturn([
+            10 => [
+                $this->galleryRow(501, self::FILE_A, ['position' => 0]),
+                $this->galleryRow(502, self::FILE_B, ['position' => 1]),
+            ],
+        ]);
+        // The role points at the file this import removes, so writeRoles() drops
+        // its rows rather than leaving the storefront asking for a dead path.
+        $this->eavValue->method('getValuesForStores')->willReturn([
+            10 => [self::ROLE_IDS['image'] => [0 => self::FILE_B]],
+        ]);
+        $this->gallery->method('insertGalleryRows')->willReturn([]);
+
+        $this->processor->process($context);
+
+        $changes = $context->get(MediaProcessor::CONTEXT_CHANGES);
+        self::assertSame(['image' => null], $changes['P1']['roles']);
+        self::assertSame([self::FILE_B], $changes['P1']['removed']);
+    }
+
+    public function testUnchangedRolesOnAnUnchangedGalleryPublishNothing(): void
+    {
+        // The role is declared and already correct: no row is written, so this
+        // must stay as silent as a re-import with no roles at all.
+        $context = $this->contextFor('P1', [
+            $this->entry(self::FILE_A, ['position' => 0, 'roles' => ['image']]),
+        ], 10);
+
+        $this->gallery->method('getGallery')->willReturn([
+            10 => [$this->galleryRow(501, self::FILE_A, ['position' => 0])],
+        ]);
+        $this->eavValue->method('getValuesForStores')->willReturn([
+            10 => [self::ROLE_IDS['image'] => [0 => self::FILE_A]],
+        ]);
+        $this->gallery->method('insertGalleryRows')->willReturn([]);
+
+        $this->processor->process($context);
+
+        self::assertNull($context->get(MediaProcessor::CONTEXT_CHANGES));
+        self::assertNull($context->get(MediaProcessor::CONTEXT_RETAINED_FILES));
+    }
+
+    public function testRetainedFilesCoverAFileThatOnlyMovedBetweenProducts(): void
+    {
+        // P1 drops the shared file, P2 gains it. It is not gone from the store,
+        // and the dispatcher needs to be able to tell that.
+        $context = $this->contextForMany([
+            'P1' => ['entries' => [$this->entry(self::FILE_A, ['position' => 0])], 'link_id' => 10],
+            'P2' => ['entries' => [
+                $this->entry(self::FILE_A, ['position' => 0]),
+                $this->entry(self::FILE_B, ['position' => 1]),
+            ], 'link_id' => 20],
+        ]);
+
+        $this->gallery->method('getGallery')->willReturn([
+            10 => [
+                $this->galleryRow(501, self::FILE_A, ['position' => 0]),
+                $this->galleryRow(502, self::FILE_B, ['position' => 1]),
+            ],
+            20 => [$this->galleryRow(601, self::FILE_A, ['position' => 0])],
+        ]);
+        $this->eavValue->method('getValuesForStores')->willReturn([]);
+        $this->gallery->method('insertGalleryRows')->willReturn(["P2\0" . self::FILE_B => 900]);
+
+        $this->processor->process($context);
+
+        $changes = $context->get(MediaProcessor::CONTEXT_CHANGES);
+        self::assertSame([self::FILE_B], $changes['P1']['removed']);
+        self::assertSame([self::FILE_B], $changes['P2']['created']);
+
+        $retained = $context->get(MediaProcessor::CONTEXT_RETAINED_FILES);
+        sort($retained);
+        self::assertSame([self::FILE_A, self::FILE_B], $retained);
+    }
+
     /**
      * Same as contextFor() but for a whole batch, which is the only shape in
      * which writeRoles() iterates its outer loop more than once.
