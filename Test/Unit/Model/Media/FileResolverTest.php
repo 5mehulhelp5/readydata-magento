@@ -19,6 +19,7 @@ use ReadyData\Import\Logger\Logger;
 use ReadyData\Import\Model\Config;
 use ReadyData\Import\Model\Media\DownloaderInterface;
 use ReadyData\Import\Model\Media\FileResolver;
+use ReadyData\Import\Model\Media\HostAllowList;
 
 class FileResolverTest extends TestCase
 {
@@ -538,6 +539,7 @@ class FileResolverTest extends TestCase
             $this->downloader,
             $storageDatabase,
             $this->config,
+            new HostAllowList($this->config),
             $this->logger
         );
 
@@ -625,6 +627,7 @@ class FileResolverTest extends TestCase
             $this->downloader,
             $this->storageDatabase,
             $this->config,
+            new HostAllowList($this->config),
             $this->logger
         );
     }
@@ -637,6 +640,7 @@ class FileResolverTest extends TestCase
             $this->downloader,
             $this->storageDatabase,
             $config,
+            new HostAllowList($config),
             $this->logger
         );
     }
@@ -652,6 +656,7 @@ class FileResolverTest extends TestCase
             $this->downloader,
             $this->storageDatabase,
             $this->config,
+            new HostAllowList($this->config),
             $this->logger
         );
     }

@@ -256,20 +256,11 @@ class MediaProcessor implements ProcessorInterface, PreparableInterface
         // 5. Removals first, so step 6's value_id watermark stays as tight as possible.
         $this->productMediaGallery->removeEntries($toRemove);
 
-        // 6. Insert the new gallery rows and learn their generated value_ids.
+        // 6. Insert the new gallery rows and learn their generated value_ids. An
+        //    untrusted read-back throws: the rows are already written and cannot
+        //    be identified, so the batch must roll back rather than commit them
+        //    unbound. See ProductMediaGallery::insertGalleryRows().
         $valueIds = $this->productMediaGallery->insertGalleryRows($toInsert);
-        if ($toInsert && !$valueIds) {
-            foreach (array_unique(array_column($insertMeta, 'sku')) as $sku) {
-                $context->addMessage(
-                    $sku,
-                    'New media entries could not be linked to their gallery rows and were skipped;'
-                    . ' existing entries were still updated.'
-                );
-            }
-            $this->logger->error(
-                'Media gallery value_id read-back failed for a batch; new media entries were skipped.'
-            );
-        }
 
         // 7. Bind the new rows, then write the per-entry data of new and existing
         //    entries together so each table is touched once per batch.
@@ -556,16 +547,19 @@ class MediaProcessor implements ProcessorInterface, PreparableInterface
                 $storedScopes = $storedByAttribute[$attributeId] ?? [];
                 $assignment = $assignments[$code] ?? null;
                 $target = $assignment['file'] ?? null;
-                $stored = $storedScopes[0] ?? null;
+                // Never named $stored: that holds the whole batch's value map,
+                // and shadowing it here silently emptied the map for every
+                // product after the first one in the batch.
+                $storedDefault = $storedScopes[0] ?? null;
                 // A stored role whose file this import removes is stale: it must
                 // be repointed or cleared, and it is not a choice worth keeping.
-                $isStale = in_array($stored, $plan['removed_files'], true);
+                $isStale = in_array($storedDefault, $plan['removed_files'], true);
 
                 // An auto-assigned role never overrides a live value a merchant chose.
                 if ($assignment !== null
                     && $assignment['auto']
                     && !$isStale
-                    && ($stored ?? self::NO_SELECTION) !== self::NO_SELECTION
+                    && ($storedDefault ?? self::NO_SELECTION) !== self::NO_SELECTION
                 ) {
                     continue;
                 }

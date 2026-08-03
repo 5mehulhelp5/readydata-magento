@@ -21,6 +21,7 @@ use PHPUnit\Framework\TestCase;
 use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\StreamInterface;
 use ReadyData\Import\Model\Config;
+use ReadyData\Import\Model\Media\HostAllowList;
 use ReadyData\Import\Model\Media\PooledDownloader;
 
 class PooledDownloaderTest extends TestCase
@@ -60,7 +61,7 @@ class PooledDownloaderTest extends TestCase
     public function testEmptyInputIsANoOp(): void
     {
         $handler = new MockHandler([]);
-        $downloader = new PooledDownloader($this->clientFor($handler), $this->config);
+        $downloader = new PooledDownloader($this->clientFor($handler), $this->config, new HostAllowList($this->config));
 
         $downloader->fetchAll([], static function (): void {
             self::fail('The callback must not run for an empty batch.');
@@ -120,7 +121,8 @@ class PooledDownloaderTest extends TestCase
         };
         $downloader = new PooledDownloader(
             new Client(['handler' => HandlerStack::create($handler)]),
-            $this->config
+            $this->config,
+            new HostAllowList($this->config)
         );
 
         $outcomes = [];
@@ -172,7 +174,11 @@ class PooledDownloaderTest extends TestCase
             return $promise;
         };
 
-        $downloader = new PooledDownloader(new Client(['handler' => HandlerStack::create($handler)]), $this->config);
+        $downloader = new PooledDownloader(
+            new Client(['handler' => HandlerStack::create($handler)]),
+            $this->config,
+            new HostAllowList($this->config)
+        );
         $downloader->fetchAll(['a' => 'https://cdn.example.com/a.jpg'], static function (): void {
         });
 
@@ -217,7 +223,11 @@ class PooledDownloaderTest extends TestCase
         }
 
         $completed = 0;
-        (new PooledDownloader(new Client(['handler' => HandlerStack::create($handler)]), $config))
+        (new PooledDownloader(
+            new Client(['handler' => HandlerStack::create($handler)]),
+            $config,
+            new HostAllowList($config)
+        ))
             ->fetchAll($urls, static function () use (&$completed, &$inFlight): void {
                 $completed++;
                 $inFlight--;
@@ -232,7 +242,9 @@ class PooledDownloaderTest extends TestCase
      */
     private function downloaderFor(array $queue, ?Config $config = null): PooledDownloader
     {
-        return new PooledDownloader($this->clientFor(new MockHandler($queue)), $config ?? $this->config);
+        $config ??= $this->config;
+
+        return new PooledDownloader($this->clientFor(new MockHandler($queue)), $config, new HostAllowList($config));
     }
 
     private function clientFor(MockHandler $handler): Client

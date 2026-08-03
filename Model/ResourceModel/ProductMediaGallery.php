@@ -171,12 +171,20 @@ class ProductMediaGallery
      * greater value, rows within one INSERT are numbered in row order, and the
      * new rows are the only ones with no _value_to_entity binding yet. The stored
      * `value` of each row read back is then compared positionally against what
-     * was sent, and ANY mismatch returns an empty array instead of a guess:
-     * writing a bogus value_id into _value / _value_to_entity / _value_video
-     * would violate their foreign keys and abort the whole batch.
+     * was sent, and ANY mismatch THROWS rather than returning a guess: writing a
+     * bogus value_id into _value / _value_to_entity / _value_video would violate
+     * their foreign keys and abort the whole batch anyway.
+     *
+     * Throwing rather than degrading to "no new entries" is deliberate. The
+     * condition means we do not know which rows we just wrote, and those rows are
+     * already in the table: the caller can neither bind them nor identify them to
+     * clean them up, so carrying on would commit unbound orphan gallery rows that
+     * every retry of the payload would duplicate. A throw hands the batch to
+     * ImportService's rollBack(), which removes them atomically.
      *
      * @param array<int, array{attribute_id: int, value: string, media_type: string, disabled: int}> $rows
-     * @return int[] generated value_ids keyed as $rows; [] when the read-back could not be trusted
+     * @return int[] generated value_ids keyed as $rows
+     * @throws \RuntimeException when the read-back cannot be trusted
      */
     public function insertGalleryRows(array $rows): array
     {
@@ -208,13 +216,24 @@ class ProductMediaGallery
 
         $readBack = $connection->fetchAll($select);
         if (count($readBack) !== count($ordered)) {
-            return [];
+            throw new \RuntimeException(sprintf(
+                'Media gallery value_id read-back returned %d unbound rows for %d inserted;'
+                . ' the generated ids cannot be trusted.',
+                count($readBack),
+                count($ordered)
+            ));
         }
 
         $valueIds = [];
         foreach ($readBack as $index => $row) {
             if ((string)$row['value'] !== (string)$ordered[$index]['value']) {
-                return [];
+                throw new \RuntimeException(sprintf(
+                    'Media gallery value_id read-back is out of order at position %d ("%s" vs "%s");'
+                    . ' the generated ids cannot be trusted.',
+                    $index,
+                    (string)$row['value'],
+                    (string)$ordered[$index]['value']
+                ));
             }
             $valueIds[$keys[$index]] = (int)$row['value_id'];
         }

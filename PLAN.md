@@ -256,10 +256,13 @@ the body, flip the flag.
 - **Media `value_id` read-back:** a gallery row has no natural key, so the watermark
   re-select is not provably unambiguous — a concurrent admin product save can interleave
   its own rows. Guarded by three stacked predicates plus a positional `value` comparison
-  that aborts to "no inserts" rather than guessing. If it ever fires in the field, the
-  escalation is per-row `insert()` + `lastInsertId()` for new files only.
+  that THROWS rather than guessing, which rolls the batch back: the rows are already
+  inserted and cannot be identified, so degrading would commit unbound orphan gallery
+  rows that every retry would duplicate. If it ever fires in the field, the escalation is
+  per-row `insert()` + `lastInsertId()` for new files only.
 - **Orphan media files:** a rolled-back batch leaves whatever `prepare()` downloaded in
   `pub/media`. Deterministic target paths make retries converge on the same file instead
   of accumulating copies, but nothing garbage-collects the unreferenced ones.
-- **Media downloads are serial and synchronous**, bounded per batch. The async path above
-  is also the answer for large first-time image imports.
+- **Media downloads are synchronous**, bounded per batch and capped by *Download
+  Concurrency*. The async path above is also the answer for large first-time image
+  imports.

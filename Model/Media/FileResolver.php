@@ -61,10 +61,23 @@ class FileResolver
         'jpeg' => ["\xFF\xD8\xFF"],
         'png' => ["\x89PNG\r\n\x1A\n"],
         'gif' => ['GIF87a', 'GIF89a'],
-        // RIFF....WEBP — the four size bytes in between are skipped below.
+        // Container formats: the leading bytes identify the container and the
+        // format itself is a marker further in, so both are checked in
+        // assertSignature() rather than by prefix alone.
         'webp' => ['RIFF'],
-        'avif' => ["\x00\x00\x00 ftypavif", "\x00\x00\x00\x1Cftypavif"],
+        'avif' => [self::ISO_BMFF_BOX_TYPE],
     ];
+
+    /**
+     * ISO-BMFF box type at offset 4. AVIF is matched on this plus the brand at
+     * offset 8, NOT on a fixed prefix: the preceding four bytes are the box
+     * SIZE, which varies with the encoder's compatible-brand list, so any
+     * hardcoded size rejects perfectly valid files from other encoders.
+     */
+    private const ISO_BMFF_BOX_TYPE = 'ftyp';
+
+    /** Major brands that make an ISO-BMFF file an AVIF; "avis" is a sequence. */
+    private const AVIF_BRANDS = ['avif', 'avis'];
 
     /** Enough for the longest signature plus the WEBP form marker at offset 8. */
     private const SIGNATURE_PROBE_BYTES = 16;
@@ -80,6 +93,7 @@ class FileResolver
         private readonly DownloaderInterface $downloader,
         private readonly StorageDatabase $storageDatabase,
         private readonly Config $config,
+        private readonly HostAllowList $hostAllowList,
         private readonly Logger $logger
     ) {
     }
@@ -270,12 +284,9 @@ class FileResolver
             throw new MediaReferenceException(sprintf('Media URL "%s" is not http(s); skipped.', $url));
         }
 
-        $allowedHosts = $this->config->getMediaAllowedHosts();
-        if ($allowedHosts && !in_array(mb_strtolower($parts['host']), $allowedHosts, true)) {
-            throw new MediaReferenceException(
-                sprintf('Media URL host "%s" is not in the allowed download hosts; skipped.', $parts['host'])
-            );
-        }
+        // Only the host the payload named. Every redirect hop is checked again by
+        // PooledDownloader, which is the only place that sees them.
+        $this->hostAllowList->assert($parts['host']);
 
         $name = mb_strtolower(Uploader::getCorrectFileName($this->trimToLimit(basename($parts['path']))));
         $extension = mb_strtolower((string)pathinfo($name, PATHINFO_EXTENSION));
@@ -487,6 +498,22 @@ class FileResolver
      */
     private function assertSignature(string $url, string $extension, string $probe): void
     {
+        if ($extension === 'avif') {
+            // Box SIZE occupies the first four bytes and is encoder-specific, so
+            // the type is read at its fixed offset and the brand decides.
+            if (substr($probe, 4, 4) === self::ISO_BMFF_BOX_TYPE
+                && in_array(substr($probe, 8, 4), self::AVIF_BRANDS, true)
+            ) {
+                return;
+            }
+
+            throw new MediaReferenceException(sprintf(
+                'Downloaded file for "%s" is not a valid %s image; skipped.',
+                $url,
+                $extension
+            ));
+        }
+
         foreach (self::SIGNATURES[$extension] as $signature) {
             if (str_starts_with($probe, $signature)) {
                 // RIFF containers carry their type after the four size bytes.

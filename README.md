@@ -587,8 +587,10 @@ needs network or filesystem access before the transaction opens) and register in
   compromised feed can make the store request any URL it can reach, including
   internal ones. Downloads are extension-filtered, signature-verified before
   anything is written, size-capped, timeout-capped and redirect-capped, and a
-  redirect may only target HTTP/HTTPS. DNS rebinding and IP-literal hosts are not
-  solved — set an allow-list in hardened environments. *Download Concurrency*
+  redirect may only target HTTP/HTTPS. When an allow-list *is* set it is applied to
+  every redirect hop as well, not just the URL in the payload, so a permitted host
+  cannot bounce the fetch onto an internal address. DNS rebinding and IP-literal
+  hosts are not solved — set an allow-list in hardened environments. *Download Concurrency*
   also bounds how hard a single feed can make the store hit one origin.
 - Database media storage (`Magento_MediaStorage`) is **not supported** for media
   import: files written to the local media directory would be invisible to the

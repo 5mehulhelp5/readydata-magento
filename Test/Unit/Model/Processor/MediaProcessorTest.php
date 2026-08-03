@@ -909,7 +909,13 @@ class MediaProcessorTest extends TestCase
         $processor->process($context);
     }
 
-    public function testValueIdReadBackFailureSkipsInsertsButStillUpdatesExistingEntries(): void
+    /**
+     * The read-back condition means the inserted rows cannot be identified, and
+     * they are already in the table. Propagating is what lets ImportService roll
+     * the batch back; swallowing it here would commit unbound orphan gallery rows
+     * that every retry of the payload would duplicate.
+     */
+    public function testValueIdReadBackFailurePropagatesSoTheBatchRollsBack(): void
     {
         $context = $this->contextFor('P1', [
             $this->entry(self::FILE_A, ['label' => 'New']),
@@ -922,19 +928,90 @@ class MediaProcessorTest extends TestCase
         $this->eavValue->method('getValuesForStores')->willReturn([]);
 
         // A concurrent writer made the read-back untrustworthy.
-        $this->gallery->expects(self::once())->method('insertGalleryRows')->willReturn([]);
-        $this->gallery->expects(self::once())->method('bindToEntities')->with([]);
-        $this->gallery->expects(self::once())->method('saveValues')
-            ->with([$this->valueRow(501, 10, 'New', 0)]);
-        $this->logger->expects(self::once())->method('error');
+        $this->gallery->expects(self::once())->method('insertGalleryRows')
+            ->willThrowException(new \RuntimeException('the generated ids cannot be trusted.'));
+        // Nothing downstream of the insert may run on an untrusted id set.
+        $this->gallery->expects(self::never())->method('bindToEntities');
+        $this->gallery->expects(self::never())->method('saveValues');
+        $this->gallery->expects(self::never())->method('saveVideos');
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('the generated ids cannot be trusted.');
 
         $this->processor->process($context);
+    }
 
-        self::assertStringContainsString(
-            'could not be linked to their gallery rows',
-            $context->getMessages('P1')[0]
-        );
-        self::assertFalse($context->isFailed('P1'));
+    /**
+     * Regression: writeRoles() used to reuse the name $stored for both the
+     * batch-wide value map and one role's default-scope value, so from the SECOND
+     * product on it saw no stored roles at all. Auto-assign then overwrote the
+     * merchant's own choice — the single-product tests above could never catch it
+     * because the shadowing only bites on the next iteration of the outer loop.
+     */
+    public function testStoredRolesAreHonouredForEveryProductInTheBatch(): void
+    {
+        $config = $this->createMock(Config::class);
+        $config->method('isMediaAutoAssignRoles')->willReturn(true);
+        $processor = $this->processorWith(null, null, $config);
+
+        $context = $this->contextForMany([
+            'P1' => ['entries' => [$this->entry(self::FILE_A)], 'link_id' => 10],
+            'P2' => ['entries' => [$this->entry(self::FILE_A)], 'link_id' => 20],
+        ]);
+
+        $this->gallery->method('getGallery')->willReturn([
+            10 => [$this->galleryRow(501, self::FILE_A, ['position' => 0])],
+            20 => [$this->galleryRow(601, self::FILE_A, ['position' => 0])],
+        ]);
+        $this->gallery->method('insertGalleryRows')->willReturn([]);
+
+        // BOTH products already have "image" set by the merchant; only the
+        // remaining base roles may be filled in, for either of them.
+        $this->eavValue->method('getValuesForStores')->willReturn([
+            10 => [self::ROLE_IDS['image'] => [0 => '/x/y/p1-choice.jpg']],
+            20 => [self::ROLE_IDS['image'] => [0 => '/x/y/p2-choice.jpg']],
+        ]);
+
+        $this->eavValue->expects(self::once())->method('upsert')->with('varchar', [
+            $this->roleRow(10, 'small_image', self::FILE_A),
+            $this->roleRow(10, 'thumbnail', self::FILE_A),
+            $this->roleRow(20, 'small_image', self::FILE_A),
+            $this->roleRow(20, 'thumbnail', self::FILE_A),
+        ]);
+
+        $processor->process($context);
+    }
+
+    /**
+     * The same shadowing also stopped a second product's stale role from being
+     * cleared, leaving the storefront pointed at a file the import had removed.
+     */
+    public function testStaleRoleIsClearedForASecondProductInTheBatch(): void
+    {
+        $context = $this->contextForMany([
+            'P1' => ['entries' => [$this->entry(self::FILE_A)], 'link_id' => 10],
+            'P2' => ['entries' => [$this->entry(self::FILE_A)], 'link_id' => 20],
+        ]);
+
+        $this->gallery->method('getGallery')->willReturn([
+            10 => [$this->galleryRow(501, self::FILE_A, ['position' => 0])],
+            // P2 loses FILE_B, and its "image" role points at exactly that file.
+            20 => [
+                $this->galleryRow(601, self::FILE_A, ['position' => 0]),
+                $this->galleryRow(602, self::FILE_B, ['position' => 1]),
+            ],
+        ]);
+        $this->gallery->method('insertGalleryRows')->willReturn([]);
+        $this->eavValue->method('getValuesForStores')->willReturn([
+            20 => [self::ROLE_IDS['image'] => [0 => self::FILE_B, 5 => self::FILE_B]],
+        ]);
+
+        $this->eavValue->expects(self::once())->method('delete')->with('varchar', [
+            ['link_id' => 20, 'attribute_id' => self::ROLE_IDS['image'], 'store_id' => 0],
+            ['link_id' => 20, 'attribute_id' => self::ROLE_IDS['image'], 'store_id' => 5],
+        ]);
+
+        $this->processor->process($context);
     }
 
     public function testProductWithoutAResolvedLinkIdIsSkipped(): void
@@ -1035,6 +1112,36 @@ class MediaProcessorTest extends TestCase
     public function testRunsAfterCategoryLinksAndBeforeProductLinks(): void
     {
         self::assertSame(710, $this->processor->getSortOrder());
+    }
+
+    /**
+     * Same as contextFor() but for a whole batch, which is the only shape in
+     * which writeRoles() iterates its outer loop more than once.
+     *
+     * @param array<string, array{entries: MediaEntryInterface[], link_id: int}> $products
+     */
+    private function contextForMany(array $products): BatchContext
+    {
+        $list = [];
+        $linkIds = [];
+        foreach ($products as $sku => $spec) {
+            $product = (new Product())->setSku((string)$sku);
+            $product->setMedia($spec['entries']);
+            $list[] = $product;
+            $linkIds[(string)$sku] = $spec['link_id'];
+        }
+
+        $context = new BatchContext($list);
+        foreach ($linkIds as $sku => $linkId) {
+            $context->setEntityId($sku, $linkId);
+        }
+        $context->set(EntityProcessor::CONTEXT_LINK_IDS, $linkIds);
+        $context->set(MediaProcessor::CONTEXT_RESOLVED_FILES, [
+            self::FILE_A => ['file' => self::FILE_A, 'message' => null],
+            self::FILE_B => ['file' => self::FILE_B, 'message' => null],
+        ]);
+
+        return $context;
     }
 
     private function expectNoGalleryWork(): void

@@ -73,7 +73,12 @@ class ProductMediaGalleryTest extends TestCase
         self::assertSame(['k1' => 101, 'k2' => 102], $valueIds);
     }
 
-    public function testInsertGalleryRowsReturnsNothingWhenAValueDoesNotMatch(): void
+    /**
+     * The rows are already inserted at this point and cannot be identified, so
+     * the only safe outcome is a throw that takes the batch's transaction with
+     * it. Returning [] would commit them unbound.
+     */
+    public function testInsertGalleryRowsThrowsWhenAValueDoesNotMatch(): void
     {
         $this->connection->method('fetchOne')->willReturn('100');
         // A concurrent writer slipped its own gallery row into the same window.
@@ -82,21 +87,27 @@ class ProductMediaGalleryTest extends TestCase
             ['value_id' => '102', 'value' => '/b/b/two.jpg'],
         ]);
 
-        self::assertSame([], $this->resource->insertGalleryRows([
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('out of order at position 0');
+
+        $this->resource->insertGalleryRows([
             'k1' => $this->row('/a/a/one.jpg'),
             'k2' => $this->row('/b/b/two.jpg'),
-        ]));
+        ]);
     }
 
-    public function testInsertGalleryRowsReturnsNothingOnACountMismatch(): void
+    public function testInsertGalleryRowsThrowsOnACountMismatch(): void
     {
         $this->connection->method('fetchOne')->willReturn('100');
         $this->connection->method('fetchAll')->willReturn([['value_id' => '101', 'value' => '/a/a/one.jpg']]);
 
-        self::assertSame([], $this->resource->insertGalleryRows([
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('returned 1 unbound rows for 2 inserted');
+
+        $this->resource->insertGalleryRows([
             'k1' => $this->row('/a/a/one.jpg'),
             'k2' => $this->row('/b/b/two.jpg'),
-        ]));
+        ]);
     }
 
     public function testInsertGalleryRowsChunksAtOneThousand(): void

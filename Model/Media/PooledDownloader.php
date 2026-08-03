@@ -9,8 +9,11 @@ namespace ReadyData\Import\Model\Media;
 use GuzzleHttp\ClientInterface;
 use GuzzleHttp\Pool;
 use GuzzleHttp\Promise\PromiseInterface;
+use GuzzleHttp\Psr7\Utils;
 use GuzzleHttp\RequestOptions;
+use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\UriInterface;
 use ReadyData\Import\Model\Config;
 use ReadyData\Import\Model\Exception\MediaReferenceException;
 
@@ -52,7 +55,8 @@ class PooledDownloader implements DownloaderInterface
 
     public function __construct(
         private readonly ClientInterface $httpClient,
-        private readonly Config $config
+        private readonly Config $config,
+        private readonly HostAllowList $hostAllowList
     ) {
     }
 
@@ -141,8 +145,22 @@ class PooledDownloader implements DownloaderInterface
      */
     private function options(int $maxBytes): array
     {
+        // Handed over as a PSR-7 stream, NOT as the raw handle, and that matters.
+        // Guzzle follows redirects in PHP rather than in curl, releasing each
+        // hop's Response before it issues the next request. Given a raw resource
+        // the handler wraps it in a fresh Stream per hop, so hop 1's response body
+        // owns the only reference to it: releasing that response runs
+        // Stream::__destruct, which fcloses the handle while curl is still writing
+        // into it. The result is a fatal "supplied resource is not a valid stream
+        // resource" raised from inside curl_multi_exec(), where neither the pool's
+        // "rejected" handler nor FileResolver's per-reference guard can catch it —
+        // so one redirecting URL failed the entire batch. Passing a stream OBJECT
+        // makes every hop reuse this one, and the options array keeps it alive.
+        $handle = fopen('php://temp/maxmemory:' . self::MEMORY_SPILL_BYTES, 'r+');
+        $sink = Utils::streamFor($handle);
+
         return [
-            RequestOptions::SINK => fopen('php://temp/maxmemory:' . self::MEMORY_SPILL_BYTES, 'r+'),
+            RequestOptions::SINK => $sink,
             RequestOptions::CONNECT_TIMEOUT => self::CONNECT_TIMEOUT_SEC,
             RequestOptions::TIMEOUT => $this->config->getMediaDownloadTimeout(),
             // Redirects are capped and pinned to http(s), so a redirect cannot
@@ -152,6 +170,23 @@ class PooledDownloader implements DownloaderInterface
                 'protocols' => ['http', 'https'],
                 'strict' => true,
                 'referer' => false,
+                'on_redirect' => function (
+                    RequestInterface $request,
+                    ResponseInterface $response,
+                    UriInterface $uri
+                ) use ($handle): void {
+                    // Every hop writes into the same sink, so a 3xx body — which
+                    // nginx and Apache both send by default — would otherwise sit
+                    // in front of the image. It would survive the signature check
+                    // whenever the image's own magic bytes happened to land first,
+                    // and a corrupt file would then be published.
+                    ftruncate($handle, 0);
+                    rewind($handle);
+                    // FileResolver only ever saw the URL the payload gave us.
+                    // Without this a permitted host can bounce the fetch onto an
+                    // address the store can reach but the operator never allowed.
+                    $this->hostAllowList->assert($uri->getHost());
+                },
             ],
             // A 404 is data, not an exception: the caller turns it into a
             // per-product warning like any other unusable reference.
