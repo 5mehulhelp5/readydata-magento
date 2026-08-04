@@ -34,8 +34,8 @@
             </logging>
             <events>
                 <dispatch_product_events>1</dispatch_product_events>
-                <dispatch_save_after>0</dispatch_save_after>
-                <hydrate_media>0</hydrate_media>
+                <dispatch_save_after>1</dispatch_save_after>
+                <hydrate_media>1</hydrate_media>
             </events>
         </readydata_import>
     </default>
