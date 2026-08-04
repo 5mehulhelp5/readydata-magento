@@ -30,6 +30,7 @@ class Product implements ProductInterface
     private ?ConfigurableDataInterface $configurable = null;
     private ?ProductLinksInterface $links = null;
     private ?array $media = null;
+    private ?array $tierPrices = null;
 
     public function getSku(): string
     {
@@ -215,6 +216,17 @@ class Product implements ProductInterface
     public function setMedia(array $media): ProductInterface
     {
         $this->media = $media;
+        return $this;
+    }
+
+    public function getTierPrices(): ?array
+    {
+        return $this->tierPrices;
+    }
+
+    public function setTierPrices(array $tierPrices): ProductInterface
+    {
+        $this->tierPrices = $tierPrices;
         return $this;
     }
 }

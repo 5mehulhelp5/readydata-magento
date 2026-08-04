@@ -33,6 +33,7 @@ interface ProductInterface
     public const CONFIGURABLE = 'configurable';
     public const LINKS = 'links';
     public const MEDIA = 'media';
+    public const TIER_PRICES = 'tier_prices';
 
     /**
      * @return string
@@ -284,4 +285,36 @@ interface ProductInterface
      * @return $this
      */
     public function setMedia(array $media): self;
+
+    /**
+     * Tier (group) prices. Each entry prices a (customer group, quantity,
+     * website) triple with either an absolute "price" or a "percentage_discount"
+     * off the product's price. When present, REPLACES the product's tier
+     * prices: they become exactly this set and rows not listed are removed (an
+     * empty array removes them all); null/omitted leaves them unchanged.
+     * Existing rows are matched on their triple, so a re-import is idempotent
+     * and writes nothing.
+     *
+     * Entries that cannot be resolved or fail validation (unknown customer
+     * group or website, a website named while Catalog Price Scope is global,
+     * non-positive quantity, both or neither of price/percentage_discount) are
+     * skipped with a per-product warning and make that product additive:
+     * inserts and price updates apply, no existing row is removed. Tier prices
+     * are written GLOBALLY — store_view_code does not affect them, the website
+     * dimension lives in the entry itself — so send them on one store pass only.
+     *
+     * Skipped for product types outside the tier_price attribute's apply_to
+     * (configurable and grouped on a stock install); existing rows on such a
+     * product are left alone, not removed. Bundle products accept
+     * percentage_discount only.
+     *
+     * @return \ReadyData\Import\Api\Data\TierPriceInterface[]|null
+     */
+    public function getTierPrices(): ?array;
+
+    /**
+     * @param \ReadyData\Import\Api\Data\TierPriceInterface[] $tierPrices
+     * @return $this
+     */
+    public function setTierPrices(array $tierPrices): self;
 }

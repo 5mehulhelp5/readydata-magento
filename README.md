@@ -30,6 +30,10 @@ Authorization: Bearer <integration token>   (ACL: ReadyData_Import::import)
       "stock": {"qty": 100, "is_in_stock": true},
       "url_key": "example-product",
       "links": {"related": ["DEF-456"], "cross_sell": ["GHI-789"]},
+      "tier_prices": [
+        {"customer_group": "all groups", "qty": 1, "price": 17.99},
+        {"customer_group": "Wholesale", "qty": 10, "percentage_discount": 15}
+      ],
       "media": [
         {"file": "https://cdn.example.com/img/shirt-front.jpg", "label": "Front",
          "roles": ["image", "small_image", "thumbnail"]},
@@ -152,6 +156,73 @@ ordered list of target SKUs:
   deduplicated, first occurrence wins.
 - Links are **global** (no store dimension) — send them on one store pass only.
 - Grouped-product children are a different link type and are not touched.
+
+### Tier prices
+
+A `tier_prices` array declares the product's tier (group) prices — one entry per
+(customer group, quantity, website) triple:
+
+```json
+{
+  "sku": "SHIRT-01",
+  "price": 100,
+  "tier_prices": [
+    {"customer_group": "all groups", "qty": 1,  "price": 90},
+    {"customer_group": "NOT LOGGED IN", "qty": 1, "price": 95},
+    {"customer_group": "Wholesale",  "qty": 10, "percentage_discount": 20},
+    {"customer_group": "3",          "qty": 25, "percentage_discount": 25, "website": "base"}
+  ]
+}
+```
+
+- Semantics are **replace**: a present array (including `[]`) makes the product's
+  tier prices become exactly this set. `null`/omitted leaves them untouched.
+  Existing rows are matched on their triple — the same unique key Magento uses —
+  so a re-import keeps each row's `value_id` and, when nothing changed, issues
+  **no SQL at all**.
+- **`customer_group`** is a group code (matched case-insensitively and trimmed,
+  as Magento's own tier-price API does), a numeric group ID, or the sentinel
+  `"all groups"` (`"all"` is accepted as shorthand) for every group. Note that
+  `NOT LOGGED IN` is a real group (ID 0) and is *not* the same as "all groups" —
+  both are storable side by side, and a group-specific price wins over the
+  all-groups one at the same quantity. When two groups share a code the lowest ID
+  wins, deterministically; a group whose code is digits-only can only be
+  referenced by its ID.
+- **`price` XOR `percentage_discount`** — exactly one. `price` is an absolute
+  amount in the base currency; `percentage_discount` is a percentage taken **off
+  the product's price** (`20` on a product at 100 means 80). Sending both, or
+  neither, skips the entry with a warning rather than guessing.
+- **`website`** is a website code, or omitted / `"all websites"` / `"all"` for
+  every website. Legal only when **Catalog Price Scope** is *Website*; under the
+  default *Global* scope an entry naming a website is skipped with a warning. It
+  is deliberately not widened to All Websites — quietly applying one website's
+  price everywhere is a pricing error, not a normalisation — and not stored
+  as-is either, since such a row is invisible in the admin and the next admin
+  save would delete it.
+- **Safety valve** (as with categories and media), scoped **per product**: if any
+  entry fails to resolve or validate, that product is applied additively — new
+  and changed prices are written, but no existing tier price is removed (a
+  warning explains this). Unlike `links` the valve is not per sub-dimension: tier
+  prices are one set whose dimensions come from the data, with no named
+  sub-field to isolate.
+- Each guard is a per-product warning in `results[].messages`, never fatal:
+  unknown or empty customer group, unknown website code, a website under global
+  price scope, `qty` not greater than zero, a negative `price`,
+  `percentage_discount` outside 0–100, both or neither amount, and an absolute
+  price on a **bundle** (bundles accept `percentage_discount` only, as in core).
+  A **duplicate triple** within one product keeps the first entry and warns, but
+  deliberately does *not* trip the valve — one of the two rows is written, so the
+  set is still complete.
+- Values are stored at the column scales `qty` 4, `price` 6 and
+  `percentage_discount` 2 decimals, and both sides of the diff are compared at
+  those scales — which is what makes a re-import a no-op instead of a
+  delete-and-reinsert churn.
+- Tier prices are **global** (no store dimension) — `store_view_code` does not
+  affect them, the website dimension lives in the entry — so send them on one
+  store pass only.
+- Skipped entirely for product types outside the `tier_price` attribute's
+  `apply_to` (**configurable** and **grouped** on a stock install): a warning is
+  reported and existing rows are left alone, never removed.
 
 ### Configurable products
 
@@ -453,6 +524,10 @@ Unsupported input types and definitions that would break a module invariant
 - Related / up-sell / cross-sell links: replace semantics per link type with a
   per-type additive safety valve and payload-order positions (see "Related,
   up-sell & cross-sell links" above).
+- Tier / group prices: `catalog_product_entity_tier_price` with replace semantics
+  diffed on the (website, all-groups, customer group, quantity) unique key,
+  absolute or percentage values, an additive safety valve, and customer-group /
+  website resolution by code or ID (see "Tier prices" above).
 - Media gallery: downloads image URLs into `pub/media/catalog/product` (or
   accepts pre-uploaded paths), writes `catalog_product_entity_media_gallery`
   and its `_value` / `_value_to_entity` / `_value_video` children with replace
@@ -590,13 +665,15 @@ Two things it does not report: a re-download that replaced the **bytes** behind
 an existing path (the path is unchanged — see *Re-Download Existing Files*), and
 removals of legacy junk rows whose stored path was NULL or a duplicate.
 
-## Placeholders (registered, disabled)
+## Extending the pipeline
 
-Tier prices — see `Model/Processor/TierPriceProcessor.php` for the planned
-scope. Implement `execute()` and flip `isEnabled()` to activate. Third-party
-steps: implement `ProcessorInterface` (plus `PreparableInterface` when the step
-needs network or filesystem access before the transaction opens) and register in
-`etc/di.xml` (`ImportService`, argument `processors`).
+No placeholder steps remain — every dimension in the pipeline is implemented.
+To add one: implement `ProcessorInterface` (plus `PreparableInterface` when the
+step needs network or filesystem access before the batch transaction opens) and
+register it in `etc/di.xml` (`ImportService`, argument `processors`). Position is
+`getSortOrder()`, not the order of the XML items; core steps use 100–750 with
+gaps left for third-party insertion. `AbstractPlaceholderProcessor` remains as the
+base for a step that should be registered but inert until it is written.
 
 ## Important caveats
 
@@ -630,6 +707,43 @@ needs network or filesystem access before the transaction opens) and register in
   are directional — only the linking product's FPC tags are cleaned, which the
   normal post-import invalidation already covers. Link targets are not
   invalidated.
+- **Tier prices are global** (no store dimension): `store_view_code` does not
+  affect them. The website dimension lives in the entry and is governed by
+  *Catalog Price Scope*, not by the `tier_price` attribute's own scope — that
+  column is installed as "Website" and core never switches it, because the
+  scope-change observer only touches attributes whose input type is `price`.
+- Under **Website** price scope the payload owns the product's whole tier-price
+  set **across all websites**: a feed that sends one pass per website would have
+  each pass wipe the other's rows. Restrict such a feed to entries with no
+  `website`, or send every website's entries in one product payload.
+- **Only `qty = 1` tier prices reach the price index.** Magento's price indexer
+  joins the tier price table with `qty = 1`, so larger quantity breaks price the
+  cart and appear in the product page's tier table but never move the indexed
+  `final_price`/`min_price` — they will not affect layered-navigation price
+  filters or price sorting. That is core behaviour, not a limitation of the
+  importer.
+- A **fixed tier price of `0` is accepted** (core's own validator allows
+  `price >= 0`, and the live price indexer branches on `percentage_value`, so it
+  indexes as 0). Be aware that Magento's *deprecated* `DefaultPrice` indexer
+  branches on `value = 0` instead; a third-party price indexer still extending it
+  would misread such a row as a percentage discount. Prefer
+  `percentage_discount: 100` to express "free at this quantity".
+- Tier prices are **not attached to dispatched product events**. The dispatched
+  product deliberately carries no `tier_price` key: the payload's shape is nothing
+  like the `price_qty`/`cust_group`/`website_id` array core puts there, and that
+  key is what triggers core's tier-price save handlers — so an observer calling
+  `$product->save()` would re-write the rows this import just wrote, against an
+  empty `origData` in which every stored row diffs as new.
+- Changing tier prices does **not** recollect existing shopping carts. Core's
+  product save marks affected quotes for recollection; this module (like its
+  `price` and `special_price` writes) does not, so carts already holding the
+  product keep their old row totals until they are next recollected.
+- Fractional `qty` is written as sent. Core additionally rejects `qty < 1` for
+  product types that cannot use decimal quantities — keep quantity breaks
+  integral unless the type allows otherwise.
+- Customer group codes are matched **case-insensitively**, unlike SKUs. This
+  follows core's own tier-price API rather than the module's case-sensitive SKU
+  rule.
 - **Value coercion**: datetime attribute values are normalized to UTC
   `Y-m-d H:i:s` (offset-less input is taken as already-UTC); unparseable
   datetime and non-numeric decimal values are skipped with a per-SKU

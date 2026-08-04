@@ -17,7 +17,8 @@ class AttributeMetadataCache
 {
     /**
      * @var array<string, array{attribute_id: int, attribute_code: string, backend_type: string,
-     *      frontend_input: string, frontend_label: string, is_global: int, is_required: int}|null>
+     *      frontend_input: string, frontend_label: string, is_global: int, is_required: int,
+     *      apply_to: string}|null>
      */
     private array $attributesByCode = [];
 
@@ -52,7 +53,7 @@ class AttributeMetadataCache
             ->joinLeft(
                 ['cea' => $this->resourceConnection->getTableName('catalog_eav_attribute')],
                 'cea.attribute_id = ea.attribute_id',
-                ['is_global']
+                ['is_global', 'apply_to']
             )
             ->where('ea.entity_type_id = ?', $this->getEntityTypeId())
             ->where('ea.attribute_code IN (?)', array_values($missing));
@@ -69,13 +70,17 @@ class AttributeMetadataCache
                 'frontend_label' => (string)($row['frontend_label'] ?? ''),
                 'is_global' => (int)($row['is_global'] ?? 1),
                 'is_required' => (int)$row['is_required'],
+                // Comma-separated product types the attribute applies to;
+                // empty means every type (core's AbstractType convention).
+                'apply_to' => (string)($row['apply_to'] ?? ''),
             ];
         }
     }
 
     /**
      * @return array{attribute_id: int, attribute_code: string, backend_type: string,
-     *      frontend_input: string, frontend_label: string, is_global: int, is_required: int}|null
+     *      frontend_input: string, frontend_label: string, is_global: int, is_required: int,
+     *      apply_to: string}|null
      *      null when the attribute does not exist
      */
     public function get(string $code): ?array

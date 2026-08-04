@@ -16,6 +16,8 @@
                 type="ReadyData\Import\Model\Data\ProductLinks"/>
     <preference for="ReadyData\Import\Api\Data\MediaEntryInterface"
                 type="ReadyData\Import\Model\Data\MediaEntry"/>
+    <preference for="ReadyData\Import\Api\Data\TierPriceInterface"
+                type="ReadyData\Import\Model\Data\TierPrice"/>
     <preference for="ReadyData\Import\Api\Data\ImportSettingsInterface"
                 type="ReadyData\Import\Model\Data\ImportSettings"/>
     <preference for="ReadyData\Import\Api\Data\ImportResultInterface"
@@ -74,7 +76,6 @@
     <!--
         The import pipeline. Order is controlled by each processor's
         getSortOrder(); add third-party steps by appending items here.
-        Placeholder processors report isEnabled() = false until implemented.
     -->
     <type name="ReadyData\Import\Model\ImportService">
         <arguments>
@@ -89,7 +90,6 @@
                 <item name="links" xsi:type="object">ReadyData\Import\Model\Processor\LinkProcessor</item>
                 <item name="configurables" xsi:type="object">ReadyData\Import\Model\Processor\ConfigurableProcessor</item>
                 <item name="media" xsi:type="object">ReadyData\Import\Model\Processor\MediaProcessor</item>
-                <!-- Placeholders for further expansion -->
                 <item name="tier_prices" xsi:type="object">ReadyData\Import\Model\Processor\TierPriceProcessor</item>
             </argument>
         </arguments>
@@ -119,6 +119,7 @@
     <type name="ReadyData\Import\Model\Cache\AttributeMetadataCache" shared="true"/>
     <type name="ReadyData\Import\Model\Cache\StoreWebsiteMap" shared="true"/>
     <type name="ReadyData\Import\Model\Cache\CategoryPathResolver" shared="true"/>
+    <type name="ReadyData\Import\Model\Cache\CustomerGroupMap" shared="true"/>
     <type name="ReadyData\Import\Model\ResourceModel\AttributeOption" shared="true"/>
     <type name="ReadyData\Import\Model\ResourceModel\AmastyAttribute" shared="true"/>
     <type name="ReadyData\Import\Model\ResourceModel\Category" shared="true"/>
@@ -126,4 +127,5 @@
     <type name="ReadyData\Import\Model\ResourceModel\ProductLink" shared="true"/>
     <!-- Memoizes the link field and the ProductVideo table probe for the request -->
     <type name="ReadyData\Import\Model\ResourceModel\ProductMediaGallery" shared="true"/>
+    <type name="ReadyData\Import\Model\ResourceModel\TierPrice" shared="true"/>
 </config>

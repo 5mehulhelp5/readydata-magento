@@ -37,7 +37,7 @@ Processor pipeline (sorted pool, injected via di.xml — the extension point)
         ├─ MediaProcessor            gallery tables + file handling
         ├─ LinkProcessor             related/upsell/crosssell            [placeholder]
         ├─ ConfigurableProcessor     super link/attribute tables         [placeholder]
-        └─ TierPriceProcessor        catalog_product_entity_tier_price   [placeholder]
+        └─ TierPriceProcessor        catalog_product_entity_tier_price
         │
         ▼
 Model\Indexer\InvalidationHandler
@@ -193,13 +193,14 @@ app/code/ReadyData/Import/
 │   │   ├── MediaProcessor.php
 │   │   ├── LinkProcessor.php              [P]
 │   │   ├── ConfigurableProcessor.php      [P]
-│   │   └── TierPriceProcessor.php         [P]
+│   │   └── TierPriceProcessor.php
 │   ├── ResourceModel/
 │   │   ├── ProductEntity.php              # entity upserts + SKU→ID resolution
 │   │   ├── EavValue.php                   # per-backend-type value upserts
 │   │   ├── AttributeOption.php            # option lookup/bulk create
 │   │   ├── Stock.php                      # stock_item + MSI source items
 │   │   ├── ProductMediaGallery.php        # the four media gallery tables
+│   │   ├── TierPrice.php                  # tier price diff/upsert + decimal scaling
 │   │   ├── UrlRewrite.php
 │   │   └── Website.php
 │   ├── Media/
@@ -208,6 +209,7 @@ app/code/ReadyData/Import/
 │   │   └── PooledDownloader.php           # bounded concurrent fetch (Guzzle Pool)
 │   ├── Cache/
 │   │   ├── AttributeMetadataCache.php
+│   │   ├── CustomerGroupMap.php           # group code/ID resolution
 │   │   └── StoreWebsiteMap.php
 │   └── Indexer/
 │       └── InvalidationHandler.php
