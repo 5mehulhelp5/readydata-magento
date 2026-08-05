@@ -29,7 +29,19 @@ use ReadyData\Import\Model\Processor\ProcessorInterface;
  */
 class ImportService
 {
-    private const LOCK_NAME = 'readydata_product_import';
+    /**
+     * Held by every endpoint that mutates the category tree.
+     *
+     * The product import creates categories on demand (see
+     * CategoryPathResolver), and so does the category sync endpoint. There is
+     * no unique key on (parent_id, name) or on a category url_key, so two
+     * concurrent runs resolve the same missing path, both miss, and both
+     * insert — leaving a duplicate sibling, or a url_rewrite unique-key
+     * violation that fails whichever request loses. One lock for both is the
+     * only thing that makes the read-then-create sequence safe.
+     */
+    public const TREE_WRITE_LOCK_NAME = 'readydata_product_import';
+
     private const LOCK_TIMEOUT_SEC = 10;
 
     /**
@@ -84,7 +96,7 @@ class ImportService
         $continueOnError = $settings?->getContinueOnError() ?? $this->config->isContinueOnError();
         $storeId = $this->storeWebsiteMap->resolveStoreId($settings?->getStoreViewCode());
 
-        if (!$this->lockManager->lock(self::LOCK_NAME, self::LOCK_TIMEOUT_SEC)) {
+        if (!$this->lockManager->lock(self::TREE_WRITE_LOCK_NAME, self::LOCK_TIMEOUT_SEC)) {
             throw new LocalizedException(__('Another import is already running. Try again later.'));
         }
 
@@ -119,7 +131,7 @@ class ImportService
             $this->invalidationHandler->execute($affectedIds, $affectedCategoryIds);
         } finally {
             $this->importState->leave();
-            $this->lockManager->unlock(self::LOCK_NAME);
+            $this->lockManager->unlock(self::TREE_WRITE_LOCK_NAME);
         }
 
         $response = $this->buildResponse($received, $contexts, $startedAt);
@@ -227,7 +239,7 @@ class ImportService
     {
         $this->resourceConnection->getConnection()->fetchOne('SELECT 1');
 
-        if (!$this->lockManager->isLocked(self::LOCK_NAME)) {
+        if (!$this->lockManager->isLocked(self::TREE_WRITE_LOCK_NAME)) {
             throw new \RuntimeException(
                 'the import lock was lost during preparation, most likely with the database connection'
             );

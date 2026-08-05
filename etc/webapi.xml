@@ -17,6 +17,14 @@
         </resources>
     </route>
 
+    <!-- Create/update categories (standalone; no product import required) -->
+    <route url="/V1/readydata/categories" method="POST">
+        <service class="ReadyData\Import\Api\CategorySyncInterface" method="sync"/>
+        <resources>
+            <resource ref="ReadyData_Import::categories"/>
+        </resources>
+    </route>
+
     <!--
         Placeholders for further expansion:
 

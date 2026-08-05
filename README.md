@@ -5,6 +5,14 @@ database** for performance. Products are processed in configurable batches
 (default **500** per batch, one DB transaction each) through a pluggable
 processor pipeline.
 
+Three endpoints, each standalone:
+
+| Endpoint | Purpose | ACL |
+|---|---|---|
+| `POST /V1/readydata/products` | Bulk create/update products | `ReadyData_Import::import` |
+| `POST /V1/readydata/attributes` | Product attribute *definitions* | `ReadyData_Import::attributes` |
+| `POST /V1/readydata/categories` | Categories and their properties | `ReadyData_Import::categories` |
+
 See [PLAN.md](PLAN.md) for the full architecture and roadmap.
 
 ## Endpoint
@@ -509,6 +517,191 @@ Unsupported input types and definitions that would break a module invariant
 `multiselect` on `varchar`, or a missing backend/source model class) are
 `skipped` with a clear per-attribute reason.
 
+## Category sync
+
+A third endpoint owns the categories themselves. The product endpoint already
+creates missing categories on demand, but only as bare nodes carrying a name and
+the resolver's defaults; this one lets the caller state what each category
+should actually *be*, and reports back what happened to it. **Standalone** — no
+product import required — and normally called as a pre-flight step so the
+categories a feed references already exist with the right properties. Off by
+default (see Configuration).
+
+```
+POST /rest/all/V1/readydata/categories
+Authorization: Bearer <integration token>   (ACL: ReadyData_Import::categories)
+```
+
+```json
+{
+  "categories": [
+    {
+      "path": "Default Category/Men",
+      "is_active": 1,
+      "include_in_menu": 1
+    },
+    {
+      "path": "Default Category/Men/Shirts",
+      "category_id": 42,
+      "name": "Shirts",
+      "url_key": "mens-shirts",
+      "is_anchor": 1,
+      "position": 10,
+      "custom_attributes": [
+        {"attribute_code": "description", "value": "<p>All shirts</p>"},
+        {"attribute_code": "meta_title", "value": "Shirts"}
+      ],
+      "clear_attributes": ["meta_keywords"]
+    }
+  ],
+  "settings": {"store_view_code": "default", "continue_on_error": true}
+}
+```
+
+Response: summary counters (`received`, `created`, `updated`, `unchanged`,
+`skipped`, `failed`, `elapsed_ms`) plus a per-category `results` array with the
+resolved `path`, the `entity_id`, a `status`, a machine-readable `reason` and
+`messages`. Errors are per category; a failing category does not abort the
+request. Every entry gets exactly one result row, rejected ones included; the
+only case where `results` is shorter than `received` is a payload that sends the
+same category twice, which collapses to one entry with the last one winning.
+
+The endpoint is **purely additive**: a category the caller stops sending is
+never deactivated or deleted. This is deliberately *unlike* the `categories`
+field on the product payload, which has replace semantics. Use `is_active: 0` to
+retire a category.
+
+### Identity: path, plus `category_id` to rename
+
+`path` is the full path from a level-1 root name and uses the same grammar as
+the product payload's `categories` field — `/` separates segments only when
+unescaped, so `Default Category/Wo\/Men` is two segments, the second being
+`Wo/Men`.
+
+A path alone cannot express a rename: the new name no longer matches the stored
+path. So sending a `name` that differs from the last path segment is
+`skipped` with `rename_requires_category_id` unless `category_id` is also given,
+in which case the ID identifies the category and `path` becomes informational —
+cross-checked against the stored parent, but never a source of the name. **Only
+an explicit `name` renames.** Sending `category_id` with a path you kept on file
+from before a rename therefore updates the other properties and leaves the name
+as it is, rather than reverting it.
+
+Every result carries `entity_id` once the entry has been matched to a row —
+including refusals like `move_not_supported` — so a caller that is the system of
+record can store it and send it back. It is null only when nothing was
+identified (`ambiguous_path`, `parent_not_found`, a rejected payload).
+
+Two sibling categories sharing a name make a path ambiguous. Reads elsewhere in
+this module resolve that by taking the lowest `entity_id`; a *write* refuses —
+the entry is `skipped` with `ambiguous_path` and the candidate IDs in its
+message. Send `category_id` to disambiguate.
+
+### Ordering, parents and roots
+
+Entries are processed **shallowest path first**, so a parent sent in the same
+request is created and committed before the child that needs it — payload order
+does not matter. Entries addressed only by `category_id` are processed last,
+since they may target something created earlier in the same run.
+
+Missing parents are **not** created implicitly: a category the caller never
+asked for would get none of the properties they specified and would not appear
+in the response at all. An unresolvable parent is `parent_not_found` (or
+`unknown_root` when the first segment names no existing root). Root categories
+are neither created nor modified — a typo cannot spawn a new tree.
+
+If an entry renames a category at default scope, any later entry in the same
+request whose path runs through the old name is `skipped` with
+`stale_parent_path` rather than silently resolving to the wrong node. A
+*store-scoped* rename does not trigger this: path resolution matches store-0
+names throughout the module, and those are untouched.
+
+### Reconciliation — create or update to match the source
+
+Per category:
+
+- **missing** (below an existing parent) → **created**;
+- **exists, nothing differs** → `unchanged`, with **no save at all** — no
+  observers, no URL rewrite regeneration, no reindex. A replayed payload is
+  therefore genuinely free;
+- **exists, something differs** → **updated**;
+- **exists under a different parent** → `skipped` with `move_not_supported`.
+
+Values are compared loosely against the stored ones, because EAV round-trips
+everything as a string and a strict comparison would report every flag as
+changed on every sync.
+
+`is_active`, `include_in_menu` and `is_anchor` are transported as **`0`/`1`
+integers, not booleans** — Magento's EAV layer treats `false` as "empty" and
+deletes the value row instead of storing a `0`.
+
+Anything else on the category attribute set (`description`, `meta_*`,
+`display_mode`, `landing_page`, `available_sort_by`, `default_sort_by`,
+`page_layout`, …) goes through `custom_attributes`. Values are written
+**verbatim** — there is no option-label resolution here, so a category `select`
+attribute needs its option *ID*. Attributes Magento maintains itself (`path`,
+`level`, `parent_id`, `children_count`, `url_path`, `position` via
+`custom_attributes`, `image`) are rejected with `invalid_definition` rather than
+silently dropped.
+
+`clear_attributes` reverts an attribute to its default: at store scope it drops
+the store override, at default scope it removes the value. Clearing something
+that has no value to remove — in particular an attribute at store scope that
+only ever had a default-scope value — is `unchanged`, not a no-op save, so
+clears stay as replayable as everything else. `name`, `url_key`,
+`url_path`, `is_active`, `include_in_menu`, `is_anchor` and Magento-owned
+attributes cannot be cleared (`protected_attribute`) — clearing a required
+attribute makes every later save of that category fail validation, and clearing
+the name or URL key strands its rewrites and its descendants' `url_path`.
+
+### URLs and redirects
+
+Magento only derives a `url_key` when the stored one is empty, so a rename would
+otherwise keep the old slug forever. On rename the endpoint derives the new
+`url_key` from the new name (an explicit `url_key` always wins), which is what
+makes the native rewrite cascade regenerate the category and its whole
+descendant subtree. It also sets `save_rewrites_history` from
+`catalog/seo/save_rewrites_history`, so old category URLs 301 instead of 404 —
+the same guarantee the product import gives.
+
+### Store scope
+
+`settings.store_view_code` selects the scope, as on the product endpoint. At
+store scope only attribute **values** are written, and only the ones named in
+the payload. Anything without a store dimension is refused with
+`store_scope_structural_change` rather than written globally behind the caller's
+back: creating a category (`path`/`level`/`parent_id` are columns, not scoped
+attributes) and setting `position`, which is likewise one column shared by every
+store. Omit `store_view_code` (or use `admin`) for the default scope.
+
+Note the `all/` in the URL. Magento resolves `/rest/V1/...` against the default
+store view, not the admin scope, so the store the values land in comes from the
+URL unless the endpoint overrides it — which it does, from `store_view_code`.
+Keeping `/rest/all/V1/...` is still the safe habit.
+
+### Concurrency & indexing
+
+Category sync takes the **same lock as the product import** (rejecting with
+`Another import is already running.`), because both mutate the category tree and
+there is no unique key on `(parent_id, name)` to fall back on — two concurrent
+runs would resolve the same missing path, both miss, and both insert.
+
+Each category is processed in its own transaction and reported independently.
+Category writes go through the category model, so `catalog_category_flat` and
+`catalog_category_product` are already reindexed by Magento's own commit
+callbacks; the endpoint additionally invalidates `catalogsearch_fulltext` (whose
+documents carry `category_ids`) and registers FPC tags for the touched
+categories **and their descendants**, since a `url_path` change cascades down.
+
+### Limits (v1)
+
+Moving or reparenting a category, deleting one, creating level-1 roots, category
+images, and assigning products from the category side (that is owned by the
+product payload's `categories` field) are out of scope. A payload implying a
+move is reported, never applied: a move re-paths an entire subtree through
+non-transactional relative updates and needs cycle detection this endpoint does
+not yet have.
+
 ## What it does today
 
 - Creates/updates `catalog_product_entity` + all scalar EAV values with
@@ -560,6 +753,14 @@ the kill switch for the `POST /V1/readydata/attributes` endpoint. When off, the
 endpoint is a no-op that reports every attribute as `skipped`/`disabled`. There
 is intentionally no attribute-shape config here — scope, flags and placement are
 supplied per attribute by the caller (the system of record).
+
+The **Categories** group has a single switch, **Enable Category Sync**
+(`readydata_import/categories/enabled`, default **off**), the kill switch for
+the `POST /V1/readydata/categories` endpoint. When off, the endpoint is a no-op
+that reports every category as `skipped`/`disabled` without taking a lock or
+writing anything. It is off by default because creating and renaming categories
+reshapes storefront navigation and category URLs. Note this switch gates only
+the endpoint — the product import's on-demand category creation is unaffected.
 
 ### Media gallery
 
@@ -692,11 +893,29 @@ base for a step that should be registered but inert until it is written.
   **global-scope select** added to the product's attribute set).
 - **Bypasses the product model**: plugins/observers on product save do NOT
   run. That is the point, but audit your customizations before adopting.
-  Exception: **auto-created categories** are saved through the category
-  model/repository (path/level maintenance, url_key, URL rewrites), so
-  category-save plugins and observers DO run for them.
-- Duplicate sibling category names are ambiguous; path resolution picks the
-  lowest entity_id, deterministically.
+  Exception: **categories** are saved through the category model/repository
+  (path/level maintenance, url_key, URL rewrites), both when auto-created by a
+  product import and when written by the category endpoint, so category-save
+  plugins and observers DO run for them.
+- Duplicate sibling category names are ambiguous. Path resolution for a *read*
+  (product→category assignment) picks the lowest entity_id, deterministically;
+  the category sync endpoint refuses to guess and reports `ambiguous_path`.
+- **Category creation now fails its batch instead of being reported per path.**
+  A category is created through the repository, which runs its own transaction;
+  when that fails inside the import's batch transaction the connection is left
+  flagged as partially rolled back, so every later write and the commit itself
+  would fail with an unrelated "Partial rollback is not supported". The failure
+  is therefore re-thrown so the batch rolls back cleanly and reports the real
+  reason (typically a URL-key conflict).
+- **Category creation is forced to default scope.** `CategoryRepository::save()`
+  takes its store from the store manager and ignores `setStoreId()`, so calling
+  `/rest/V1/...` instead of `/rest/all/V1/...` used to write the category name
+  at the default store view with no store-0 row — invisible to every store-0
+  name lookup, and duplicated on the next import. Writes are now wrapped in
+  explicit store-0 emulation, but `/rest/all/V1/...` remains the correct URL.
+  Both callers go through the same `CategoryWriter`, so the defaults and the
+  emulation cannot drift between an auto-created and an endpoint-created
+  category.
 - **Referenced SKUs are matched case-sensitively** — configurable `children` and
   the SKUs in a `links` block are looked up by their **stored** spelling, so
   `"belt-01"` against a stored `"BELT-01"` is reported as not found (and trips

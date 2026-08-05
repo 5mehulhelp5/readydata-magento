@@ -7,6 +7,7 @@
                 <resource id="ReadyData_Import::import" title="ReadyData Product Import" sortOrder="100">
                     <resource id="ReadyData_Import::config" title="Import Configuration" sortOrder="10"/>
                     <resource id="ReadyData_Import::attributes" title="Attribute Definition Sync" sortOrder="20"/>
+                    <resource id="ReadyData_Import::categories" title="Category Sync" sortOrder="30"/>
                 </resource>
             </resource>
         </resources>

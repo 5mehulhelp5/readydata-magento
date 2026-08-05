@@ -41,6 +41,7 @@ class Config
     private const XML_PATH_DISPATCH_SAVE_AFTER = 'readydata_import/events/dispatch_save_after';
     private const XML_PATH_HYDRATE_MEDIA = 'readydata_import/events/hydrate_media';
     private const XML_PATH_AUTO_CREATE_ATTRIBUTES = 'readydata_import/attributes/auto_create';
+    private const XML_PATH_CATEGORIES_ENABLED = 'readydata_import/categories/enabled';
     private const XML_PATH_MEDIA_ENABLED = 'readydata_import/media/enabled';
     private const XML_PATH_MEDIA_DOWNLOAD_TIMEOUT = 'readydata_import/media/download_timeout';
     private const XML_PATH_MEDIA_DOWNLOAD_CONCURRENCY = 'readydata_import/media/download_concurrency';
@@ -140,6 +141,16 @@ class Config
     public function isAutoCreateAttributes(): bool
     {
         return $this->scopeConfig->isSetFlag(self::XML_PATH_AUTO_CREATE_ATTRIBUTES);
+    }
+
+    /**
+     * Master switch for the category sync endpoint. Off by default: creating and
+     * renaming categories reshapes the storefront's navigation and its URLs, so
+     * it must be opted into.
+     */
+    public function isCategorySyncEnabled(): bool
+    {
+        return $this->scopeConfig->isSetFlag(self::XML_PATH_CATEGORIES_ENABLED);
     }
 
     /**

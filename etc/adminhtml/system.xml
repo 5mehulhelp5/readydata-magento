@@ -48,6 +48,14 @@
                     <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
                 </field>
             </group>
+            <group id="categories" translate="label" type="text" sortOrder="26" showInDefault="1">
+                <label>Categories</label>
+                <field id="enabled" translate="label comment" type="select" sortOrder="10" showInDefault="1">
+                    <label>Enable Category Sync</label>
+                    <comment>Allow the /V1/readydata/categories endpoint to create/update categories. Off by default: it reshapes storefront navigation and category URLs.</comment>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                </field>
+            </group>
             <group id="media" translate="label" type="text" sortOrder="27" showInDefault="1">
                 <label>Media Gallery</label>
                 <field id="enabled" translate="label comment" type="select" sortOrder="10" showInDefault="1">

@@ -15,6 +15,9 @@
             <attributes>
                 <auto_create>1</auto_create>
             </attributes>
+            <categories>
+                <enabled>0</enabled>
+            </categories>
             <media>
                 <enabled>1</enabled>
                 <download_timeout>15</download_timeout>

@@ -41,6 +41,16 @@
     <preference for="ReadyData\Import\Api\Data\AttributeSyncResponseInterface"
                 type="ReadyData\Import\Model\Data\AttributeSyncResponse"/>
 
+    <!-- Category sync -->
+    <preference for="ReadyData\Import\Api\CategorySyncInterface"
+                type="ReadyData\Import\Model\CategorySync"/>
+    <preference for="ReadyData\Import\Api\Data\CategoryDefinitionInterface"
+                type="ReadyData\Import\Model\Data\CategoryDefinition"/>
+    <preference for="ReadyData\Import\Api\Data\CategorySyncResultInterface"
+                type="ReadyData\Import\Model\Data\CategorySyncResult"/>
+    <preference for="ReadyData\Import\Api\Data\CategorySyncResponseInterface"
+                type="ReadyData\Import\Model\Data\CategorySyncResponse"/>
+
     <!--
         Image downloads. Per-request options (sink, timeouts, redirect cap) are
         set by PooledDownloader; the client itself only carries what must be
@@ -123,6 +133,12 @@
     <type name="ReadyData\Import\Model\ResourceModel\AttributeOption" shared="true"/>
     <type name="ReadyData\Import\Model\ResourceModel\AmastyAttribute" shared="true"/>
     <type name="ReadyData\Import\Model\ResourceModel\Category" shared="true"/>
+    <!--
+        Memoizes the required-attribute probe for the request. Shared matters
+        beyond that: CategoryPathResolver creates through this writer, so both
+        category-creating paths run the same defaults and store emulation.
+    -->
+    <type name="ReadyData\Import\Model\Category\CategoryWriter" shared="true"/>
     <type name="ReadyData\Import\Model\ResourceModel\AttributeDefinition" shared="true"/>
     <type name="ReadyData\Import\Model\ResourceModel\ProductLink" shared="true"/>
     <!-- Memoizes the link field and the ProductVideo table probe for the request -->

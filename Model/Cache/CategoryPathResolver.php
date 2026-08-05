@@ -6,9 +6,9 @@ declare(strict_types=1);
 
 namespace ReadyData\Import\Model\Cache;
 
-use Magento\Catalog\Api\CategoryRepositoryInterface;
-use Magento\Catalog\Model\CategoryFactory;
+use Magento\Framework\Exception\LocalizedException;
 use ReadyData\Import\Logger\Logger;
+use ReadyData\Import\Model\Category\CategoryWriter;
 use ReadyData\Import\Model\Category\PathParser;
 use ReadyData\Import\Model\ResourceModel\Category as CategoryResource;
 
@@ -21,11 +21,12 @@ use ReadyData\Import\Model\ResourceModel\Category as CategoryResource;
  * escaped canonical form via PathParser::buildKey, so a segment containing
  * "/" cannot collide with a deeper path). The first segment must name an
  * existing level-1 root — roots are never auto-created, so a typo cannot
- * spawn a new tree. Missing segments below a root are created through the
- * category repository: the model save maintains path/level/children_count,
- * generates the url_key and category URL rewrites, and handles EE row_id —
- * a deliberate exception to the module's direct-SQL rule, bounded by the
- * low cardinality of distinct new paths per request.
+ * spawn a new tree. Missing segments below a root are created through
+ * CategoryWriter, i.e. through the category repository: the model save
+ * maintains path/level/children_count, generates the url_key and category URL
+ * rewrites, and handles EE row_id — a deliberate exception to the module's
+ * direct-SQL rule, bounded by the low cardinality of distinct new paths per
+ * request.
  *
  * Categories created inside a batch transaction vanish if that batch rolls
  * back; entries this resolver created itself are therefore re-verified on
@@ -48,15 +49,9 @@ class CategoryPathResolver
      */
     private ?array $roots = null;
 
-    /**
-     * @var string[]|null required int attributes to zero-fill on creation
-     */
-    private ?array $requiredIntAttributes = null;
-
     public function __construct(
         private readonly CategoryResource $categoryResource,
-        private readonly CategoryFactory $categoryFactory,
-        private readonly CategoryRepositoryInterface $categoryRepository,
+        private readonly CategoryWriter $categoryWriter,
         private readonly Logger $logger
     ) {
     }
@@ -65,11 +60,64 @@ class CategoryPathResolver
      * Bulk-resolve normalized paths, creating missing subtrees below
      * existing roots. One tree query per depth level, never per path.
      *
+     * A path that cannot be resolved (unknown root, root-only path) is reported
+     * per path. A path that could not be CREATED throws — see
+     * {@see createChain()} for why continuing is not safe.
+     *
      * @param array<string, string[]> $paths cache key => trimmed segments
      * @return array<string, array{id: ?int, message: ?string}> keyed like
      *         $paths; id is null when unresolved and message explains why
+     * @throws LocalizedException when a category could not be created
      */
     public function resolvePaths(array $paths): array
+    {
+        return $this->walk($paths, true);
+    }
+
+    /**
+     * Resolve paths WITHOUT creating anything: an unresolvable path simply has
+     * no entry in the result.
+     *
+     * The category sync endpoint uses this rather than {@see resolvePaths()}
+     * because implicit creation would produce nodes carrying this resolver's
+     * defaults, with no result row and no counter in the endpoint's response —
+     * a category the caller never sees and never asked for.
+     *
+     * @param array<string, string[]> $paths cache key => trimmed segments
+     * @return array<string, int> cache key => entity_id, for resolvable paths only
+     */
+    public function lookupPaths(array $paths): array
+    {
+        $resolved = [];
+        foreach ($this->walk($paths, false) as $key => $result) {
+            if ($result['id'] !== null) {
+                $resolved[$key] = $result['id'];
+            }
+        }
+
+        return $resolved;
+    }
+
+    /**
+     * Drop a cached path => ID mapping.
+     *
+     * {@see evictRolledBackCreations()} only notices categories whose row
+     * disappeared. A rename leaves the row in place under a different name, so
+     * the cached entry for the OLD path would keep resolving and a later write
+     * would land on the wrong category. Whoever renames a category is
+     * responsible for forgetting its path here.
+     */
+    public function forget(string $cacheKey): void
+    {
+        unset($this->idByPath[$cacheKey], $this->createdPaths[$cacheKey]);
+    }
+
+    /**
+     * @param array<string, string[]> $paths cache key => trimmed segments
+     * @param bool $create whether to create the missing tail of a stalled walk
+     * @return array<string, array{id: ?int, message: ?string}>
+     */
+    private function walk(array $paths, bool $create): array
     {
         $this->evictRolledBackCreations();
 
@@ -85,7 +133,10 @@ class CategoryPathResolver
             if (count($segments) === 1) {
                 $results[$key] = [
                     'id' => null,
-                    'message' => sprintf('Cannot assign products to the root category "%s".', $segments[0]),
+                    'message' => sprintf(
+                        'Path "%s" names a root category; a root cannot be used here.',
+                        $segments[0]
+                    ),
                 ];
                 continue;
             }
@@ -132,7 +183,11 @@ class CategoryPathResolver
 
                 if ($childId === null) {
                     // Tree walk stalled: the rest of the chain is missing.
-                    $results[$key] = $this->createChain($walk);
+                    // Without $create the only caller is lookupPaths(), which
+                    // reports absence by omission and never reads a message.
+                    $results[$key] = $create
+                        ? $this->createChain($walk)
+                        : ['id' => null, 'message' => null];
                     unset($walks[$key]);
                     continue;
                 }
@@ -197,12 +252,19 @@ class CategoryPathResolver
     }
 
     /**
-     * Create the missing tail of a stalled walk, parent-first. A creation
-     * failure (e.g. a url-key conflict raised by a plugin) is reported per
-     * path, never thrown — a category problem must not roll back the batch.
+     * Create the missing tail of a stalled walk, parent-first.
+     *
+     * A creation failure is re-thrown, NOT reported per path. The repository
+     * save runs its own transaction, so when it fails inside a caller's open
+     * transaction the nested rollBack marks the connection as partially rolled
+     * back: every later write, and the caller's own commit, would throw
+     * "Partial rollback is not supported" instead of the real cause. Continuing
+     * on that connection is not an option, so the failure has to reach the
+     * caller's rollback handler while it can still report the actual reason.
      *
      * @param array{segments: string[], depth: int, parentId: int} $walk
      * @return array{id: ?int, message: ?string}
+     * @throws LocalizedException
      */
     private function createChain(array $walk): array
     {
@@ -218,37 +280,21 @@ class CategoryPathResolver
                 continue;
             }
 
+            $segment = $walk['segments'][$i];
             try {
-                $category = $this->categoryFactory->create();
-                $category->setName($walk['segments'][$i]);
-                $category->setParentId($parentId);
-                $category->setIsActive(true);
-                $category->setData('include_in_menu', 1);
-                $category->setStoreId(0);
-                // Required custom yes/no attributes with no default would
-                // fail validation on save; fill them with "No".
-                foreach ($this->getRequiredIntAttributes() as $code) {
-                    if ($category->getData($code) === null) {
-                        $category->setData($code, 0);
-                    }
-                }
-                // The repository save fills path/level/children_count,
-                // generates the url_key and category URL rewrites.
-                $parentId = (int)$this->categoryRepository->save($category)->getId();
+                // CategoryWriter owns the defaults and the store-0 emulation
+                // the repository needs; see createBare().
+                $parentId = $this->categoryWriter->createBare($parentId, $segment);
             } catch (\Throwable $e) {
                 $this->logger->error(
                     sprintf('Failed to create category "%s": %s', $prefixKey, $e->getMessage()),
                     ['exception' => $e]
                 );
 
-                return [
-                    'id' => null,
-                    'message' => sprintf(
-                        'Failed to create category "%s": %s',
-                        $prefixKey,
-                        $e->getMessage()
-                    ),
-                ];
+                throw new LocalizedException(
+                    __('Failed to create category "%1": %2', $prefixKey, $e->getMessage()),
+                    $e
+                );
             }
 
             $this->idByPath[$prefixKey] = $parentId;
@@ -294,15 +340,6 @@ class CategoryPathResolver
     private function prefixKey(array $walk): string
     {
         return PathParser::buildKey(array_slice($walk['segments'], 0, $walk['depth'] + 1));
-    }
-
-    /**
-     * @return string[]
-     */
-    private function getRequiredIntAttributes(): array
-    {
-        return $this->requiredIntAttributes
-            ??= $this->categoryResource->getRequiredIntAttributesWithoutDefault();
     }
 
     /**

@@ -95,6 +95,103 @@ class Category
     }
 
     /**
+     * Like {@see getChildrenByParentIds()} but keeps EVERY id per name instead
+     * of collapsing duplicates.
+     *
+     * Resolving a path for a read (product links) can pick the lowest entity_id
+     * and move on. A write cannot: two siblings sharing a name are two distinct
+     * business objects, and silently updating whichever sorts first is worse
+     * than refusing. Callers that write use this and treat a name with more
+     * than one id as ambiguous.
+     *
+     * @param int[] $parentIds
+     * @return array<int, array<string, int[]>> parent_id => [name => entity_id[]]
+     */
+    public function getChildIdsByParentIds(array $parentIds): array
+    {
+        if (!$parentIds) {
+            return [];
+        }
+
+        $connection = $this->resourceConnection->getConnection();
+        $select = $this->joinName(
+            $connection->select()
+                ->from(
+                    ['e' => $this->resourceConnection->getTableName(self::ENTITY_TABLE)],
+                    ['entity_id', 'parent_id']
+                )
+                ->where('e.parent_id IN (?)', $parentIds)
+                ->order('e.entity_id ' . \Magento\Framework\DB\Select::SQL_ASC)
+        );
+
+        $children = [];
+        foreach ($connection->fetchAll($select) as $row) {
+            $children[(int)$row['parent_id']][(string)$row['name']][] = (int)$row['entity_id'];
+        }
+
+        return $children;
+    }
+
+    /**
+     * All descendants of the given categories, derived from the stored id-path.
+     * Used for cache invalidation: a url_path or name change cascades down the
+     * subtree, so the descendants' cached pages are stale too.
+     *
+     * @param int[] $categoryIds
+     * @return int[] descendant IDs, excluding the given categories themselves
+     */
+    public function getDescendantIds(array $categoryIds): array
+    {
+        $rows = $this->getExistingByIds($categoryIds);
+        if (!$rows) {
+            return [];
+        }
+
+        $connection = $this->resourceConnection->getConnection();
+        $conditions = [];
+        foreach ($this->topmostPaths($rows) as $path) {
+            $conditions[] = $connection->quoteInto('path LIKE ?', $path . '/%');
+        }
+
+        $select = $connection->select()
+            ->from($this->resourceConnection->getTableName(self::ENTITY_TABLE), ['entity_id'])
+            ->where(implode(' OR ', $conditions));
+
+        return array_map('intval', $connection->fetchCol($select));
+    }
+
+    /**
+     * Drop paths already covered by a shallower one in the same set.
+     *
+     * `path` carries no index, so each LIKE is a scan of the category table;
+     * syncing a subtree would otherwise contribute one redundant condition per
+     * node, and the descendants of a descendant are matched by the ancestor's
+     * pattern anyway.
+     *
+     * @param array<int, array{path: string, ...}> $rows
+     * @return string[]
+     */
+    private function topmostPaths(array $rows): array
+    {
+        $paths = array_column($rows, 'path');
+        // Shortest first, so a candidate is only ever tested against paths
+        // that could actually contain it.
+        usort($paths, static fn (string $a, string $b): int => strlen($a) <=> strlen($b));
+
+        $topmost = [];
+        foreach ($paths as $path) {
+            foreach ($topmost as $ancestor) {
+                if (str_starts_with($path, $ancestor . '/')) {
+                    continue 2;
+                }
+            }
+            $topmost[] = $path;
+        }
+
+        return $topmost;
+    }
+
+    /**
      * Existence and tree-position check, used to validate numeric payload
      * references and to re-verify categories created earlier in the request.
      *
