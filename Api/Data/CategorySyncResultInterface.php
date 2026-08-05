@@ -34,6 +34,7 @@ interface CategorySyncResultInterface
     public const REASON_PARENT_NOT_FOUND = 'parent_not_found';
     public const REASON_AMBIGUOUS_PATH = 'ambiguous_path';
     public const REASON_ROOT_NOT_WRITABLE = 'root_not_writable';
+    public const REASON_WRONG_STORE_ROOT = 'wrong_store_root';
     public const REASON_UNKNOWN_CATEGORY = 'unknown_category';
     public const REASON_RENAME_REQUIRES_CATEGORY_ID = 'rename_requires_category_id';
     public const REASON_MOVE_NOT_SUPPORTED = 'move_not_supported';

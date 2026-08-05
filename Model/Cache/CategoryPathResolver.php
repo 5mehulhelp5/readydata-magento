@@ -19,9 +19,11 @@ use ReadyData\Import\Model\ResourceModel\Category as CategoryResource;
  * Paths are matched segment-by-segment against store-0 names (exact match,
  * segments pre-decoded and trimmed by PathParser; cache keys use the
  * escaped canonical form via PathParser::buildKey, so a segment containing
- * "/" cannot collide with a deeper path). The first segment must name an
- * existing level-1 root — roots are never auto-created, so a typo cannot
- * spawn a new tree. Missing segments below a root are created through
+ * "/" cannot collide with a deeper path). The first segment must name a level-1
+ * root that already exists — this resolver never creates one, so a typo in a
+ * product feed cannot spawn a new tree. (The category sync endpoint does create
+ * roots, on explicit request; it tells this resolver through
+ * {@see forgetRoots()}.) Missing segments below a root are created through
  * CategoryWriter, i.e. through the category repository: the model save
  * maintains path/level/children_count, generates the url_key and category URL
  * rewrites, and handles EE row_id — a deliberate exception to the module's
@@ -110,6 +112,35 @@ class CategoryPathResolver
     public function forget(string $cacheKey): void
     {
         unset($this->idByPath[$cacheKey], $this->createdPaths[$cacheKey]);
+    }
+
+    /**
+     * Drop the memoized root map, and optionally everything cached below a root
+     * that was just renamed.
+     *
+     * The root map is not covered by {@see forget()}: a root's own name is never
+     * a cache key here (single-segment paths are refused outright), so a root
+     * created or renamed by the category sync endpoint would otherwise stay
+     * invisible — or keep resolving under its old name — for the rest of the
+     * request. Deeper keys have to go too: "OldRoot/Men" points at a category
+     * whose path no longer starts with that name.
+     */
+    public function forgetRoots(?string $renamedRootName = null): void
+    {
+        $this->roots = null;
+
+        if ($renamedRootName === null) {
+            return;
+        }
+
+        // The escaped canonical form, so a root whose name contains "/" cannot
+        // match a deeper path's prefix — same reasoning as prefixKey().
+        $prefix = PathParser::buildKey([$renamedRootName]) . '/';
+        foreach (array_keys($this->idByPath) as $key) {
+            if (str_starts_with($key, $prefix)) {
+                unset($this->idByPath[$key], $this->createdPaths[$key]);
+            }
+        }
     }
 
     /**
@@ -347,8 +378,9 @@ class CategoryPathResolver
      */
     private function getRoots(): array
     {
-        // Roots are never auto-created, so this cache cannot go stale
-        // through a rollback.
+        // This resolver never creates a root, so a rollback of its own work
+        // cannot make this stale. A caller that creates or renames one has to
+        // say so through forgetRoots().
         return $this->roots ??= $this->categoryResource->getRootCategories();
     }
 }

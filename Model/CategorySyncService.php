@@ -6,6 +6,7 @@ declare(strict_types=1);
 
 namespace ReadyData\Import\Model;
 
+use Magento\Catalog\Model\Category as CategoryModel;
 use Magento\Framework\App\ResourceConnection;
 use Magento\Framework\DB\Adapter\AdapterInterface;
 use Magento\Framework\Exception\LocalizedException;
@@ -34,10 +35,11 @@ use ReadyData\Import\Model\ResourceModel\Category as CategoryResource;
  * hierarchy forces: entries are processed shallowest-path-first, so a parent
  * sent in the same request is committed before the child that needs it.
  *
- * Structural scope is deliberately narrow. A missing category below an existing
- * root is created; roots are never created; reparenting an existing category is
- * reported, not applied, because a move re-paths an entire subtree and needs
- * cycle detection this endpoint does not yet have.
+ * Structural scope is deliberately narrow. A missing category is created —
+ * including a level-1 root, which is simply a child of the catalog tree root
+ * here — but reparenting an existing category is reported, not applied, because
+ * a move re-paths an entire subtree and needs cycle detection this endpoint does
+ * not yet have.
  */
 class CategorySyncService
 {
@@ -85,6 +87,11 @@ class CategorySyncService
         }
 
         $storeId = $this->storeWebsiteMap->resolveStoreId($settings?->getStoreViewCode());
+        // The tree the selected store view actually shows. Resolved once, up
+        // front: a store view whose group has no root category makes every
+        // store-scoped write unverifiable, which is a request-level problem the
+        // caller cannot fix per category.
+        $storeRootId = $storeId === 0 ? null : $this->storeWebsiteMap->getRootCategoryId($storeId);
         $continueOnError = $settings?->getContinueOnError() ?? $this->config->isContinueOnError();
 
         if (!$this->lockManager->lock(self::LOCK_NAME, self::LOCK_TIMEOUT_SEC)) {
@@ -137,7 +144,14 @@ class CategorySyncService
                     // a repository save failed inside it.
                     $connection->beginTransaction();
                     try {
-                        $result = $this->processOne($entry, $parents, $siblings, $storeId, $renamedPaths);
+                        $result = $this->processOne(
+                            $entry,
+                            $parents,
+                            $siblings,
+                            $storeId,
+                            $storeRootId,
+                            $renamedPaths
+                        );
                         $connection->commit();
                     } catch (\Throwable $e) {
                         $this->rollBackQuietly($connection);
@@ -195,12 +209,14 @@ class CategorySyncService
      * @param array{
      *     definition: ?CategoryDefinitionInterface,
      *     segments: string[],
+     *     key: string,
      *     label: string,
      *     error: ?array{reason: string, message: string}
      * } $entry
-     * @param array<string, array{id: ?int, reason: ?string, message: ?string}> $parents
-     *        entry label => resolved parent, with the reason when it did not resolve
+     * @param array<string, array{id: ?int, root_id: ?int, reason: ?string, message: ?string}> $parents
+     *        entry key => resolved parent, with the reason when it did not resolve
      * @param array<int, array<string, int[]>> $siblings parent_id => [name => entity_id[]]
+     * @param int|null $storeRootId root category of the target store view, null at default scope
      * @param array<string, true> $renamedPaths by reference; records renames for later entries
      */
     private function processOne(
@@ -208,6 +224,7 @@ class CategorySyncService
         array $parents,
         array $siblings,
         int $storeId,
+        ?int $storeRootId,
         array &$renamedPaths
     ): CategorySyncResultInterface {
         if ($entry['error'] !== null) {
@@ -227,19 +244,9 @@ class CategorySyncService
         // well be the pre-rename one, so deriving the name from it would rename
         // the category back on the next sync.
         $name = $definition->getName() !== null ? trim($definition->getName()) : null;
-        $parentId = $parents[$entry['label']]['id'] ?? null;
+        $parent = $parents[$entry['key']] ?? [];
+        $parentId = $parent['id'] ?? null;
         $messages = [];
-
-        // position lives in a column on catalog_category_entity, which has no
-        // store dimension — writing it at store scope would silently change
-        // sibling order for every store.
-        if ($storeId !== 0 && $definition->getPosition() !== null) {
-            return $this->skip(
-                $entry,
-                CategorySyncResultInterface::REASON_STORE_SCOPE_STRUCTURAL_CHANGE,
-                'Position has no store dimension; omit store_view_code to change it.'
-            );
-        }
 
         if ($categoryId !== null && $categoryId > 0) {
             $row = $this->categoryResource->getExistingByIds([$categoryId])[$categoryId] ?? null;
@@ -250,11 +257,13 @@ class CategorySyncService
                     sprintf('Category ID %d does not exist.', $categoryId)
                 );
             }
-            if ($row['level'] <= 1) {
+            // Level 1 is a root and is writable; level 0 is the catalog tree
+            // root itself, which owns no catalog and must never be touched.
+            if ($row['level'] < 1) {
                 return $this->skip(
                     $entry,
                     CategorySyncResultInterface::REASON_ROOT_NOT_WRITABLE,
-                    'Root categories are not managed by this endpoint.',
+                    'The catalog tree root is not a category and cannot be written.',
                     $categoryId
                 );
             }
@@ -271,26 +280,35 @@ class CategorySyncService
                     $categoryId
                 );
             }
+            $rowRootId = $this->rootIdOfPath($row['path']);
+            if ($storeRootId !== null && $rowRootId !== $storeRootId) {
+                return $this->wrongStoreRoot($entry, $rowRootId, $storeRootId, $categoryId);
+            }
+            $refusal = $this->refusePositionAtStoreScope($entry, $storeId, $categoryId);
+            if ($refusal !== null) {
+                return $refusal;
+            }
 
-            return $this->applyUpdate($entry, $categoryId, $name, $storeId, $messages, $renamedPaths);
-        }
-
-        if (count($segments) === 1) {
-            return $this->skip(
+            return $this->applyUpdate(
                 $entry,
-                CategorySyncResultInterface::REASON_ROOT_NOT_WRITABLE,
-                'Root categories are neither created nor modified by this endpoint.'
+                $categoryId,
+                $name,
+                $storeId,
+                $row['level'] === 1,
+                $messages,
+                $renamedPaths
             );
         }
+
         if ($parentId === null) {
             return $this->skip(
                 $entry,
-                $parents[$entry['label']]['reason'] ?? CategorySyncResultInterface::REASON_PARENT_NOT_FOUND,
-                $parents[$entry['label']]['message']
-                    ?? sprintf('The parent of "%s" could not be resolved.', $entry['label'])
+                $parent['reason'] ?? CategorySyncResultInterface::REASON_PARENT_NOT_FOUND,
+                $parent['message'] ?? sprintf('The parent of "%s" could not be resolved.', $entry['label'])
             );
         }
 
+        $isRoot = count($segments) === 1;
         $leafName = (string)end($segments);
         if ($name !== null && $name !== $leafName) {
             return $this->skip(
@@ -310,7 +328,9 @@ class CategorySyncService
                 $entry,
                 CategorySyncResultInterface::REASON_AMBIGUOUS_PATH,
                 sprintf(
-                    '%d categories named "%s" share this parent (IDs %s); send category_id to pick one.',
+                    $isRoot
+                        ? '%d root categories are named "%s" (IDs %s); send category_id to pick one.'
+                        : '%d categories named "%s" share this parent (IDs %s); send category_id to pick one.',
                     count($matches),
                     $leafName,
                     implode(', ', $matches)
@@ -318,16 +338,35 @@ class CategorySyncService
             );
         }
 
+        $matchedId = isset($matches[0]) ? (int)$matches[0] : null;
+        // Which tree this entry lives in: its own ID when it names a root,
+        // otherwise the root its path starts from. Checked before the
+        // create/update split, so a caller pointed at another store's tree is
+        // told that rather than "omit store_view_code to create it".
+        $entryRootId = $isRoot ? $matchedId : ($parent['root_id'] ?? null);
+        if ($storeRootId !== null && $entryRootId !== null && $entryRootId !== $storeRootId) {
+            return $this->wrongStoreRoot($entry, $entryRootId, $storeRootId, $matchedId);
+        }
+
         if ($matches === []) {
             if ($storeId !== 0) {
                 return $this->skip(
                     $entry,
                     CategorySyncResultInterface::REASON_STORE_SCOPE_STRUCTURAL_CHANGE,
-                    'A category can only be created at default scope; omit store_view_code to create it.'
+                    $isRoot
+                        ? 'A root category can only be created at default scope;'
+                            . ' omit store_view_code to create it.'
+                        : 'A category can only be created at default scope; omit store_view_code to create it.'
                 );
             }
 
             $entityId = $this->writer->create($parentId, $leafName, $definition, $messages);
+            if ($isRoot) {
+                // A new root changes the name => ID map the resolver memoizes
+                // for the whole request; without this a deeper path sent in the
+                // same request would not find it.
+                $this->pathResolver->forgetRoots();
+            }
 
             return $this->result(
                 $entry,
@@ -337,10 +376,77 @@ class CategorySyncService
             )->setEntityId($entityId);
         }
 
-        return $this->applyUpdate($entry, (int)$matches[0], $leafName, $storeId, $messages, $renamedPaths);
+        $refusal = $this->refusePositionAtStoreScope($entry, $storeId, $matchedId);
+        if ($refusal !== null) {
+            return $refusal;
+        }
+
+        return $this->applyUpdate(
+            $entry,
+            (int)$matchedId,
+            $leafName,
+            $storeId,
+            $isRoot,
+            $messages,
+            $renamedPaths
+        );
     }
 
     /**
+     * The level-1 root an id-path belongs to ("1/4/12" => 4), or null for the
+     * tree root itself. A root's own path ("1/4") yields the root.
+     */
+    private function rootIdOfPath(string $path): ?int
+    {
+        $ids = explode('/', $path);
+
+        return isset($ids[1]) ? (int)$ids[1] : null;
+    }
+
+    private function wrongStoreRoot(
+        array $entry,
+        ?int $entryRootId,
+        int $storeRootId,
+        ?int $entityId
+    ): CategorySyncResultInterface {
+        return $this->skip(
+            $entry,
+            CategorySyncResultInterface::REASON_WRONG_STORE_ROOT,
+            sprintf(
+                'The category belongs to root category %s, but the selected store view shows root category %d;'
+                . ' send it at default scope, or with a store view of its own root.',
+                $entryRootId !== null ? (string)$entryRootId : 'none',
+                $storeRootId
+            ),
+            $entityId
+        );
+    }
+
+    /**
+     * position lives in a column on catalog_category_entity, which has no store
+     * dimension — writing it at store scope would silently change sibling order
+     * for every store. Checked once the category has been identified, so the
+     * refusal can carry its entity_id like every other post-identity refusal.
+     */
+    private function refusePositionAtStoreScope(
+        array $entry,
+        int $storeId,
+        ?int $entityId
+    ): ?CategorySyncResultInterface {
+        if ($storeId === 0 || $entry['definition']->getPosition() === null) {
+            return null;
+        }
+
+        return $this->skip(
+            $entry,
+            CategorySyncResultInterface::REASON_STORE_SCOPE_STRUCTURAL_CHANGE,
+            'Position has no store dimension; omit store_view_code to change it.',
+            $entityId
+        );
+    }
+
+    /**
+     * @param bool $isRoot whether the target is a level-1 root
      * @param string[] $messages
      * @param array<string, true> $renamedPaths
      */
@@ -349,6 +455,7 @@ class CategorySyncService
         int $entityId,
         ?string $name,
         int $storeId,
+        bool $isRoot,
         array $messages,
         array &$renamedPaths
     ): CategorySyncResultInterface {
@@ -358,14 +465,28 @@ class CategorySyncService
         // matches store-0 names throughout this module, so a store-scoped
         // rename leaves every path resolving exactly where it did; treating it
         // as a rename would skip the whole subtree for nothing.
-        if ($changed && $storeId === 0 && $name !== null && $entry['segments'] !== []) {
-            $pathKey = PathParser::buildKey($entry['segments']);
-            if ($name !== (string)end($entry['segments'])) {
+        if ($changed && $storeId === 0) {
+            $renamedFrom = $name !== null && $entry['segments'] !== [] && $name !== (string)end($entry['segments'])
+                ? (string)end($entry['segments'])
+                : null;
+
+            if ($renamedFrom !== null) {
                 // The cached path now points at a differently named category,
                 // and any later entry addressing a descendant by the old path
                 // would resolve to the wrong node.
+                $pathKey = PathParser::buildKey($entry['segments']);
                 $this->pathResolver->forget($pathKey);
                 $renamedPaths[$pathKey] = true;
+            }
+            if ($isRoot) {
+                // forget() above cannot reach a root: single-segment paths are
+                // refused by the resolver, so a root only ever lives in its
+                // separately memoized name => ID map. The old name is passed
+                // when we know it, which also drops the paths cached below it;
+                // an entry addressed by category_id has no path in the payload
+                // and needs none, since those run in the last bucket, after
+                // every path has already been resolved.
+                $this->pathResolver->forgetRoots($renamedFrom);
             }
         }
 
@@ -378,48 +499,89 @@ class CategorySyncService
     }
 
     /**
-     * Resolve each entry's parent in bulk: one root lookup plus one
-     * level-by-level walk for the whole bucket, never a query per entry.
+     * Resolve each entry's parent, and the root of the tree it lives in, in
+     * bulk: one root lookup plus one level-by-level walk for the whole bucket,
+     * never a query per entry.
      *
-     * @param array<int, array{segments: string[], label: string, ...}> $bucket
-     * @return array<string, array{id: ?int, reason: ?string, message: ?string}> entry label => parent
+     * @param array<int, array{segments: string[], key: string, ...}> $bucket
+     * @return array<string, array{id: ?int, root_id: ?int, reason: ?string, message: ?string}>
+     *         entry key => parent, with the reason when it did not resolve
      */
     private function resolveParents(array $bucket): array
     {
         $parents = [];
         $deepPaths = [];
-        $deepKeyByLabel = [];
+        $deepByEntryKey = [];
+        // Deliberately per call, and this call is per bucket: a root created in
+        // a shallower bucket is already committed and MUST be visible here.
+        // Hoisting this to a property would break same-request root creation.
         $roots = null;
 
         foreach ($bucket as $entry) {
-            $parentSegments = array_slice($entry['segments'], 0, -1);
-            if ($parentSegments === []) {
-                // Either a root-only path or an entry addressed purely by
-                // category_id; neither needs a parent.
-                $parents[$entry['label']] = ['id' => null, 'reason' => null, 'message' => null];
+            $segments = $entry['segments'];
+            if ($segments === []) {
+                // Addressed purely by category_id: there is no path to resolve a
+                // parent from, and the stored row is what gets cross-checked.
+                $parents[$entry['key']] = self::noParent();
                 continue;
             }
-            if (count($parentSegments) === 1) {
-                // The resolver refuses single-segment paths, so level-1 roots
-                // are resolved directly here.
-                $roots ??= $this->categoryResource->getRootCategories();
-                $rootId = $roots[$parentSegments[0]] ?? null;
-                $parents[$entry['label']] = $rootId !== null
-                    ? ['id' => $rootId, 'reason' => null, 'message' => null]
-                    : [
-                        'id' => null,
-                        'reason' => CategorySyncResultInterface::REASON_UNKNOWN_ROOT,
-                        'message' => sprintf(
-                            'Unknown root category "%s" — root categories are not created by this endpoint.',
-                            $parentSegments[0]
-                        ),
-                    ];
+            if (count($segments) === 1) {
+                // A root: its parent is the catalog tree root, which always
+                // exists. root_id stays null — the entry IS the root, and which
+                // one it is only becomes known once the name has been matched.
+                $parents[$entry['key']] = [
+                    'id' => CategoryModel::TREE_ROOT_ID,
+                    'root_id' => null,
+                    'reason' => null,
+                    'message' => null,
+                ];
                 continue;
             }
 
-            $key = PathParser::buildKey($parentSegments);
-            $deepPaths[$key] = $parentSegments;
-            $deepKeyByLabel[$entry['label']] = $key;
+            // The resolver collapses duplicate root names to the lowest ID,
+            // which is fine for a read but not for a write, so the first
+            // segment is resolved here with every candidate ID in hand.
+            $roots ??= $this->categoryResource->getRootCategoryIds();
+            $rootIds = $roots[$segments[0]] ?? [];
+            if (count($rootIds) > 1) {
+                $parents[$entry['key']] = self::noParent(
+                    CategorySyncResultInterface::REASON_AMBIGUOUS_PATH,
+                    sprintf(
+                        '%d root categories are named "%s" (IDs %s); send category_id to address a category'
+                        . ' under one of them.',
+                        count($rootIds),
+                        $segments[0],
+                        implode(', ', $rootIds)
+                    )
+                );
+                continue;
+            }
+            if ($rootIds === []) {
+                $parents[$entry['key']] = self::noParent(
+                    CategorySyncResultInterface::REASON_UNKNOWN_ROOT,
+                    sprintf(
+                        'Unknown root category "%s" — send it as a single-segment path to create it.',
+                        $segments[0]
+                    )
+                );
+                continue;
+            }
+
+            $rootId = $rootIds[0];
+            if (count($segments) === 2) {
+                $parents[$entry['key']] = [
+                    'id' => $rootId,
+                    'root_id' => $rootId,
+                    'reason' => null,
+                    'message' => null,
+                ];
+                continue;
+            }
+
+            $parentSegments = array_slice($segments, 0, -1);
+            $pathKey = PathParser::buildKey($parentSegments);
+            $deepPaths[$pathKey] = $parentSegments;
+            $deepByEntryKey[$entry['key']] = ['path_key' => $pathKey, 'root_id' => $rootId];
         }
 
         if ($deepPaths) {
@@ -428,18 +590,33 @@ class CategorySyncService
             // caller's to send, and creating it silently would produce a
             // category with none of the properties they specified anywhere.
             $resolved = $this->pathResolver->lookupPaths($deepPaths);
-            foreach ($deepKeyByLabel as $label => $key) {
-                $parents[$label] = isset($resolved[$key])
-                    ? ['id' => $resolved[$key], 'reason' => null, 'message' => null]
-                    : [
-                        'id' => null,
-                        'reason' => CategorySyncResultInterface::REASON_PARENT_NOT_FOUND,
-                        'message' => sprintf('Parent category "%s" does not exist; send it too.', $key),
-                    ];
+            foreach ($deepByEntryKey as $entryKey => $deep) {
+                $parentId = $resolved[$deep['path_key']] ?? null;
+                $parents[$entryKey] = [
+                    'id' => $parentId,
+                    'root_id' => $deep['root_id'],
+                    'reason' => $parentId !== null
+                        ? null
+                        : CategorySyncResultInterface::REASON_PARENT_NOT_FOUND,
+                    'message' => $parentId !== null
+                        ? null
+                        : sprintf('Parent category "%s" does not exist; send it too.', $deep['path_key']),
+                ];
             }
         }
 
         return $parents;
+    }
+
+    /**
+     * No parent, either because the entry needs none or because it could not be
+     * resolved — in which case the reason is what the entry is skipped with.
+     *
+     * @return array{id: null, root_id: null, reason: ?string, message: ?string}
+     */
+    private static function noParent(?string $reason = null, ?string $message = null): array
+    {
+        return ['id' => null, 'root_id' => null, 'reason' => $reason, 'message' => $message];
     }
 
     /**
@@ -451,6 +628,7 @@ class CategorySyncService
      * @return array<int, array{
      *     definition: ?CategoryDefinitionInterface,
      *     segments: string[],
+     *     key: string,
      *     label: string,
      *     error: ?array{reason: string, message: string}
      * }>
@@ -468,6 +646,7 @@ class CategorySyncService
                 $entries['invalid:' . $position] = [
                     'definition' => null,
                     'segments' => [],
+                    'key' => 'invalid:' . $position,
                     'label' => sprintf('#%d', $position),
                     'error' => [
                         'reason' => CategorySyncResultInterface::REASON_INVALID_DEFINITION,
@@ -505,6 +684,11 @@ class CategorySyncService
             $entries[$key] = [
                 'definition' => $definition,
                 'segments' => $segments,
+                // Carried onto the entry because resolveParents() keys by it:
+                // the label is not unique — a category literally named "#42"
+                // shares its label with the entry addressing ID 42 — and two
+                // entries sharing a parents key would inherit each other's.
+                'key' => $key,
                 'label' => $this->labelFor($definition, $segments, $position),
                 'error' => $error,
             ];

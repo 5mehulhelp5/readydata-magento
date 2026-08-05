@@ -536,6 +536,10 @@ Authorization: Bearer <integration token>   (ACL: ReadyData_Import::categories)
 {
   "categories": [
     {
+      "path": "Outdoor Catalog",
+      "is_active": 1
+    },
+    {
       "path": "Default Category/Men",
       "is_active": 1,
       "include_in_menu": 1
@@ -576,7 +580,7 @@ retire a category.
 `path` is the full path from a level-1 root name and uses the same grammar as
 the product payload's `categories` field — `/` separates segments only when
 unescaped, so `Default Category/Wo\/Men` is two segments, the second being
-`Wo/Men`.
+`Wo/Men`. A single-segment path addresses the root itself.
 
 A path alone cannot express a rename: the new name no longer matches the stored
 path. So sending a `name` that differs from the last path segment is
@@ -606,9 +610,25 @@ since they may target something created earlier in the same run.
 
 Missing parents are **not** created implicitly: a category the caller never
 asked for would get none of the properties they specified and would not appear
-in the response at all. An unresolvable parent is `parent_not_found` (or
-`unknown_root` when the first segment names no existing root). Root categories
-are neither created nor modified — a typo cannot spawn a new tree.
+in the response at all. An unresolvable parent is `parent_not_found`, or
+`unknown_root` when the first segment names no existing root — send that root as
+a single-segment path in the same payload and it will be created first.
+
+**Roots are first-class.** A single-segment path (`Outdoor Catalog`) creates a
+level-1 root under the catalog tree root when it does not exist and updates it
+when it does; a `category_id` naming a level-1 category is writable the same way,
+rename included. The catalog tree root itself (entity `1`) is not a category and
+is refused with `root_not_writable`. A root is *not* attached to a store: this
+endpoint never writes `store_group.root_category_id`, so a new root has no
+storefront presence until someone points a store group at it in the admin — at
+which point Magento regenerates that store's rewrites itself.
+
+Magento enforces no uniqueness on root names, so two roots can share one. As with
+sibling categories, a *write* to such a name refuses with `ambiguous_path` and the
+candidate IDs — both as the target and as the first segment of a deeper path —
+because the two roots are two different catalogs. Send `category_id` to pick one.
+Reads elsewhere in the module (product-import path resolution) still take the
+lowest `entity_id`.
 
 If an entry renames a category at default scope, any later entry in the same
 request whose path runs through the old name is `skipped` with
@@ -664,6 +684,11 @@ descendant subtree. It also sets `save_rewrites_history` from
 `catalog/seo/save_rewrites_history`, so old category URLs 301 instead of 404 —
 the same guarantee the product import gives.
 
+Roots are the exception: a root's `url_key` is part of no storefront URL, so core
+generates no rewrites for one and a root rename cascades nothing. The endpoint
+still derives the slug, so the root carries a matching one for the day a store
+group points at it.
+
 ### Store scope
 
 `settings.store_view_code` selects the scope, as on the product endpoint. At
@@ -673,6 +698,16 @@ the payload. Anything without a store dimension is refused with
 back: creating a category (`path`/`level`/`parent_id` are columns, not scoped
 attributes) and setting `position`, which is likewise one column shared by every
 store. Omit `store_view_code` (or use `admin`) for the default scope.
+
+A store-scoped write must also target a category the named store view actually
+shows, that is, one under its store group's `root_category_id`. Anything else is
+`wrong_store_root`: the write would succeed and be invisible on the storefront the
+caller named. Precedence, when more than one refusal applies: a category that was
+identified reports `wrong_store_root` (with its `entity_id`) ahead of
+`store_scope_structural_change`, and an `ambiguous_path` outranks both — which
+category is wrong-rooted cannot be said before knowing which one was meant. A
+missing category under a *foreign* root is `wrong_store_root` rather than "omit
+`store_view_code` to create it", which would be wrong advice.
 
 Note the `all/` in the URL. Magento resolves `/rest/V1/...` against the default
 store view, not the admin scope, so the store the values land in comes from the
@@ -695,12 +730,12 @@ categories **and their descendants**, since a `url_path` change cascades down.
 
 ### Limits (v1)
 
-Moving or reparenting a category, deleting one, creating level-1 roots, category
-images, and assigning products from the category side (that is owned by the
-product payload's `categories` field) are out of scope. A payload implying a
-move is reported, never applied: a move re-paths an entire subtree through
-non-transactional relative updates and needs cycle detection this endpoint does
-not yet have.
+Moving or reparenting a category, deleting one, attaching a root to a store group
+(`store_group.root_category_id`), category images, and assigning products from the
+category side (that is owned by the product payload's `categories` field) are out
+of scope. A payload implying a move is reported, never applied: a move re-paths an
+entire subtree through non-transactional relative updates and needs cycle
+detection this endpoint does not yet have.
 
 ## What it does today
 

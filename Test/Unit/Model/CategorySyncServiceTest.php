@@ -6,6 +6,7 @@ declare(strict_types=1);
 
 namespace ReadyData\Import\Test\Unit\Model;
 
+use Magento\Catalog\Model\Category as CategoryModel;
 use Magento\Framework\App\ResourceConnection;
 use Magento\Framework\DB\Adapter\AdapterInterface;
 use Magento\Framework\Exception\LocalizedException;
@@ -33,8 +34,10 @@ use ReadyData\Import\Model\ResourceModel\Category as CategoryResource;
 class CategorySyncServiceTest extends TestCase
 {
     private const ROOT_ID = 2;
+    private const OUTDOOR_ID = 7;
     private const MEN_ID = 10;
     private const SHIRTS_ID = 11;
+    private const TENTS_ID = 12;
 
     private Config&MockObject $config;
     private LockManagerInterface&MockObject $lockManager;
@@ -53,6 +56,19 @@ class CategorySyncServiceTest extends TestCase
      */
     private int $storeId = 0;
 
+    /**
+     * Root category of the store view above, likewise read lazily.
+     */
+    private int $storeRootId = self::ROOT_ID;
+
+    /**
+     * Level-1 roots as the resource model would report them. Mutable so a test
+     * can add an ambiguous name, a second tree, or a root created mid-request.
+     *
+     * @var array<string, int[]>
+     */
+    private array $rootIds = ['Default Category' => [self::ROOT_ID]];
+
     protected function setUp(): void
     {
         $this->config = $this->configMock();
@@ -66,13 +82,20 @@ class CategorySyncServiceTest extends TestCase
 
         $this->pathResolver = $this->createMock(CategoryPathResolver::class);
         $this->categoryResource = $this->createMock(CategoryResource::class);
-        $this->categoryResource->method('getRootCategories')->willReturn(['Default Category' => self::ROOT_ID]);
+        $this->categoryResource->method('getRootCategoryIds')
+            ->willReturnCallback(fn (): array => $this->rootIds);
+        $this->categoryResource->method('getRootCategories')
+            ->willReturnCallback(fn (): array => array_map(
+                static fn (array $ids): int => $ids[0],
+                $this->rootIds
+            ));
 
         $this->writer = $this->createMock(CategoryWriter::class);
         $this->invalidationHandler = $this->createMock(CategoryInvalidationHandler::class);
 
         $storeWebsiteMap = $this->createMock(StoreWebsiteMap::class);
         $storeWebsiteMap->method('resolveStoreId')->willReturnCallback(fn (): int => $this->storeId);
+        $storeWebsiteMap->method('getRootCategoryId')->willReturnCallback(fn (): int => $this->storeRootId);
 
         $this->resourceConnection = $resourceConnection;
         $this->storeWebsiteMap = $storeWebsiteMap;
@@ -229,15 +252,275 @@ class CategorySyncServiceTest extends TestCase
         );
     }
 
-    public function testRootOnlyPathIsNeverWritten(): void
+    public function testSingleSegmentPathCreatesARootUnderTheTreeRoot(): void
     {
+        $this->categoryResource->method('getChildIdsByParentIds')->willReturn([]);
+        // Explicitly the tree root: CategoryRepository::save() falls back to the
+        // CURRENT STORE's root for a falsy parent, which would silently create
+        // the "root" one level too deep.
+        $this->writer->expects(self::once())->method('create')
+            ->with(CategoryModel::TREE_ROOT_ID, 'Outdoor Catalog')
+            ->willReturn(self::OUTDOOR_ID);
+        // The resolver memoizes the root name => ID map for the request.
+        $this->pathResolver->expects(self::once())->method('forgetRoots');
+
+        $response = $this->service->sync([$this->definition('Outdoor Catalog')]);
+
+        self::assertSame(1, $response->getCreated());
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::STATUS_CREATED, $result->getStatus());
+        self::assertSame(self::OUTDOOR_ID, $result->getEntityId());
+    }
+
+    public function testExistingRootIsUpdatedThroughItsSingleSegmentPath(): void
+    {
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([CategoryModel::TREE_ROOT_ID => ['Default Category' => [self::ROOT_ID]]]);
+        $this->writer->expects(self::once())->method('update')
+            ->with(self::ROOT_ID, 'Default Category', self::anything(), 0)
+            ->willReturn(true);
         $this->writer->expects(self::never())->method('create');
+
+        $response = $this->service->sync([$this->definition('Default Category')->setIsActive(1)]);
+
+        self::assertSame(1, $response->getUpdated());
+        self::assertSame(self::ROOT_ID, $response->getResults()[0]->getEntityId());
+    }
+
+    public function testRootAddressedByCategoryIdCanBeRenamed(): void
+    {
+        $this->categoryResource->method('getExistingByIds')->willReturn([
+            self::ROOT_ID => [
+                'entity_id' => self::ROOT_ID,
+                'parent_id' => CategoryModel::TREE_ROOT_ID,
+                'level' => 1,
+                'path' => '1/2',
+            ],
+        ]);
+        $this->writer->expects(self::once())->method('update')
+            ->with(self::ROOT_ID, 'Main Catalog', self::anything(), 0)
+            ->willReturn(true);
+        // A root lives only in the resolver's root map — no path cache entry
+        // covers it — so forget() cannot reach it.
+        $this->pathResolver->expects(self::once())->method('forgetRoots')->with('Default Category');
+
+        $definition = $this->definition('Default Category')
+            ->setCategoryId(self::ROOT_ID)
+            ->setName('Main Catalog');
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(1, $response->getUpdated());
+    }
+
+    public function testCatalogTreeRootIsNotWritable(): void
+    {
+        $this->categoryResource->method('getExistingByIds')->willReturn([
+            CategoryModel::TREE_ROOT_ID => [
+                'entity_id' => CategoryModel::TREE_ROOT_ID,
+                'parent_id' => 0,
+                'level' => 0,
+                'path' => '1',
+            ],
+        ]);
         $this->writer->expects(self::never())->method('update');
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(CategoryModel::TREE_ROOT_ID)
+            ->setName('Root Catalog');
+        $response = $this->service->sync([$definition]);
+
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::REASON_ROOT_NOT_WRITABLE, $result->getReason());
+        self::assertSame(CategoryModel::TREE_ROOT_ID, $result->getEntityId());
+    }
+
+    public function testTwoRootsSharingANameAreRefusedRatherThanGuessed(): void
+    {
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([CategoryModel::TREE_ROOT_ID => ['Default Category' => [self::ROOT_ID, 8]]]);
+        $this->writer->expects(self::never())->method('update');
+        $this->writer->expects(self::never())->method('create');
 
         $response = $this->service->sync([$this->definition('Default Category')]);
 
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::REASON_AMBIGUOUS_PATH, $result->getReason());
+        self::assertStringContainsString('2, 8', $result->getMessages()[0]);
+    }
+
+    public function testAmbiguousRootNameIsRefusedForADeeperPathToo(): void
+    {
+        // Reads elsewhere in the module take the lowest ID; a write cannot,
+        // because the two roots are two different catalogs.
+        $this->rootIds = ['Default Category' => [self::ROOT_ID, 8]];
+        $this->writer->expects(self::never())->method('create');
+        $this->writer->expects(self::never())->method('update');
+
+        $response = $this->service->sync([$this->definition('Default Category/Men')]);
+
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::REASON_AMBIGUOUS_PATH, $result->getReason());
+        self::assertStringContainsString('2, 8', $result->getMessages()[0]);
+    }
+
+    public function testRootCreatedInTheSameRequestIsVisibleToItsChildren(): void
+    {
+        $this->categoryResource->method('getChildIdsByParentIds')->willReturn([]);
+        $created = [];
+        $this->writer->method('create')
+            ->willReturnCallback(function (int $parentId, string $name) use (&$created): int {
+                $created[] = [$parentId, $name];
+                if ($name === 'Outdoor Catalog') {
+                    // Committed by the time the deeper bucket resolves parents,
+                    // which is why the roots map must be re-read per bucket.
+                    $this->rootIds['Outdoor Catalog'] = [self::OUTDOOR_ID];
+                    return self::OUTDOOR_ID;
+                }
+                return self::MEN_ID;
+            });
+
+        $response = $this->service->sync([
+            $this->definition('Outdoor Catalog/Tents'),
+            $this->definition('Outdoor Catalog'),
+        ]);
+
         self::assertSame(
-            CategorySyncResultInterface::REASON_ROOT_NOT_WRITABLE,
+            [[CategoryModel::TREE_ROOT_ID, 'Outdoor Catalog'], [self::OUTDOOR_ID, 'Tents']],
+            $created
+        );
+        self::assertSame(2, $response->getCreated());
+    }
+
+    public function testRootRenameMarksDescendantsInTheSameRequestAsStale(): void
+    {
+        $this->categoryResource->method('getExistingByIds')->willReturn([
+            self::ROOT_ID => [
+                'entity_id' => self::ROOT_ID,
+                'parent_id' => CategoryModel::TREE_ROOT_ID,
+                'level' => 1,
+                'path' => '1/2',
+            ],
+        ]);
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([CategoryModel::TREE_ROOT_ID => ['Default Category' => [self::ROOT_ID]]]);
+        $this->writer->method('update')->willReturn(true);
+
+        $response = $this->service->sync([
+            $this->definition('Default Category')->setCategoryId(self::ROOT_ID)->setName('Main Catalog'),
+            $this->definition('Default Category/Men'),
+        ]);
+
+        $byPath = [];
+        foreach ($response->getResults() as $result) {
+            $byPath[$result->getPath()] = $result;
+        }
+        self::assertSame(CategorySyncResultInterface::STATUS_UPDATED, $byPath['Default Category']->getStatus());
+        self::assertSame(
+            CategorySyncResultInterface::REASON_STALE_PARENT_PATH,
+            $byPath['Default Category/Men']->getReason()
+        );
+    }
+
+    public function testRootCannotBeCreatedAtStoreScope(): void
+    {
+        $this->storeId = 1;
+        $this->categoryResource->method('getChildIdsByParentIds')->willReturn([]);
+        $this->writer->expects(self::never())->method('create');
+
+        $response = $this->service->sync([$this->definition('Outdoor Catalog')]);
+
+        self::assertSame(
+            CategorySyncResultInterface::REASON_STORE_SCOPE_STRUCTURAL_CHANGE,
+            $response->getResults()[0]->getReason()
+        );
+    }
+
+    public function testStoreScopedWriteToAnotherStoresTreeIsRefused(): void
+    {
+        $this->storeId = 1;
+        $this->storeRootId = self::ROOT_ID;
+        $this->rootIds['Outdoor Catalog'] = [self::OUTDOOR_ID];
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([self::OUTDOOR_ID => ['Tents' => [self::TENTS_ID]]]);
+        // The write would succeed and be invisible on the storefront the caller
+        // named, which is worse than refusing.
+        $this->writer->expects(self::never())->method('update');
+
+        $response = $this->service->sync([$this->definition('Outdoor Catalog/Tents')->setIsActive(0)]);
+
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::REASON_WRONG_STORE_ROOT, $result->getReason());
+        self::assertSame(self::TENTS_ID, $result->getEntityId());
+    }
+
+    public function testStoreScopedWriteByCategoryIdOutsideTheStoreRootIsRefused(): void
+    {
+        $this->storeId = 1;
+        $this->storeRootId = self::ROOT_ID;
+        $this->categoryResource->method('getExistingByIds')->willReturn([
+            self::TENTS_ID => [
+                'entity_id' => self::TENTS_ID,
+                'parent_id' => self::OUTDOOR_ID,
+                'level' => 2,
+                'path' => '1/7/12',
+            ],
+        ]);
+        $this->writer->expects(self::never())->method('update');
+
+        $definition = (new CategoryDefinition())->setCategoryId(self::TENTS_ID)->setName('Tents');
+        $response = $this->service->sync([$definition]);
+
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::REASON_WRONG_STORE_ROOT, $result->getReason());
+        self::assertSame(self::TENTS_ID, $result->getEntityId());
+    }
+
+    public function testStoreScopedWriteUnderTheStoreRootIsAllowed(): void
+    {
+        $this->storeId = 1;
+        $this->storeRootId = self::ROOT_ID;
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([self::ROOT_ID => ['Men' => [self::MEN_ID]]]);
+        $this->writer->expects(self::once())->method('update')
+            ->with(self::MEN_ID, 'Men', self::anything(), 1)
+            ->willReturn(true);
+
+        $response = $this->service->sync([$this->definition('Default Category/Men')->setIsActive(0)]);
+
+        self::assertSame(1, $response->getUpdated());
+        self::assertNull($response->getResults()[0]->getReason());
+    }
+
+    public function testAmbiguityIsReportedBeforeTheStoreRootMismatch(): void
+    {
+        // Which category is wrong-rooted cannot be said before knowing which
+        // category was meant.
+        $this->storeId = 1;
+        $this->storeRootId = self::ROOT_ID;
+        $this->rootIds['Outdoor Catalog'] = [self::OUTDOOR_ID, 9];
+
+        $response = $this->service->sync([$this->definition('Outdoor Catalog/Tents')]);
+
+        self::assertSame(
+            CategorySyncResultInterface::REASON_AMBIGUOUS_PATH,
+            $response->getResults()[0]->getReason()
+        );
+    }
+
+    public function testMissingCategoryInAnotherStoresTreeReportsTheRootMismatch(): void
+    {
+        // Not store_scope_structural_change: "omit store_view_code to create it"
+        // would be wrong advice for a caller pointed at the wrong tree entirely.
+        $this->storeId = 1;
+        $this->storeRootId = self::ROOT_ID;
+        $this->rootIds['Outdoor Catalog'] = [self::OUTDOOR_ID];
+        $this->categoryResource->method('getChildIdsByParentIds')->willReturn([]);
+        $this->writer->expects(self::never())->method('create');
+
+        $response = $this->service->sync([$this->definition('Outdoor Catalog/Tents')]);
+
+        self::assertSame(
+            CategorySyncResultInterface::REASON_WRONG_STORE_ROOT,
             $response->getResults()[0]->getReason()
         );
     }
@@ -553,10 +836,11 @@ class CategorySyncServiceTest extends TestCase
         $definition = $this->definition('Default Category/Men')->setPosition(10);
         $response = $this->service->sync([$definition]);
 
-        self::assertSame(
-            CategorySyncResultInterface::REASON_STORE_SCOPE_STRUCTURAL_CHANGE,
-            $response->getResults()[0]->getReason()
-        );
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::REASON_STORE_SCOPE_STRUCTURAL_CHANGE, $result->getReason());
+        // Refused after the category was identified, so the caller still learns
+        // which one it was.
+        self::assertSame(self::MEN_ID, $result->getEntityId());
     }
 
     public function testStoreScopedRenameDoesNotMarkDescendantsStale(): void

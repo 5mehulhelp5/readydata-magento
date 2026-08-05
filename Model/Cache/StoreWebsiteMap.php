@@ -19,6 +19,7 @@ class StoreWebsiteMap
     private ?array $websiteIdByCode = null;
     private ?array $storeIdsByWebsiteId = null;
     private ?array $websiteStoreIds = null;
+    private ?array $rootCategoryIdByStoreId = null;
     private ?int $defaultWebsiteId = null;
 
     public function __construct(
@@ -134,6 +135,41 @@ class StoreWebsiteMap
         }
 
         return $this->websiteStoreIds[$storeId] ?? [$storeId];
+    }
+
+    /**
+     * Root category of the store view's store group — the top of the category
+     * tree that store actually shows.
+     *
+     * @throws LocalizedException when the store view has no root category, which
+     *         a caller cannot fix per category: every store-scoped write would
+     *         be unverifiable, so the request fails instead.
+     */
+    public function getRootCategoryId(int $storeId): int
+    {
+        if ($this->rootCategoryIdByStoreId === null) {
+            $connection = $this->resourceConnection->getConnection();
+            $select = $connection->select()
+                ->from(['s' => $this->resourceConnection->getTableName('store')], ['store_id'])
+                ->join(
+                    ['g' => $this->resourceConnection->getTableName('store_group')],
+                    'g.group_id = s.group_id',
+                    ['root_category_id']
+                )
+                ->where('s.store_id > 0');
+            $this->rootCategoryIdByStoreId = array_map('intval', $connection->fetchPairs($select));
+        }
+
+        // root_category_id is NOT NULL DEFAULT 0, so 0 is the "not configured"
+        // sentinel and indistinguishable from an unknown store here.
+        $rootCategoryId = $this->rootCategoryIdByStoreId[$storeId] ?? 0;
+        if ($rootCategoryId <= 0) {
+            throw new LocalizedException(
+                __('Store view ID %1 has no root category configured.', $storeId)
+            );
+        }
+
+        return $rootCategoryId;
     }
 
     /**

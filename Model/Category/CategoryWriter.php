@@ -148,6 +148,10 @@ class CategoryWriter
             // A rename with no explicit url_key would keep the old slug
             // forever: Magento only derives a url_key when the stored one is
             // empty. Deriving it here is what makes the rewrite cascade fire.
+            // (Not for a level-1 root, where core skips rewrite generation
+            // entirely — a root's url_key is part of no storefront URL. The
+            // derivation is still right there: the root keeps a slug that
+            // matches its name for the day a store group points at it.)
             if (isset($desired['name'])
                 && !isset($desired['url_key'])
                 && (string)$loaded->getName() !== (string)$desired['name']

@@ -384,6 +384,29 @@ class CategoryWriterTest extends TestCase
         self::assertSame(0, $data['custom_required_flag']);
     }
 
+    public function testCreatingARootSetsTheTreeRootAsTheExplicitParent(): void
+    {
+        // CategoryRepository::save() falls back to the CURRENT STORE's root
+        // category for a falsy parent_id, so a root has to be created with the
+        // tree root passed explicitly or it lands one level too deep, inside
+        // whichever catalog the emulated store happens to use.
+        $created = $this->categoryMock();
+        $this->categoryFactory->method('create')->willReturn($created);
+        $this->categoryRepository->method('save')->willReturnCallback(
+            static function (CategoryModel $category) {
+                $category->setId(self::CATEGORY_ID);
+                return $category;
+            }
+        );
+
+        $messages = [];
+        $this->writer->create(CategoryModel::TREE_ROOT_ID, 'Outdoor Catalog', new CategoryDefinition(), $messages);
+
+        $data = $created->toArray();
+        self::assertSame(CategoryModel::TREE_ROOT_ID, $data['parent_id']);
+        self::assertSame('outdoor-catalog', $data['url_key']);
+    }
+
     public function testCreateBareProducesTheSameCategoryAsAnEmptyDefinition(): void
     {
         // CategoryPathResolver auto-creates through createBare(), and a

@@ -43,6 +43,22 @@ class Category
      */
     public function getRootCategories(): array
     {
+        return array_map(
+            static fn (array $ids): int => $ids[0],
+            $this->getRootCategoryIds()
+        );
+    }
+
+    /**
+     * Like {@see getRootCategories()} but keeps EVERY id per name, for the same
+     * reason {@see getChildIdsByParentIds()} does: a read can take the lowest
+     * entity_id, a write cannot — two roots sharing a name are two distinct
+     * catalogs, and core enforces no uniqueness on root names.
+     *
+     * @return array<string, int[]> store-0 name => entity_id[], ascending
+     */
+    public function getRootCategoryIds(): array
+    {
         $connection = $this->resourceConnection->getConnection();
         $select = $this->joinName(
             $connection->select()
@@ -50,13 +66,17 @@ class Category
                     ['e' => $this->resourceConnection->getTableName(self::ENTITY_TABLE)],
                     ['entity_id']
                 )
+                // Both predicates describe the same set. level carries an index
+                // and parent_id does not, so the level condition is what keeps
+                // this off a table scan; parent_id makes the intent exact.
                 ->where('e.level = ?', 1)
+                ->where('e.parent_id = ?', CategoryModel::TREE_ROOT_ID)
                 ->order('e.entity_id ' . \Magento\Framework\DB\Select::SQL_ASC)
         );
 
         $roots = [];
         foreach ($connection->fetchAll($select) as $row) {
-            $roots[(string)$row['name']] ??= (int)$row['entity_id'];
+            $roots[(string)$row['name']][] = (int)$row['entity_id'];
         }
 
         return $roots;
@@ -439,10 +459,11 @@ class Category
         $result = [];
         foreach ($rows as $id => $row) {
             $ids = array_map('intval', explode('/', $row['path']));
-            // Drop the tree root (1) and the category itself.
+            // Drop the tree root and the category itself.
             $ancestors = array_values(array_filter(
                 $ids,
-                static fn (int $ancestorId): bool => $ancestorId !== 1 && $ancestorId !== $id
+                static fn (int $ancestorId): bool => $ancestorId !== CategoryModel::TREE_ROOT_ID
+                    && $ancestorId !== $id
             ));
             $result[$id] = ['level' => $row['level'], 'ancestors' => $ancestors];
         }

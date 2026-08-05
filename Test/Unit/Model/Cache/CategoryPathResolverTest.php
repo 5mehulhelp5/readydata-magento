@@ -148,6 +148,60 @@ class CategoryPathResolverTest extends TestCase
         self::assertSame(2, $calls);
     }
 
+    public function testForgetRootsRereadsTheRootMap(): void
+    {
+        // A root a caller created mid-request would otherwise stay invisible:
+        // this map is memoized for the life of the shared instance, and no path
+        // cache entry covers a root for forget() to drop.
+        $rootCalls = 0;
+        $categoryResource = $this->createMock(CategoryResource::class);
+        $categoryResource->method('getRootCategories')
+            ->willReturnCallback(function () use (&$rootCalls): array {
+                $rootCalls++;
+                return ['Default Category' => self::ROOT_ID];
+            });
+        $categoryResource->method('getChildrenByParentIds')
+            ->willReturn([self::ROOT_ID => ['Men' => self::MEN_ID]]);
+        $resolver = new CategoryPathResolver(
+            $categoryResource,
+            $this->categoryWriter,
+            $this->createMock(Logger::class)
+        );
+
+        $paths = ['Default Category/Men' => ['Default Category', 'Men']];
+        $resolver->lookupPaths($paths);
+        $resolver->forget('Default Category/Men');
+        $resolver->lookupPaths($paths);
+        self::assertSame(1, $rootCalls);
+
+        $resolver->forgetRoots();
+        $resolver->forget('Default Category/Men');
+        $resolver->lookupPaths($paths);
+
+        self::assertSame(2, $rootCalls);
+    }
+
+    public function testForgetRootsDropsThePathsCachedUnderARenamedRoot(): void
+    {
+        $calls = 0;
+        $this->categoryResource->method('getChildrenByParentIds')
+            ->willReturnCallback(function () use (&$calls): array {
+                $calls++;
+                return [self::ROOT_ID => ['Men' => self::MEN_ID]];
+            });
+
+        $paths = ['Default Category/Men' => ['Default Category', 'Men']];
+        $this->resolver->lookupPaths($paths);
+        self::assertSame(1, $calls);
+
+        // The root was renamed, so every path that starts with its old name is
+        // stale — not just the root's own entry.
+        $this->resolver->forgetRoots('Default Category');
+        $this->resolver->lookupPaths($paths);
+
+        self::assertSame(2, $calls);
+    }
+
     public function testRootOnlyPathIsReportedWithoutAProductSpecificMessage(): void
     {
         $result = $this->resolver->resolvePaths(['Default Category' => ['Default Category']]);
