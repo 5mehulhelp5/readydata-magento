@@ -28,6 +28,8 @@ interface CategoryDefinitionInterface
 {
     public const PATH = 'path';
     public const CATEGORY_ID = 'category_id';
+    public const PARENT_PATH = 'parent_path';
+    public const PARENT_CATEGORY_ID = 'parent_category_id';
     public const NAME = 'name';
     public const URL_KEY = 'url_key';
     public const IS_ACTIVE = 'is_active';
@@ -36,6 +38,8 @@ interface CategoryDefinitionInterface
     public const POSITION = 'position';
     public const CUSTOM_ATTRIBUTES = 'custom_attributes';
     public const CLEAR_ATTRIBUTES = 'clear_attributes';
+    public const DELETE = 'delete';
+    public const DELETE_CHILDREN = 'delete_children';
 
     /**
      * Full path from a level-1 root name, e.g. "Default Category/Men/Shirts".
@@ -65,6 +69,46 @@ interface CategoryDefinitionInterface
      * @return $this
      */
     public function setCategoryId(?int $categoryId): self;
+
+    /**
+     * The parent this category should live under, as a full path from a level-1
+     * root name — same grammar as {@see getPath()}, and a single segment names a
+     * root. Present means "reconcile the parent", so a category stored elsewhere
+     * is MOVED here; omitted means the parent is left alone.
+     *
+     * Deliberately separate from `path`: `path` identifies, and a caller that
+     * kept a path on file from before a rename or an earlier move must never
+     * have it read as "put it back there".
+     *
+     * A move requires `category_id` for the same reason a rename does — after
+     * the move the old path no longer resolves, so path identity would not
+     * survive a replay.
+     *
+     * @return string|null
+     */
+    public function getParentPath(): ?string;
+
+    /**
+     * @param string|null $parentPath
+     * @return $this
+     */
+    public function setParentPath(?string $parentPath): self;
+
+    /**
+     * The parent this category should live under, by ID. Authoritative when both
+     * this and `parent_path` are given, which is how a caller addresses a parent
+     * whose name is ambiguous among its siblings. `1` is the catalog tree root
+     * and promotes the category to a level-1 root.
+     *
+     * @return int|null
+     */
+    public function getParentCategoryId(): ?int;
+
+    /**
+     * @param int|null $parentCategoryId
+     * @return $this
+     */
+    public function setParentCategoryId(?int $parentCategoryId): self;
 
     /**
      * Category name. Omitted means the last segment of the path.
@@ -178,4 +222,40 @@ interface CategoryDefinitionInterface
      * @return $this
      */
     public function setClearAttributes(?array $clearAttributes): self;
+
+    /**
+     * 0 or 1. Remove this category instead of reconciling it. Cannot be combined
+     * with fields that set a value — a payload that both deletes a category and
+     * describes what it should be is a mistake, not an instruction.
+     *
+     * Deleting is recursive in Magento: the whole descendant subtree goes with
+     * it, which is why {@see getDeleteChildren()} has to be set explicitly for a
+     * category that still has children.
+     *
+     * @return int|null
+     */
+    public function getDelete(): ?int;
+
+    /**
+     * @param int|null $delete
+     * @return $this
+     */
+    public function setDelete(?int $delete): self;
+
+    /**
+     * 0 or 1. Acknowledges that deleting this category also deletes every
+     * category beneath it. Without it, a delete of a non-empty category is
+     * refused rather than silently removing a whole branch of the catalog.
+     *
+     * Only meaningful alongside `delete`.
+     *
+     * @return int|null
+     */
+    public function getDeleteChildren(): ?int;
+
+    /**
+     * @param int|null $deleteChildren
+     * @return $this
+     */
+    public function setDeleteChildren(?int $deleteChildren): self;
 }

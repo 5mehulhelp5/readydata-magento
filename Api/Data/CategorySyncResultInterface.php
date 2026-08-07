@@ -22,6 +22,7 @@ interface CategorySyncResultInterface
     public const STATUS_CREATED = 'created';
     public const STATUS_UPDATED = 'updated';
     public const STATUS_UNCHANGED = 'unchanged';
+    public const STATUS_DELETED = 'deleted';
     public const STATUS_SKIPPED = 'skipped';
     public const STATUS_ERROR = 'error';
 
@@ -37,7 +38,37 @@ interface CategorySyncResultInterface
     public const REASON_WRONG_STORE_ROOT = 'wrong_store_root';
     public const REASON_UNKNOWN_CATEGORY = 'unknown_category';
     public const REASON_RENAME_REQUIRES_CATEGORY_ID = 'rename_requires_category_id';
+    /**
+     * A path implies a parent the category is not under, and the payload named no
+     * destination. Reparenting is expressed by parent_path/parent_category_id, so
+     * this stays what it always was: a mismatch nobody asked us to act on.
+     */
     public const REASON_MOVE_NOT_SUPPORTED = 'move_not_supported';
+    public const REASON_MOVE_REQUIRES_CATEGORY_ID = 'move_requires_category_id';
+    public const REASON_MOVE_INTO_DESCENDANT = 'move_into_descendant';
+    /**
+     * A sibling under the parent the category would end up under already carries
+     * the name it would land with. Nothing in the schema forbids that — there is
+     * no unique key on (parent_id, name) — but it makes the path permanently
+     * ambiguous, so the write refuses rather than creating the duplicate.
+     */
+    public const REASON_DESTINATION_NAME_TAKEN = 'destination_name_taken';
+    /**
+     * Likewise for url_key, where the backstop does exist (url_rewrite is unique
+     * on (request_path, store_id)) but only fires deep inside the save as an
+     * opaque exception. Checked up front so the caller gets the conflicting ID.
+     */
+    public const REASON_DESTINATION_URL_KEY_TAKEN = 'destination_url_key_taken';
+    public const REASON_MOVE_DISABLED = 'move_disabled';
+    public const REASON_DELETE_DISABLED = 'delete_disabled';
+    public const REASON_ROOT_IN_USE = 'root_in_use';
+    public const REASON_HAS_CHILDREN = 'has_children';
+    /**
+     * A delete whose target does not exist. Paired with STATUS_UNCHANGED rather
+     * than a skip: the desired state is already the stored state, which is what
+     * makes a replayed delete free.
+     */
+    public const REASON_ALREADY_ABSENT = 'already_absent';
     public const REASON_STORE_SCOPE_STRUCTURAL_CHANGE = 'store_scope_structural_change';
     public const REASON_STALE_PARENT_PATH = 'stale_parent_path';
     public const REASON_PROTECTED_ATTRIBUTE = 'protected_attribute';
@@ -71,7 +102,7 @@ interface CategorySyncResultInterface
     public function setEntityId(?int $entityId): self;
 
     /**
-     * One of: created, updated, unchanged, skipped, error.
+     * One of: created, updated, unchanged, deleted, skipped, error.
      *
      * @return string
      */

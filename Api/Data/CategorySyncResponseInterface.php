@@ -17,6 +17,7 @@ interface CategorySyncResponseInterface
     public const CREATED = 'created';
     public const UPDATED = 'updated';
     public const UNCHANGED = 'unchanged';
+    public const DELETED = 'deleted';
     public const SKIPPED = 'skipped';
     public const FAILED = 'failed';
     public const ELAPSED_MS = 'elapsed_ms';
@@ -65,6 +66,17 @@ interface CategorySyncResponseInterface
      * @return $this
      */
     public function setUnchanged(int $unchanged): self;
+
+    /**
+     * @return int
+     */
+    public function getDeleted(): int;
+
+    /**
+     * @param int $deleted
+     * @return $this
+     */
+    public function setDeleted(int $deleted): self;
 
     /**
      * @return int

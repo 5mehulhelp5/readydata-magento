@@ -38,6 +38,7 @@ class CategorySyncServiceTest extends TestCase
     private const MEN_ID = 10;
     private const SHIRTS_ID = 11;
     private const TENTS_ID = 12;
+    private const WOMEN_ID = 20;
 
     private Config&MockObject $config;
     private LockManagerInterface&MockObject $lockManager;
@@ -132,12 +133,23 @@ class CategorySyncServiceTest extends TestCase
         );
     }
 
-    private function configMock(bool $categorySyncEnabled = true, bool $continueOnError = true): Config&MockObject
-    {
+    /**
+     * The structural switches default to ON here so a test only mentions them
+     * when it is testing them. Production defaults are the opposite (both off);
+     * that is what testMovesDisabledIsRefused/testDeletesDisabledIsRefused cover.
+     */
+    private function configMock(
+        bool $categorySyncEnabled = true,
+        bool $continueOnError = true,
+        bool $allowMove = true,
+        bool $allowDelete = true
+    ): Config&MockObject {
         $config = $this->createMock(Config::class);
         $config->method('isEnabled')->willReturn(true);
         $config->method('isCategorySyncEnabled')->willReturn($categorySyncEnabled);
         $config->method('isContinueOnError')->willReturn($continueOnError);
+        $config->method('isCategoryMoveAllowed')->willReturn($allowMove);
+        $config->method('isCategoryDeleteAllowed')->willReturn($allowDelete);
 
         return $config;
     }
@@ -145,6 +157,30 @@ class CategorySyncServiceTest extends TestCase
     private function definition(string $path): CategoryDefinition
     {
         return (new CategoryDefinition())->setPath($path);
+    }
+
+    /**
+     * A stored row as CategoryResource::getExistingByIds() reports it.
+     *
+     * @return array{entity_id: int, parent_id: int, level: int, path: string}
+     */
+    private static function row(int $entityId, int $parentId, int $level, string $path): array
+    {
+        return ['entity_id' => $entityId, 'parent_id' => $parentId, 'level' => $level, 'path' => $path];
+    }
+
+    /**
+     * Stub getExistingByIds() over a fixed set of rows, honouring the requested
+     * IDs — the move and delete paths look up a destination or a batch of
+     * targets, so a flat willReturn() would hand back the wrong rows.
+     *
+     * @param array<int, array{entity_id: int, parent_id: int, level: int, path: string}> $rows
+     */
+    private function stubExistingRows(array $rows): void
+    {
+        $this->categoryResource->method('getExistingByIds')->willReturnCallback(
+            static fn (array $ids): array => array_intersect_key($rows, array_flip($ids))
+        );
     }
 
     public function testCreatesMissingCategoryUnderResolvedRoot(): void
@@ -962,5 +998,1003 @@ class CategorySyncServiceTest extends TestCase
         $response = $this->service->sync([$this->definition('Default Category/Men')]);
 
         self::assertSame(1, $response->getCreated());
+    }
+
+    // --- Moving -----------------------------------------------------------
+
+    public function testParentPathMovesTheCategory(): void
+    {
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+            self::WOMEN_ID => self::row(self::WOMEN_ID, self::ROOT_ID, 2, '1/2/20'),
+        ]);
+        $this->pathResolver->method('lookupPaths')->willReturn([
+            'Default Category/Men' => self::MEN_ID,
+            'Default Category/Women' => self::WOMEN_ID,
+        ]);
+        $this->writer->expects(self::once())->method('move')->with(self::SHIRTS_ID, self::WOMEN_ID);
+
+        $definition = $this->definition('Default Category/Men/Shirts')
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setParentPath('Default Category/Women');
+        $response = $this->service->sync([$definition]);
+
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::STATUS_UPDATED, $result->getStatus());
+        self::assertNull($result->getReason());
+        self::assertSame(self::SHIRTS_ID, $result->getEntityId());
+        self::assertSame(1, $response->getUpdated());
+    }
+
+    public function testAMoveWithNoAttributeChangeStillReportsUpdated(): void
+    {
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+            self::WOMEN_ID => self::row(self::WOMEN_ID, self::ROOT_ID, 2, '1/2/20'),
+        ]);
+        $this->pathResolver->method('lookupPaths')->willReturn(['Default Category/Women' => self::WOMEN_ID]);
+        // Nothing differs on the attribute side, so the writer reports no change.
+        $this->writer->method('update')->willReturn(false);
+        $this->writer->expects(self::once())->method('move');
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setName('Shirts')
+            ->setParentPath('Default Category/Women');
+        $response = $this->service->sync([$definition]);
+
+        // The category is somewhere else than it was; "unchanged" would be a lie.
+        self::assertSame(CategorySyncResultInterface::STATUS_UPDATED, $response->getResults()[0]->getStatus());
+    }
+
+    public function testParentCategoryIdWinsOverParentPath(): void
+    {
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+            self::WOMEN_ID => self::row(self::WOMEN_ID, self::ROOT_ID, 2, '1/2/20'),
+        ]);
+        // parent_path is not consulted at all, so no path lookup is needed for it.
+        $this->writer->expects(self::once())->method('move')->with(self::SHIRTS_ID, self::WOMEN_ID);
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setName('Shirts')
+            ->setParentPath('Default Category/Somewhere Ambiguous')
+            ->setParentCategoryId(self::WOMEN_ID);
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(CategorySyncResultInterface::STATUS_UPDATED, $response->getResults()[0]->getStatus());
+    }
+
+    public function testMoveOntoTheCurrentParentIsUnchanged(): void
+    {
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+        ]);
+        $this->writer->method('update')->willReturn(false);
+        // This is the replayed-payload case and it has to cost nothing.
+        $this->writer->expects(self::never())->method('move');
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setName('Shirts')
+            ->setParentCategoryId(self::MEN_ID);
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(CategorySyncResultInterface::STATUS_UNCHANGED, $response->getResults()[0]->getStatus());
+    }
+
+    public function testMoveWithoutCategoryIdIsRefused(): void
+    {
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([self::MEN_ID => ['Shirts' => [self::SHIRTS_ID]]]);
+        $this->pathResolver->method('lookupPaths')->willReturn(['Default Category/Men' => self::MEN_ID]);
+        $this->writer->expects(self::never())->method('move');
+
+        $definition = $this->definition('Default Category/Men/Shirts')
+            ->setParentPath('Default Category/Women');
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(
+            CategorySyncResultInterface::REASON_MOVE_REQUIRES_CATEGORY_ID,
+            $response->getResults()[0]->getReason()
+        );
+    }
+
+    public function testMoveIntoOwnDescendantIsRefused(): void
+    {
+        $this->stubExistingRows([
+            self::MEN_ID => self::row(self::MEN_ID, self::ROOT_ID, 2, '1/2/10'),
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+        ]);
+        $this->writer->expects(self::never())->method('move');
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::MEN_ID)
+            ->setName('Men')
+            ->setParentCategoryId(self::SHIRTS_ID);
+        $response = $this->service->sync([$definition]);
+
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::REASON_MOVE_INTO_DESCENDANT, $result->getReason());
+        self::assertSame(self::MEN_ID, $result->getEntityId());
+    }
+
+    public function testMoveUnderItselfIsRefused(): void
+    {
+        $this->stubExistingRows([
+            self::MEN_ID => self::row(self::MEN_ID, self::ROOT_ID, 2, '1/2/10'),
+        ]);
+        $this->writer->expects(self::never())->method('move');
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::MEN_ID)
+            ->setName('Men')
+            ->setParentCategoryId(self::MEN_ID);
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(
+            CategorySyncResultInterface::REASON_MOVE_INTO_DESCENDANT,
+            $response->getResults()[0]->getReason()
+        );
+    }
+
+    public function testMoveToAnUnresolvableDestinationIsRefused(): void
+    {
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+        ]);
+        $this->pathResolver->method('lookupPaths')->willReturn([]);
+        $this->writer->expects(self::never())->method('move');
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setName('Shirts')
+            ->setParentPath('Default Category/Nowhere/Deep');
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(
+            CategorySyncResultInterface::REASON_PARENT_NOT_FOUND,
+            $response->getResults()[0]->getReason()
+        );
+    }
+
+    public function testMoveToAnUnknownRootIsRefused(): void
+    {
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+        ]);
+        $this->writer->expects(self::never())->method('move');
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setName('Shirts')
+            ->setParentPath('No Such Root/Women');
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(
+            CategorySyncResultInterface::REASON_UNKNOWN_ROOT,
+            $response->getResults()[0]->getReason()
+        );
+    }
+
+    public function testMoveToAnAmbiguousDestinationRootIsRefused(): void
+    {
+        $this->rootIds = ['Default Category' => [self::ROOT_ID, 9]];
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+        ]);
+        $this->writer->expects(self::never())->method('move');
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setName('Shirts')
+            ->setParentPath('Default Category/Women');
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(
+            CategorySyncResultInterface::REASON_AMBIGUOUS_PATH,
+            $response->getResults()[0]->getReason()
+        );
+    }
+
+    public function testMoveIsRefusedAtStoreScope(): void
+    {
+        $this->storeId = 1;
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+            self::WOMEN_ID => self::row(self::WOMEN_ID, self::ROOT_ID, 2, '1/2/20'),
+        ]);
+        $this->writer->expects(self::never())->method('move');
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setName('Shirts')
+            ->setParentCategoryId(self::WOMEN_ID);
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(
+            CategorySyncResultInterface::REASON_STORE_SCOPE_STRUCTURAL_CHANGE,
+            $response->getResults()[0]->getReason()
+        );
+    }
+
+    public function testMovesDisabledIsRefused(): void
+    {
+        $service = $this->buildService($this->configMock(allowMove: false));
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+            self::WOMEN_ID => self::row(self::WOMEN_ID, self::ROOT_ID, 2, '1/2/20'),
+        ]);
+        $this->writer->expects(self::never())->method('move');
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setName('Shirts')
+            ->setParentCategoryId(self::WOMEN_ID);
+        $response = $service->sync([$definition]);
+
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::REASON_MOVE_DISABLED, $result->getReason());
+        self::assertSame(self::SHIRTS_ID, $result->getEntityId());
+    }
+
+    public function testMovingAStoreGroupRootIsRefused(): void
+    {
+        $this->stubExistingRows([
+            self::ROOT_ID => self::row(self::ROOT_ID, 1, 1, '1/2'),
+            self::OUTDOOR_ID => self::row(self::OUTDOOR_ID, 1, 1, '1/7'),
+        ]);
+        $this->categoryResource->method('getStoreGroupRootCategoryIds')->willReturn([self::ROOT_ID => true]);
+        $this->writer->expects(self::never())->method('move');
+
+        // Demoting it would leave the storefront pointing at a non-root.
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::ROOT_ID)
+            ->setName('Default Category')
+            ->setParentCategoryId(self::OUTDOOR_ID);
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(
+            CategorySyncResultInterface::REASON_ROOT_IN_USE,
+            $response->getResults()[0]->getReason()
+        );
+    }
+
+    public function testPromotingToARootIsAllowed(): void
+    {
+        $this->stubExistingRows([
+            self::MEN_ID => self::row(self::MEN_ID, self::ROOT_ID, 2, '1/2/10'),
+            CategoryModel::TREE_ROOT_ID => self::row(CategoryModel::TREE_ROOT_ID, 0, 0, '1'),
+        ]);
+        $this->writer->expects(self::once())
+            ->method('move')
+            ->with(self::MEN_ID, CategoryModel::TREE_ROOT_ID);
+        // The root name => ID map the resolver memoizes has a new entry.
+        $this->pathResolver->expects(self::once())->method('forgetRoots');
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::MEN_ID)
+            ->setName('Men')
+            ->setParentCategoryId(CategoryModel::TREE_ROOT_ID);
+        $response = $this->service->sync([$definition]);
+
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::STATUS_UPDATED, $result->getStatus());
+        self::assertNotEmpty(array_filter(
+            $result->getMessages(),
+            static fn (string $m): bool => str_contains($m, 'level-1 root')
+        ));
+    }
+
+    public function testAPathImplyingADifferentParentIsStillRefusedWithoutADestination(): void
+    {
+        // The behaviour the endpoint has always had, and the reason parent_path
+        // exists: a caller replaying a path they stored before an earlier move
+        // must not have it read as "put it back".
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, 77, 3, '1/2/77/11'),
+        ]);
+        $this->pathResolver->method('lookupPaths')->willReturn(['Default Category/Men' => self::MEN_ID]);
+        $this->writer->expects(self::never())->method('move');
+        $this->writer->expects(self::never())->method('update');
+
+        $definition = $this->definition('Default Category/Men/Shirts')->setCategoryId(self::SHIRTS_ID);
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(
+            CategorySyncResultInterface::REASON_MOVE_NOT_SUPPORTED,
+            $response->getResults()[0]->getReason()
+        );
+    }
+
+    public function testAStalePathIsIgnoredWhenADestinationIsGiven(): void
+    {
+        // Same stale path as above, but now the caller said where it should be.
+        // The path stops being a cross-check and the move goes ahead.
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, 77, 3, '1/2/77/11'),
+            self::WOMEN_ID => self::row(self::WOMEN_ID, self::ROOT_ID, 2, '1/2/20'),
+        ]);
+        $this->pathResolver->method('lookupPaths')->willReturn([
+            'Default Category/Men' => self::MEN_ID,
+            'Default Category/Women' => self::WOMEN_ID,
+        ]);
+        $this->writer->expects(self::once())->method('move')->with(self::SHIRTS_ID, self::WOMEN_ID);
+
+        $definition = $this->definition('Default Category/Men/Shirts')
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setParentPath('Default Category/Women');
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(CategorySyncResultInterface::STATUS_UPDATED, $response->getResults()[0]->getStatus());
+    }
+
+    public function testMovedSubtreeAndBothParentsAreInvalidated(): void
+    {
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+            self::WOMEN_ID => self::row(self::WOMEN_ID, self::ROOT_ID, 2, '1/2/20'),
+        ]);
+        $this->categoryResource->method('getDescendantIds')->willReturn([99]);
+        $this->writer->method('update')->willReturn(false);
+
+        $touched = null;
+        $this->invalidationHandler->method('execute')
+            ->willReturnCallback(function (array $ids, array $removed = []) use (&$touched): void {
+                $touched = $ids;
+            });
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setName('Shirts')
+            ->setParentCategoryId(self::WOMEN_ID);
+        $this->service->sync([$definition]);
+
+        // The subtree was re-pathed, and both parents' children lists changed.
+        self::assertNotNull($touched);
+        foreach ([self::SHIRTS_ID, 99, self::MEN_ID, self::WOMEN_ID] as $expected) {
+            self::assertContains($expected, $touched);
+        }
+    }
+
+    public function testASecondStructuralChangeInsideAMovedSubtreeIsRefused(): void
+    {
+        $this->stubExistingRows([
+            self::MEN_ID => self::row(self::MEN_ID, self::ROOT_ID, 2, '1/2/10'),
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+            self::WOMEN_ID => self::row(self::WOMEN_ID, self::ROOT_ID, 2, '1/2/20'),
+            self::OUTDOOR_ID => self::row(self::OUTDOOR_ID, 1, 1, '1/7'),
+        ]);
+        // Shirts is inside the subtree that the first entry moves.
+        $this->categoryResource->method('getDescendantIds')->willReturnCallback(
+            static fn (array $ids): array => $ids === [self::MEN_ID] ? [self::SHIRTS_ID] : []
+        );
+        $this->writer->method('update')->willReturn(false);
+        // Only the first move is applied.
+        $this->writer->expects(self::once())->method('move');
+
+        $response = $this->service->sync([
+            (new CategoryDefinition())
+                ->setCategoryId(self::MEN_ID)
+                ->setName('Men')
+                ->setParentCategoryId(self::WOMEN_ID),
+            (new CategoryDefinition())
+                ->setCategoryId(self::SHIRTS_ID)
+                ->setName('Shirts')
+                ->setParentCategoryId(self::OUTDOOR_ID),
+        ]);
+
+        $byId = [];
+        foreach ($response->getResults() as $result) {
+            $byId[$result->getEntityId()] = $result;
+        }
+        self::assertSame(CategorySyncResultInterface::STATUS_UPDATED, $byId[self::MEN_ID]->getStatus());
+        // Core memoizes children per request, so regenerating rewrites for the
+        // second move would use the pre-move tree.
+        self::assertSame(
+            CategorySyncResultInterface::REASON_STALE_PARENT_PATH,
+            $byId[self::SHIRTS_ID]->getReason()
+        );
+    }
+
+    public function testMoveInvalidatesTheResolversPathCache(): void
+    {
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+            self::WOMEN_ID => self::row(self::WOMEN_ID, self::ROOT_ID, 2, '1/2/20'),
+        ]);
+        $this->writer->method('update')->willReturn(false);
+        // Every cached path under the old and the new location now resolves to
+        // the wrong node.
+        $this->pathResolver->expects(self::once())->method('forgetAllPaths');
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setName('Shirts')
+            ->setParentCategoryId(self::WOMEN_ID);
+        $this->service->sync([$definition]);
+    }
+
+    // --- Destination collisions -------------------------------------------
+
+    public function testCreateIsRefusedWhenASiblingAlreadyUsesTheDerivedSlug(): void
+    {
+        $this->categoryResource->method('getChildIdsByParentIds')->willReturn([]);
+        $this->pathResolver->method('lookupPaths')->willReturn(['Default Category/Men' => self::MEN_ID]);
+        $this->writer->method('findNewChildConflict')
+            ->willReturn(['kind' => 'url_key', 'value' => 'clearance', 'category_id' => 99]);
+        $this->writer->expects(self::never())->method('create');
+
+        $response = $this->service->sync([$this->definition('Default Category/Men/Clearance')]);
+
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::REASON_DESTINATION_URL_KEY_TAKEN, $result->getReason());
+        // Nothing was created, so there is no ID to report.
+        self::assertNull($result->getEntityId());
+        self::assertStringContainsString('99', $result->getMessages()[0]);
+    }
+
+    public function testCreateProceedsWhenTheSlugIsFree(): void
+    {
+        $this->categoryResource->method('getChildIdsByParentIds')->willReturn([]);
+        $this->pathResolver->method('lookupPaths')->willReturn(['Default Category/Men' => self::MEN_ID]);
+        $this->writer->method('findNewChildConflict')->willReturn(null);
+        $this->writer->expects(self::once())->method('create')
+            ->with(self::MEN_ID, 'Clearance')
+            ->willReturn(53);
+
+        $response = $this->service->sync([$this->definition('Default Category/Men/Clearance')]);
+
+        self::assertSame(1, $response->getCreated());
+    }
+
+    public function testTheCreateCollisionCheckIsAskedAboutTheResolvedParentAndLeafName(): void
+    {
+        $this->categoryResource->method('getChildIdsByParentIds')->willReturn([]);
+        $this->pathResolver->method('lookupPaths')->willReturn(['Default Category/Men' => self::MEN_ID]);
+        $this->writer->expects(self::once())->method('findNewChildConflict')
+            ->with(self::MEN_ID, 'Clearance', self::anything())
+            ->willReturn(null);
+        $this->writer->method('create')->willReturn(53);
+
+        $this->service->sync([$this->definition('Default Category/Men/Clearance')]);
+    }
+
+    public function testAnExistingSiblingNameIsUpdatedAndNeverCollisionChecked(): void
+    {
+        // A name collision cannot reach the create branch: the sibling is found
+        // and updated instead, so there is nothing to check.
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([self::MEN_ID => ['Clearance' => [53]]]);
+        $this->stubExistingRows([53 => self::row(53, self::MEN_ID, 3, '1/2/10/53')]);
+        $this->pathResolver->method('lookupPaths')->willReturn(['Default Category/Men' => self::MEN_ID]);
+        $this->writer->method('update')->willReturn(true);
+        $this->writer->expects(self::never())->method('create');
+        $this->writer->expects(self::never())->method('findNewChildConflict');
+
+        $response = $this->service->sync([$this->definition('Default Category/Men/Clearance')]);
+
+        self::assertSame(1, $response->getUpdated());
+    }
+
+    public function testMoveIsRefusedWhenTheDestinationAlreadyHasThatName(): void
+    {
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+            self::WOMEN_ID => self::row(self::WOMEN_ID, self::ROOT_ID, 2, '1/2/20'),
+        ]);
+        $this->writer->method('findSiblingConflict')
+            ->willReturn(['kind' => 'name', 'value' => 'Shirts', 'category_id' => 33]);
+        // Nothing in catalog_category_entity forbids duplicate sibling names, so
+        // the write would succeed and leave the path ambiguous forever.
+        $this->writer->expects(self::never())->method('move');
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setName('Shirts')
+            ->setParentCategoryId(self::WOMEN_ID);
+        $response = $this->service->sync([$definition]);
+
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::REASON_DESTINATION_NAME_TAKEN, $result->getReason());
+        self::assertSame(self::SHIRTS_ID, $result->getEntityId());
+        // The conflicting ID is what makes the refusal actionable.
+        self::assertStringContainsString('33', $result->getMessages()[0]);
+    }
+
+    public function testMoveIsRefusedWhenTheDestinationAlreadyUsesThatUrlKey(): void
+    {
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+            self::WOMEN_ID => self::row(self::WOMEN_ID, self::ROOT_ID, 2, '1/2/20'),
+        ]);
+        $this->writer->method('findSiblingConflict')
+            ->willReturn(['kind' => 'url_key', 'value' => 'shirts', 'category_id' => 33]);
+        $this->writer->expects(self::never())->method('move');
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setName('Shirts')
+            ->setParentCategoryId(self::WOMEN_ID);
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(
+            CategorySyncResultInterface::REASON_DESTINATION_URL_KEY_TAKEN,
+            $response->getResults()[0]->getReason()
+        );
+    }
+
+    public function testTheMoveCollisionCheckAsksAboutTheDestinationParent(): void
+    {
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+            self::WOMEN_ID => self::row(self::WOMEN_ID, self::ROOT_ID, 2, '1/2/20'),
+        ]);
+        // Destination parent, and flagged as a move — a move collides on the name
+        // the category already has, which the payload alone cannot reveal.
+        $this->writer->expects(self::once())->method('findSiblingConflict')
+            ->with(self::SHIRTS_ID, self::WOMEN_ID, 'Shirts', self::anything(), true)
+            ->willReturn(null);
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setName('Shirts')
+            ->setParentCategoryId(self::WOMEN_ID);
+        $this->service->sync([$definition]);
+    }
+
+    public function testRenameIsRefusedWhenASiblingAlreadyHasThatName(): void
+    {
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+        ]);
+        $this->writer->method('findSiblingConflict')
+            ->willReturn(['kind' => 'name', 'value' => 'Coats', 'category_id' => 44]);
+        $this->writer->expects(self::never())->method('update');
+
+        $definition = (new CategoryDefinition())->setCategoryId(self::SHIRTS_ID)->setName('Coats');
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(
+            CategorySyncResultInterface::REASON_DESTINATION_NAME_TAKEN,
+            $response->getResults()[0]->getReason()
+        );
+    }
+
+    public function testTheRenameCollisionCheckAsksAboutTheCurrentParent(): void
+    {
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+        ]);
+        $this->writer->expects(self::once())->method('findSiblingConflict')
+            ->with(self::SHIRTS_ID, self::MEN_ID, 'Coats', self::anything(), false)
+            ->willReturn(null);
+
+        $definition = (new CategoryDefinition())->setCategoryId(self::SHIRTS_ID)->setName('Coats');
+        $this->service->sync([$definition]);
+    }
+
+    public function testAPathIdentifiedEntryWithACollidingUrlKeyIsRefused(): void
+    {
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([self::MEN_ID => ['Shirts' => [self::SHIRTS_ID]]]);
+        $this->pathResolver->method('lookupPaths')->willReturn(['Default Category/Men' => self::MEN_ID]);
+        $this->writer->method('findSiblingConflict')
+            ->willReturn(['kind' => 'url_key', 'value' => 'tents', 'category_id' => self::TENTS_ID]);
+        $this->writer->expects(self::never())->method('update');
+
+        // A path-identified entry cannot rename, but it can still hand over a
+        // url_key a sibling already owns.
+        $definition = $this->definition('Default Category/Men/Shirts')->setUrlKey('tents');
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(
+            CategorySyncResultInterface::REASON_DESTINATION_URL_KEY_TAKEN,
+            $response->getResults()[0]->getReason()
+        );
+    }
+
+    public function testAMoveIsCollisionCheckedOnceNotTwice(): void
+    {
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+            self::WOMEN_ID => self::row(self::WOMEN_ID, self::ROOT_ID, 2, '1/2/20'),
+        ]);
+        // The move already checked the destination; re-checking the same parent
+        // afterwards would be a wasted pair of queries per entry.
+        $this->writer->expects(self::once())->method('findSiblingConflict')->willReturn(null);
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setName('Shirts')
+            ->setParentCategoryId(self::WOMEN_ID);
+        $this->service->sync([$definition]);
+    }
+
+    public function testStoreScopedWritesSkipTheCollisionCheck(): void
+    {
+        $this->storeId = 1;
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+        ]);
+        // Path resolution matches store-0 names throughout the module, so a
+        // store-scoped rename cannot create a store-0 ambiguity.
+        $this->writer->expects(self::never())->method('findSiblingConflict');
+
+        $definition = (new CategoryDefinition())->setCategoryId(self::SHIRTS_ID)->setName('Coats');
+        $this->service->sync([$definition]);
+    }
+
+    // --- Deleting ---------------------------------------------------------
+
+    public function testDeleteByPathRemovesTheCategory(): void
+    {
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([self::MEN_ID => ['Shirts' => [self::SHIRTS_ID]]]);
+        $this->pathResolver->method('lookupPaths')->willReturn(['Default Category/Men' => self::MEN_ID]);
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+        ]);
+        $this->writer->expects(self::once())->method('delete')->with(self::SHIRTS_ID);
+
+        $definition = $this->definition('Default Category/Men/Shirts')->setDelete(1);
+        $response = $this->service->sync([$definition]);
+
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::STATUS_DELETED, $result->getStatus());
+        self::assertSame(self::SHIRTS_ID, $result->getEntityId());
+        self::assertSame(1, $response->getDeleted());
+    }
+
+    public function testDeleteByCategoryIdRemovesTheCategory(): void
+    {
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+        ]);
+        $this->writer->expects(self::once())->method('delete')->with(self::SHIRTS_ID);
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setName('Shirts')
+            ->setDelete(1);
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(CategorySyncResultInterface::STATUS_DELETED, $response->getResults()[0]->getStatus());
+    }
+
+    public function testDeletingAnAbsentCategoryIsUnchangedSoAReplayIsFree(): void
+    {
+        $this->categoryResource->method('getChildIdsByParentIds')->willReturn([]);
+        $this->pathResolver->method('lookupPaths')->willReturn(['Default Category/Men' => self::MEN_ID]);
+        $this->writer->expects(self::never())->method('delete');
+
+        $definition = $this->definition('Default Category/Men/Shirts')->setDelete(1);
+        $response = $this->service->sync([$definition]);
+
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::STATUS_UNCHANGED, $result->getStatus());
+        self::assertSame(CategorySyncResultInterface::REASON_ALREADY_ABSENT, $result->getReason());
+        self::assertSame(1, $response->getUnchanged());
+    }
+
+    public function testDeletingAnUnknownCategoryIdIsAlsoAlreadyAbsent(): void
+    {
+        $this->stubExistingRows([]);
+        $this->writer->expects(self::never())->method('delete');
+
+        $definition = (new CategoryDefinition())->setCategoryId(4242)->setName('Gone')->setDelete(1);
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(
+            CategorySyncResultInterface::REASON_ALREADY_ABSENT,
+            $response->getResults()[0]->getReason()
+        );
+    }
+
+    public function testDeletingACategoryWithChildrenNeedsTheOptIn(): void
+    {
+        $this->stubExistingRows([
+            self::MEN_ID => self::row(self::MEN_ID, self::ROOT_ID, 2, '1/2/10'),
+        ]);
+        $this->categoryResource->method('getDescendantIds')->willReturn([self::SHIRTS_ID, 99]);
+        $this->writer->expects(self::never())->method('delete');
+
+        $definition = (new CategoryDefinition())->setCategoryId(self::MEN_ID)->setName('Men')->setDelete(1);
+        $response = $this->service->sync([$definition]);
+
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::REASON_HAS_CHILDREN, $result->getReason());
+        self::assertSame(self::MEN_ID, $result->getEntityId());
+        // The count is what makes the refusal actionable.
+        self::assertStringContainsString('2 categories beneath it', $result->getMessages()[0]);
+    }
+
+    public function testDeleteChildrenOptInRemovesTheWholeSubtree(): void
+    {
+        $this->stubExistingRows([
+            self::MEN_ID => self::row(self::MEN_ID, self::ROOT_ID, 2, '1/2/10'),
+        ]);
+        $this->categoryResource->method('getDescendantIds')->willReturn([self::SHIRTS_ID, 99]);
+        $this->writer->expects(self::once())->method('delete')->with(self::MEN_ID);
+
+        $removed = null;
+        $this->invalidationHandler->method('execute')
+            ->willReturnCallback(function (array $ids, array $removedIds = []) use (&$removed): void {
+                $removed = $removedIds;
+            });
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::MEN_ID)
+            ->setName('Men')
+            ->setDelete(1)
+            ->setDeleteChildren(1);
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(CategorySyncResultInterface::STATUS_DELETED, $response->getResults()[0]->getStatus());
+        // Captured before the delete — afterwards the rows are gone and nothing
+        // could rebuild this list.
+        self::assertSame([self::MEN_ID, self::SHIRTS_ID, 99], $removed);
+    }
+
+    public function testDeletesRunDeepestFirstSoBothEntriesReportTheirOwnRemoval(): void
+    {
+        $this->stubExistingRows([
+            self::MEN_ID => self::row(self::MEN_ID, self::ROOT_ID, 2, '1/2/10'),
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+        ]);
+        $this->categoryResource->method('getDescendantIds')->willReturnCallback(
+            static fn (array $ids): array => $ids === [self::MEN_ID] ? [self::SHIRTS_ID] : []
+        );
+
+        $deleted = [];
+        $this->writer->method('delete')->willReturnCallback(
+            static function (int $id) use (&$deleted): void {
+                $deleted[] = $id;
+            }
+        );
+
+        // Parent sent first in the payload; depth decides the order, not order.
+        $response = $this->service->sync([
+            (new CategoryDefinition())
+                ->setCategoryId(self::MEN_ID)
+                ->setName('Men')
+                ->setDelete(1)
+                ->setDeleteChildren(1),
+            (new CategoryDefinition())
+                ->setCategoryId(self::SHIRTS_ID)
+                ->setName('Shirts')
+                ->setDelete(1),
+        ]);
+
+        self::assertSame([self::SHIRTS_ID, self::MEN_ID], $deleted);
+        self::assertSame(2, $response->getDeleted());
+    }
+
+    public function testDeletesDisabledIsRefused(): void
+    {
+        $service = $this->buildService($this->configMock(allowDelete: false));
+        $this->writer->expects(self::never())->method('delete');
+
+        $definition = (new CategoryDefinition())->setCategoryId(self::MEN_ID)->setName('Men')->setDelete(1);
+        $response = $service->sync([$definition]);
+
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::STATUS_SKIPPED, $result->getStatus());
+        self::assertSame(CategorySyncResultInterface::REASON_DELETE_DISABLED, $result->getReason());
+    }
+
+    public function testDeletingTheTreeRootIsRefused(): void
+    {
+        $this->stubExistingRows([
+            CategoryModel::TREE_ROOT_ID => self::row(CategoryModel::TREE_ROOT_ID, 0, 0, '1'),
+        ]);
+        $this->writer->expects(self::never())->method('delete');
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(CategoryModel::TREE_ROOT_ID)
+            ->setName('Root Catalog')
+            ->setDelete(1);
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(
+            CategorySyncResultInterface::REASON_ROOT_NOT_WRITABLE,
+            $response->getResults()[0]->getReason()
+        );
+    }
+
+    public function testDeletingAStoreGroupRootIsRefused(): void
+    {
+        $this->stubExistingRows([
+            self::ROOT_ID => self::row(self::ROOT_ID, 1, 1, '1/2'),
+        ]);
+        $this->categoryResource->method('getStoreGroupRootCategoryIds')->willReturn([self::ROOT_ID => true]);
+        $this->writer->expects(self::never())->method('delete');
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::ROOT_ID)
+            ->setName('Default Category')
+            ->setDelete(1)
+            ->setDeleteChildren(1);
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(
+            CategorySyncResultInterface::REASON_ROOT_IN_USE,
+            $response->getResults()[0]->getReason()
+        );
+    }
+
+    public function testDeleteIsRefusedAtStoreScope(): void
+    {
+        $this->storeId = 1;
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+        ]);
+        $this->writer->expects(self::never())->method('delete');
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setName('Shirts')
+            ->setDelete(1);
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(
+            CategorySyncResultInterface::REASON_STORE_SCOPE_STRUCTURAL_CHANGE,
+            $response->getResults()[0]->getReason()
+        );
+    }
+
+    public function testDeletingACategoryInAnotherStoresTreeReportsWrongStoreRoot(): void
+    {
+        $this->storeId = 1;
+        $this->storeRootId = self::ROOT_ID;
+        $this->stubExistingRows([
+            self::TENTS_ID => self::row(self::TENTS_ID, self::OUTDOOR_ID, 2, '1/7/12'),
+        ]);
+        $this->writer->expects(self::never())->method('delete');
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::TENTS_ID)
+            ->setName('Tents')
+            ->setDelete(1);
+        $response = $this->service->sync([$definition]);
+
+        // Ahead of the store-scope refusal: which category is wrong-rooted is
+        // the more specific finding.
+        self::assertSame(
+            CategorySyncResultInterface::REASON_WRONG_STORE_ROOT,
+            $response->getResults()[0]->getReason()
+        );
+    }
+
+    public function testAmbiguousDeletePathIsRefusedRatherThanGuessed(): void
+    {
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([self::MEN_ID => ['Shirts' => [self::SHIRTS_ID, 44]]]);
+        $this->pathResolver->method('lookupPaths')->willReturn(['Default Category/Men' => self::MEN_ID]);
+        $this->writer->expects(self::never())->method('delete');
+
+        $definition = $this->definition('Default Category/Men/Shirts')->setDelete(1);
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(
+            CategorySyncResultInterface::REASON_AMBIGUOUS_PATH,
+            $response->getResults()[0]->getReason()
+        );
+    }
+
+    public function testDeleteAndUpdateOfTheSameCategoryCollapseWithTheLastWinning(): void
+    {
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+        ]);
+        $this->writer->expects(self::once())->method('delete')->with(self::SHIRTS_ID);
+        $this->writer->expects(self::never())->method('update');
+
+        $response = $this->service->sync([
+            (new CategoryDefinition())->setCategoryId(self::SHIRTS_ID)->setName('Shirts')->setIsActive(0),
+            (new CategoryDefinition())->setCategoryId(self::SHIRTS_ID)->setName('Shirts')->setDelete(1),
+        ]);
+
+        self::assertCount(1, $response->getResults());
+        self::assertSame(CategorySyncResultInterface::STATUS_DELETED, $response->getResults()[0]->getStatus());
+    }
+
+    public function testDeletesRunAfterCreatesSoAParentCanBeReplacedInOneRequest(): void
+    {
+        $this->categoryResource->method('getChildIdsByParentIds')->willReturn([]);
+        $this->pathResolver->method('lookupPaths')->willReturn(['Default Category/Men' => self::MEN_ID]);
+        $this->stubExistingRows([
+            self::TENTS_ID => self::row(self::TENTS_ID, self::MEN_ID, 3, '1/2/10/12'),
+        ]);
+
+        $order = [];
+        $this->writer->method('create')->willReturnCallback(
+            static function () use (&$order): int {
+                $order[] = 'create';
+                return self::SHIRTS_ID;
+            }
+        );
+        $this->writer->method('delete')->willReturnCallback(
+            static function () use (&$order): void {
+                $order[] = 'delete';
+            }
+        );
+
+        $this->service->sync([
+            (new CategoryDefinition())->setCategoryId(self::TENTS_ID)->setName('Tents')->setDelete(1),
+            $this->definition('Default Category/Men/Shirts'),
+        ]);
+
+        self::assertSame(['create', 'delete'], $order);
+    }
+
+    public function testADeleteFailureAbortsTheRestWhenContinueOnErrorIsOff(): void
+    {
+        $service = $this->buildService($this->configMock(continueOnError: false));
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+            self::TENTS_ID => self::row(self::TENTS_ID, self::MEN_ID, 3, '1/2/10/12'),
+        ]);
+        $this->writer->method('delete')->willThrowException(new \RuntimeException('constraint violation'));
+
+        $response = $service->sync([
+            (new CategoryDefinition())->setCategoryId(self::SHIRTS_ID)->setName('Shirts')->setDelete(1),
+            (new CategoryDefinition())->setCategoryId(self::TENTS_ID)->setName('Tents')->setDelete(1),
+        ]);
+
+        self::assertSame(1, $response->getFailed());
+        self::assertSame(1, $response->getSkipped());
+        $reasons = array_map(
+            static fn ($r): ?string => $r->getReason(),
+            $response->getResults()
+        );
+        self::assertContains(CategorySyncResultInterface::REASON_ABORTED, $reasons);
+    }
+
+    public function testDeleteInvalidatesTheResolversPathCache(): void
+    {
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+        ]);
+        $this->pathResolver->expects(self::once())->method('forgetAllPaths');
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setName('Shirts')
+            ->setDelete(1);
+        $this->service->sync([$definition]);
+    }
+
+    public function testDeleteReportsThatProductsSurvive(): void
+    {
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+        ]);
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setName('Shirts')
+            ->setDelete(1);
+        $response = $this->service->sync([$definition]);
+
+        self::assertNotEmpty(array_filter(
+            $response->getResults()[0]->getMessages(),
+            static fn (string $m): bool => str_contains($m, 'products themselves')
+        ));
+    }
+
+    public function testInvalidDeleteDefinitionIsReportedNotDeleted(): void
+    {
+        $this->writer->expects(self::never())->method('delete');
+
+        // A delete that also sets a value: contradictory, so nothing happens.
+        $definition = $this->definition('Default Category/Men')->setDelete(1)->setIsActive(0);
+        $response = $this->service->sync([$definition]);
+
+        self::assertSame(
+            CategorySyncResultInterface::REASON_INVALID_DEFINITION,
+            $response->getResults()[0]->getReason()
+        );
     }
 }

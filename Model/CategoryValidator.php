@@ -125,11 +125,110 @@ class CategoryValidator
         $this->assertFlag('is_active', $definition->getIsActive());
         $this->assertFlag('include_in_menu', $definition->getIncludeInMenu());
         $this->assertFlag('is_anchor', $definition->getIsAnchor());
+        $this->assertFlag('delete', $definition->getDelete());
+        $this->assertFlag('delete_children', $definition->getDeleteChildren());
 
         $this->assertCustomAttributes($definition);
         $this->assertClearAttributes($definition);
+        $this->assertDelete($definition);
 
         return $segments;
+    }
+
+    /**
+     * The parent the definition asks for, as path segments.
+     *
+     * Separate from {@see validate()} rather than folded into its return value:
+     * that return is the entry's own path and the service keys everything off it,
+     * and a destination is optional in a way an identity is not.
+     *
+     * @return string[] the parsed segments, empty when no parent_path was sent
+     * @throws CategoryValidationException
+     */
+    public function validateParent(CategoryDefinitionInterface $definition): array
+    {
+        $parentPath = $definition->getParentPath();
+        if ($parentPath === null || trim($parentPath) === '') {
+            return [];
+        }
+
+        $parsed = $this->pathParser->parse($parentPath);
+        if ($parsed === null) {
+            throw new CategoryValidationException(
+                CategorySyncResultInterface::REASON_INVALID_DEFINITION,
+                __('Parent path "%1" is empty after normalization.', $parentPath)
+            );
+        }
+        if ($parsed['type'] === PathParser::TYPE_ID) {
+            throw new CategoryValidationException(
+                CategorySyncResultInterface::REASON_INVALID_DEFINITION,
+                __(
+                    'Parent path "%1" is a bare number; use the parent_category_id field to address a parent'
+                    . ' by ID, or escape the segment ("\\%1") to name a category whose name is a number.',
+                    $parentPath
+                )
+            );
+        }
+
+        return $parsed['segments'];
+    }
+
+    /**
+     * A delete says "this category should not exist". Combining it with fields
+     * that describe what the category should *be* is contradictory, and the two
+     * readings (delete it / update it) differ enough that guessing is worse than
+     * refusing. `name` is exempt: it is the cross-check a bare category_id needs,
+     * not a value to write.
+     *
+     * @throws CategoryValidationException
+     */
+    private function assertDelete(CategoryDefinitionInterface $definition): void
+    {
+        $isDelete = $definition->getDelete() === 1;
+
+        if (!$isDelete) {
+            if ($definition->getDeleteChildren() === 1) {
+                throw new CategoryValidationException(
+                    CategorySyncResultInterface::REASON_INVALID_DEFINITION,
+                    __('Field "delete_children" is only meaningful together with "delete": 1.')
+                );
+            }
+
+            return;
+        }
+
+        $conflicts = [];
+        foreach (
+            [
+                'url_key' => $definition->getUrlKey(),
+                'is_active' => $definition->getIsActive(),
+                'include_in_menu' => $definition->getIncludeInMenu(),
+                'is_anchor' => $definition->getIsAnchor(),
+                'position' => $definition->getPosition(),
+                'parent_path' => $definition->getParentPath(),
+                'parent_category_id' => $definition->getParentCategoryId(),
+            ] as $field => $value
+        ) {
+            if ($value !== null) {
+                $conflicts[] = $field;
+            }
+        }
+        if ($definition->getCustomAttributes()) {
+            $conflicts[] = 'custom_attributes';
+        }
+        if ($definition->getClearAttributes()) {
+            $conflicts[] = 'clear_attributes';
+        }
+
+        if ($conflicts !== []) {
+            throw new CategoryValidationException(
+                CategorySyncResultInterface::REASON_INVALID_DEFINITION,
+                __(
+                    'A category being deleted cannot also set values; remove %1, or drop "delete".',
+                    implode(', ', $conflicts)
+                )
+            );
+        }
     }
 
     /**

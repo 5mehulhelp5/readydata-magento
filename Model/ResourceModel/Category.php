@@ -29,6 +29,11 @@ class Category
 
     private ?bool $isAnchorDefault = null;
 
+    /**
+     * @var array<int, true>|null
+     */
+    private ?array $storeGroupRootIds = null;
+
     public function __construct(
         private readonly ResourceConnection $resourceConnection,
         private readonly MetadataPool $metadataPool
@@ -153,6 +158,49 @@ class Category
     }
 
     /**
+     * Direct children of the given parents keyed by their store-0 `url_key`.
+     *
+     * The companion to {@see getChildIdsByParentIds()} for the other half of a
+     * sibling collision: two siblings may differ in name and still generate the
+     * same `url_path`, which `url_rewrite` refuses on its
+     * (request_path, store_id) unique key.
+     *
+     * Store-0 only, which is the scope a structural write uses. A sibling whose
+     * `url_key` exists solely as a store-view override is therefore not seen
+     * here, and such a collision still surfaces the way it always did — as the
+     * repository's own exception.
+     *
+     * @param int[] $parentIds
+     * @return array<int, array<string, int[]>> parent_id => [url_key => entity_id[]]
+     */
+    public function getChildUrlKeysByParentIds(array $parentIds): array
+    {
+        if (!$parentIds) {
+            return [];
+        }
+
+        $connection = $this->resourceConnection->getConnection();
+        $select = $this->joinVarchar(
+            $connection->select()
+                ->from(
+                    ['e' => $this->resourceConnection->getTableName(self::ENTITY_TABLE)],
+                    ['entity_id', 'parent_id']
+                )
+                ->where('e.parent_id IN (?)', $parentIds)
+                ->order('e.entity_id ' . \Magento\Framework\DB\Select::SQL_ASC),
+            'url_key',
+            'url_key'
+        );
+
+        $children = [];
+        foreach ($connection->fetchAll($select) as $row) {
+            $children[(int)$row['parent_id']][(string)$row['url_key']][] = (int)$row['entity_id'];
+        }
+
+        return $children;
+    }
+
+    /**
      * All descendants of the given categories, derived from the stored id-path.
      * Used for cache invalidation: a url_path or name change cascades down the
      * subtree, so the descendants' cached pages are stale too.
@@ -246,6 +294,44 @@ class Category
     }
 
     /**
+     * Categories some store group has adopted as its root, as a lookup set.
+     *
+     * The tree-structural guard for moves and deletes: demoting or removing one
+     * of these leaves a storefront pointing at a category that is no longer a
+     * root, or at nothing at all. Core catches the delete case in
+     * `Category::beforeDelete()` ("Can't delete root category.") but not the move
+     * case, and a thrown exception mid-batch is a worse answer than a per-entry
+     * refusal either way.
+     *
+     * Reads `store_group` directly rather than reusing
+     * {@see StoreWebsiteMap::getRootCategoryId()}: that map is keyed by store view
+     * and filtered to `store_id > 0`, so a store group with no store views — which
+     * still pins its root — would be invisible here.
+     *
+     * @return array<int, true> entity_id => true
+     */
+    public function getStoreGroupRootCategoryIds(): array
+    {
+        if ($this->storeGroupRootIds !== null) {
+            return $this->storeGroupRootIds;
+        }
+
+        $connection = $this->resourceConnection->getConnection();
+        $select = $connection->select()
+            ->from($this->resourceConnection->getTableName('store_group'), ['root_category_id'])
+            // 0 is the "not configured" sentinel (the column is NOT NULL
+            // DEFAULT 0), not a category id.
+            ->where('root_category_id > ?', 0);
+
+        $ids = [];
+        foreach ($connection->fetchCol($select) as $id) {
+            $ids[(int)$id] = true;
+        }
+
+        return $this->storeGroupRootIds = $ids;
+    }
+
+    /**
      * Required category attributes with int backend and no default value —
      * typically third-party "required select" (yes/no) attributes that would
      * otherwise block programmatic category creation with an "attribute
@@ -280,14 +366,30 @@ class Category
      */
     private function joinName(\Magento\Framework\DB\Select $select): \Magento\Framework\DB\Select
     {
+        return $this->joinVarchar($select, 'name', 'name');
+    }
+
+    /**
+     * Join a store-0 varchar attribute value onto a catalog_category_entity
+     * select aliased "e", exposing it under $resultAlias.
+     *
+     * Inner join on purpose: a category with no store-0 row for the attribute has
+     * no default-scope value, and every caller here is asking "what is the
+     * default-scope value" rather than "does a value exist somewhere".
+     */
+    private function joinVarchar(
+        \Magento\Framework\DB\Select $select,
+        string $attributeCode,
+        string $resultAlias
+    ): \Magento\Framework\DB\Select {
         $linkField = $this->getLinkField();
 
         return $select->join(
             ['v' => $this->resourceConnection->getTableName(self::ENTITY_TABLE . '_varchar')],
             sprintf('v.%1$s = e.%1$s', $linkField)
-            . ' AND v.attribute_id = ' . $this->getNameAttributeId()
+            . ' AND v.attribute_id = ' . $this->getAttributeId($attributeCode)
             . ' AND v.store_id = 0',
-            ['name' => 'value']
+            [$resultAlias => 'value']
         );
     }
 
@@ -300,11 +402,6 @@ class Category
         }
 
         return $this->linkField;
-    }
-
-    private function getNameAttributeId(): int
-    {
-        return $this->getAttributeId('name');
     }
 
     /**

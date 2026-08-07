@@ -556,6 +556,15 @@ Authorization: Bearer <integration token>   (ACL: ReadyData_Import::categories)
         {"attribute_code": "meta_title", "value": "Shirts"}
       ],
       "clear_attributes": ["meta_keywords"]
+    },
+    {
+      "category_id": 43,
+      "path": "Default Category/Men/Coats",
+      "parent_path": "Default Category/Women"
+    },
+    {
+      "path": "Default Category/Men/Clearance",
+      "delete": 1
     }
   ],
   "settings": {"store_view_code": "default", "continue_on_error": true}
@@ -563,17 +572,18 @@ Authorization: Bearer <integration token>   (ACL: ReadyData_Import::categories)
 ```
 
 Response: summary counters (`received`, `created`, `updated`, `unchanged`,
-`skipped`, `failed`, `elapsed_ms`) plus a per-category `results` array with the
+`deleted`, `skipped`, `failed`, `elapsed_ms`) plus a per-category `results` array with the
 resolved `path`, the `entity_id`, a `status`, a machine-readable `reason` and
 `messages`. Errors are per category; a failing category does not abort the
 request. Every entry gets exactly one result row, rejected ones included; the
 only case where `results` is shorter than `received` is a payload that sends the
 same category twice, which collapses to one entry with the last one winning.
 
-The endpoint is **purely additive**: a category the caller stops sending is
+Nothing here is inferred from **absence**: a category the caller stops sending is
 never deactivated or deleted. This is deliberately *unlike* the `categories`
 field on the product payload, which has replace semantics. Use `is_active: 0` to
-retire a category.
+retire a category, or `delete: 1` to remove it outright — but only ever because
+the payload said so.
 
 ### Identity: path, plus `category_id` to rename
 
@@ -589,12 +599,16 @@ in which case the ID identifies the category and `path` becomes informational �
 cross-checked against the stored parent, but never a source of the name. **Only
 an explicit `name` renames.** Sending `category_id` with a path you kept on file
 from before a rename therefore updates the other properties and leaves the name
-as it is, rather than reverting it.
+as it is, rather than reverting it. The same holds for the tree: only
+`parent_path`/`parent_category_id` moves a category, so a stale path cannot move
+it back either.
 
 Every result carries `entity_id` once the entry has been matched to a row —
 including refusals like `move_not_supported` — so a caller that is the system of
 record can store it and send it back. It is null only when nothing was
-identified (`ambiguous_path`, `parent_not_found`, a rejected payload).
+identified: `ambiguous_path`, a `parent_not_found` on the entry's *own* path, or a
+rejected payload. (A `parent_not_found` about an unresolvable move *destination*
+does carry it — the category itself was found.)
 
 Two sibling categories sharing a name make a path ambiguous. Reads elsewhere in
 this module resolve that by taking the lowest `entity_id`; a *write* refuses —
@@ -607,6 +621,15 @@ Entries are processed **shallowest path first**, so a parent sent in the same
 request is created and committed before the child that needs it — payload order
 does not matter. Entries addressed only by `category_id` are processed last,
 since they may target something created earlier in the same run.
+
+A created category must have room for its slug. `url_key` is derived from the
+name when the payload omits it, so two differently named siblings can easily want
+the same one — and `url_rewrite` is unique on `(request_path, store_id)`, which
+would otherwise surface as `Could not save category: URL key for specified store
+already exists.` with the other category unnamed. That collision is
+`destination_url_key_taken` instead, carrying the conflicting ID; send an explicit
+`url_key` to place the category anyway. A *name* collision cannot arise on create
+— a sibling already carrying the name is updated rather than duplicated.
 
 Missing parents are **not** created implicitly: a category the caller never
 asked for would get none of the properties they specified and would not appear
@@ -645,7 +668,12 @@ Per category:
   observers, no URL rewrite regeneration, no reindex. A replayed payload is
   therefore genuinely free;
 - **exists, something differs** → **updated**;
-- **exists under a different parent** → `skipped` with `move_not_supported`.
+- **exists under a different parent**, no destination in the payload → `skipped`
+  with `move_not_supported`;
+- **exists under a different parent than `parent_path`/`parent_category_id` says**
+  → **moved**, reported as `updated` (see "Moving a category");
+- **`delete: 1`** → **deleted**, or `unchanged` / `already_absent` when it was
+  already gone (see "Deleting a category").
 
 Values are compared loosely against the stored ones, because EAV round-trips
 everything as a string and a strict comparison would report every flag as
@@ -674,6 +702,121 @@ attributes cannot be cleared (`protected_attribute`) — clearing a required
 attribute makes every later save of that category fail validation, and clearing
 the name or URL key strands its rewrites and its descendants' `url_path`.
 
+### Moving a category
+
+A move is stated, never inferred. `parent_path` (or `parent_category_id`) names
+the parent the category **should** be under; when it differs from the stored one
+the category is reparented, subtree and all. Omit both and the parent is left
+alone — which is what makes a `path` the caller kept on file from before an
+earlier rename or move harmless rather than a silent instruction to undo it. Off
+by default (see Configuration).
+
+```json
+{
+  "categories": [
+    {
+      "category_id": 42,
+      "path": "Default Category/Men/Shirts",
+      "parent_path": "Default Category/Women"
+    }
+  ]
+}
+```
+
+A move **requires `category_id`**, for the same reason a rename does: the moment
+the category lands elsewhere its old path stops identifying it, so a path-only
+move would not survive a replay. Without one the entry is `skipped` with
+`move_requires_category_id`. With one, `path` becomes purely informational and the
+usual `move_not_supported` cross-check is dropped — the path may legitimately be
+either the pre-move or the post-move one, and both replay to `unchanged`.
+
+`parent_category_id` wins when both are given; it is how a caller names a
+destination whose path is ambiguous. `parent_category_id: 1` is the catalog tree
+root and **promotes** the category to a level-1 root; a single-segment
+`parent_path` moves it under that root. Demoting a root is allowed too — a root
+is just a child of the tree root here.
+
+Refusals, in the order they are checked: `store_scope_structural_change` (a move
+is default-scope only — `parent_id`, `path` and `level` are columns with no store
+dimension), `move_disabled`, `parent_not_found` / `unknown_root` /
+`ambiguous_path` for a destination that does not resolve, `move_into_descendant`
+for a destination that is the category itself or inside its own subtree,
+`root_in_use` when the category is some store group's `root_category_id` —
+demoting that would leave the storefront pointing at a non-root — and the two
+destination-collision refusals below.
+
+**The destination must have room for it.** A move whose new parent already holds
+a category with the same name is `destination_name_taken`; one that would collide
+on `url_key` is `destination_url_key_taken`. Both carry the conflicting category's
+ID so the caller can act on it. The same two checks guard a create and a rename,
+so a collision reads the same way whichever operation ran into it.
+
+These are checked up front because the two collisions fail very differently if
+left to the write. `catalog_category_entity` has **no unique key on
+`(parent_id, name)`**, so the name case would simply succeed and leave the path
+permanently ambiguous — refused by every later write to it, and silently resolved
+to the lowest `entity_id` by the product import's path lookup. The `url_key` case
+*does* have a backstop (`url_rewrite` is unique on `(request_path, store_id)`) but
+it only fires from deep inside the save as `UrlAlreadyExistsException`, after a
+nested rollback, naming neither category.
+
+A move re-sequences siblings: the category is appended to the end of its new
+parent's children and the gap it left behind closes. This is the one case where
+the endpoint reorders anything (contrast `position`, which never makes room).
+
+URLs cascade the way a rename's do. Core regenerates the category's rewrites and
+its whole descendant subtree's, plus the rewrites of every product in it, and
+reads `catalog/seo/save_rewrites_history` itself — so old category URLs 301
+rather than 404, with no extra work from this endpoint.
+
+**One move per subtree per request.** Core memoizes a category's children for the
+whole request, and both the move plugin and the rewrite observer read through that
+cache, so a second move or delete *inside* a subtree this request already moved
+would regenerate rewrites from the pre-move tree — wrong URLs, silently. Such an
+entry is `skipped` with `stale_parent_path`; send it in a separate request.
+
+### Deleting a category
+
+`delete: 1` removes a category. Deletion in Magento is **recursive**: the whole
+descendant subtree goes with it, along with every affected category's URL rewrites
+and product assignments. Products themselves are never deleted. Off by default
+(see Configuration).
+
+```json
+{
+  "categories": [
+    {"path": "Default Category/Men/Clearance", "delete": 1},
+    {"category_id": 77, "name": "Old Tree", "delete": 1, "delete_children": 1}
+  ]
+}
+```
+
+Because a wrong path would otherwise remove a whole branch of the catalog,
+deleting a category that still has children needs **`delete_children: 1`** as an
+explicit acknowledgement; without it the entry is `skipped` with `has_children`
+and the child count in `messages`. A delete cannot also set values —
+`invalid_definition` — because a payload that both removes a category and
+describes what it should be has no coherent reading.
+
+Deleting something that is already gone is `unchanged` with `already_absent`,
+not an error: the caller's desired state holds, which keeps a replayed delete
+free. That covers an unresolvable path as well as an unknown `category_id` — if
+the parent is not there, neither is the category. An **ambiguous** path is the
+exception and is refused, since removing a subtree on a guess cannot be undone.
+
+Other refusals: `root_not_writable` for the catalog tree root, `root_in_use` when
+a store group's `root_category_id` points at it (core would throw "Can't delete
+root category."; this reports it cleanly instead), `wrong_store_root`,
+`store_scope_structural_change` (the row is shared by every store, so a delete has
+no store dimension), and `delete_disabled`.
+
+Deletes run **after every other entry**, and among themselves **deepest first**.
+Both orderings matter: creating something under a parent the same request removes
+only reads one way round, and taking a parent before an explicitly requested child
+would leave the child's own entry reporting `already_absent` rather than
+`deleted`. Payload order is irrelevant. A delete and an update of the *same*
+category collapse to one entry in the usual way, with the last one winning.
+
 ### URLs and redirects
 
 Magento only derives a `url_key` when the stored one is empty, so a rename would
@@ -683,6 +826,19 @@ makes the native rewrite cascade regenerate the category and its whole
 descendant subtree. It also sets `save_rewrites_history` from
 `catalog/seo/save_rewrites_history`, so old category URLs 301 instead of 404 —
 the same guarantee the product import gives.
+
+A rename is subject to the same sibling checks a move is: a new name a sibling
+already carries is `destination_name_taken`, and a `url_key` — supplied or derived
+— that a sibling already owns is `destination_url_key_taken` (see "Moving a
+category" for why these are checked rather than left to the write). An explicit
+`url_key` in the payload is what gets checked, not the one the name would derive.
+
+Both checks evaluate **default scope**, which is the scope every structural write
+uses and the scope whose names path resolution matches. A store-scoped write skips
+them: a store-view rename cannot make a store-0 path ambiguous. The gap that
+leaves is a sibling whose `url_key` exists *only* as a store-view override — that
+collision is not predicted here and still surfaces the way it always did, as the
+repository's own exception reported against that category.
 
 Roots are the exception: a root's `url_key` is part of no storefront URL, so core
 generates no rewrites for one and a root rename cascades nothing. The endpoint
@@ -722,20 +878,31 @@ there is no unique key on `(parent_id, name)` to fall back on — two concurrent
 runs would resolve the same missing path, both miss, and both insert.
 
 Each category is processed in its own transaction and reported independently.
+That transaction is what makes a **move** atomic: `changeParent()` re-paths the
+subtree with relative `UPDATE`s, and `Category::move()` wraps them in a
+transaction that nests inside ours, so a failure rolls the whole move back.
+
 Category writes go through the category model, so `catalog_category_flat` and
 `catalog_category_product` are already reindexed by Magento's own commit
 callbacks; the endpoint additionally invalidates `catalogsearch_fulltext` (whose
 documents carry `category_ids`) and registers FPC tags for the touched
-categories **and their descendants**, since a `url_path` change cascades down.
+categories **and their descendants**, since a `url_path` change cascades down. A
+move or delete also tags the **products** in the affected subtree, whose canonical
+URLs are derived from the category path when "Use Categories Path for Product
+URLs" is on. For a delete the subtree is captured *before* the rows go, since
+nothing can derive it afterwards.
+
+One thing a move does that this endpoint does not control: core reindexes
+`catalog_category_product` for the affected paths synchronously, inside our
+transaction, whenever that indexer is in "Update on Save".
 
 ### Limits (v1)
 
-Moving or reparenting a category, deleting one, attaching a root to a store group
-(`store_group.root_category_id`), category images, and assigning products from the
-category side (that is owned by the product payload's `categories` field) are out
-of scope. A payload implying a move is reported, never applied: a move re-paths an
-entire subtree through non-transactional relative updates and needs cycle
-detection this endpoint does not yet have.
+Attaching a root to a store group (`store_group.root_category_id`), category
+images, and assigning products from the category side (that is owned by the
+product payload's `categories` field) are out of scope. Moving and deleting are
+supported but each need their config switch turned on, and a move is limited to
+one per subtree per request (see "Moving a category").
 
 ## What it does today
 
@@ -789,13 +956,19 @@ endpoint is a no-op that reports every attribute as `skipped`/`disabled`. There
 is intentionally no attribute-shape config here — scope, flags and placement are
 supplied per attribute by the caller (the system of record).
 
-The **Categories** group has a single switch, **Enable Category Sync**
-(`readydata_import/categories/enabled`, default **off**), the kill switch for
-the `POST /V1/readydata/categories` endpoint. When off, the endpoint is a no-op
-that reports every category as `skipped`/`disabled` without taking a lock or
-writing anything. It is off by default because creating and renaming categories
-reshapes storefront navigation and category URLs. Note this switch gates only
-the endpoint — the product import's on-demand category creation is unaffected.
+The **Categories** group has three switches, all default **off**:
+
+| Setting | Path | Notes |
+|---|---|---|
+| Enable Category Sync | `readydata_import/categories/enabled` | The kill switch for the whole `POST /V1/readydata/categories` endpoint. When off it is a no-op that reports every category as `skipped`/`disabled` without taking a lock or writing anything. |
+| Allow Category Moves | `readydata_import/categories/allow_move` | Gates reparenting. When off, an entry naming a destination is `skipped`/`move_disabled` and nothing is written. |
+| Allow Category Deletion | `readydata_import/categories/allow_delete` | Gates `delete: 1`. When off, every delete entry is `skipped`/`delete_disabled` before anything is even resolved. |
+
+The endpoint is off by default because creating and renaming categories reshapes
+storefront navigation and category URLs; moves and deletes are gated *again*
+because their blast radius is a whole subtree, and a delete is irreversible.
+Note the master switch gates only the endpoint — the product import's on-demand
+category creation is unaffected.
 
 ### Media gallery
 
@@ -934,7 +1107,33 @@ base for a step that should be registered but inert until it is written.
   plugins and observers DO run for them.
 - Duplicate sibling category names are ambiguous. Path resolution for a *read*
   (product→category assignment) picks the lowest entity_id, deterministically;
-  the category sync endpoint refuses to guess and reports `ambiguous_path`.
+  the category sync endpoint refuses to guess and reports `ambiguous_path`. It
+  also refuses to *create* the situation: a move or rename that would land a
+  category on a sibling's name is `destination_name_taken`, because
+  `catalog_category_entity` has no unique key on `(parent_id, name)` and the write
+  would otherwise succeed and poison that path for good.
+- **A category move re-sequences siblings and reindexes synchronously.** It is
+  appended to the end of its new parent's children (passing no "after" position
+  would instead put it *first* and shift everything up), the gap it left closes,
+  and core reindexes `catalog_category_product` for the affected paths inside our
+  transaction when that indexer is in "Update on Save".
+- **Only one move per subtree per request.** Core's `ChildrenCategoriesProvider`
+  memoizes a category's children for the whole request, and the move plugin and
+  rewrite observer both read through it, so a second structural change inside a
+  just-moved subtree would build rewrites from the old tree. Those entries are
+  refused with `stale_parent_path` rather than silently producing wrong URLs.
+- **Deleting is recursive and irreversible.** The descendant subtree, its URL
+  rewrites and its `catalog_category_product` rows all go; products survive.
+  `delete_children: 1` is required before a non-empty category is removed, and a
+  category some store group has adopted as its root is refused with `root_in_use`
+  (core would throw "Can't delete root category." mid-batch instead).
+- **The sibling-collision guards are the category endpoint's, not the product
+  import's.** `CategoryPathResolver`'s on-demand subtree creation goes through
+  `CategoryWriter::createBare()` and is deliberately left unguarded: it has no
+  per-entry result row to report a refusal into, and its documented contract is
+  to throw so the batch rolls back with the real reason (see the next bullet). A
+  product feed referencing a path whose slug is taken therefore still fails its
+  batch rather than reporting `destination_url_key_taken`.
 - **Category creation now fails its batch instead of being reported per path.**
   A category is created through the repository, which runs its own transaction;
   when that fails inside the import's batch transaction the connection is left

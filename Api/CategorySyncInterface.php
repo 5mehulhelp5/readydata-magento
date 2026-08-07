@@ -21,11 +21,15 @@ use ReadyData\Import\Api\Data\ImportSettingsInterface;
  * nodes with a name; this endpoint owns their properties and reports per-category
  * what happened.
  *
- * Behaviour is create-or-update-to-source, and purely additive: a category the
- * caller stops sending is never deactivated or deleted. Structural changes are
- * deliberately narrow — a missing category below an existing root is created,
- * but roots are never created, and reparenting an existing category is reported
- * rather than applied. Gated by the readydata_import/categories/enabled switch.
+ * Behaviour is create-or-update-to-source, and nothing is ever inferred from
+ * absence: a category the caller stops sending is never deactivated or deleted.
+ * Every structural change is available but each has to be asked for explicitly —
+ * a missing category (including a level-1 root) is created, a category is
+ * reparented only when the payload names a destination through
+ * parent_path/parent_category_id, and one is deleted only on a `delete` flag,
+ * with a second flag before its descendants go with it. Gated by the
+ * readydata_import/categories/enabled switch, with allow_move and allow_delete
+ * gating the two destructive operations separately.
  *
  * @api
  */

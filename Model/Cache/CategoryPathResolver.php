@@ -115,6 +115,23 @@ class CategoryPathResolver
     }
 
     /**
+     * Drop every cached path => ID mapping.
+     *
+     * {@see forget()} handles a rename, where exactly one path changed meaning.
+     * A move or a delete re-paths or removes a whole subtree at once, so the
+     * stale set is "every key under the old location and every key under the
+     * new one" — and for a category addressed by ID we do not even hold the
+     * names needed to build those prefixes. Enumerating them is not worth it:
+     * this cache exists to collapse repeated lookups within one request, and
+     * rebuilding it costs one query per depth level.
+     */
+    public function forgetAllPaths(): void
+    {
+        $this->idByPath = [];
+        $this->createdPaths = [];
+    }
+
+    /**
      * Drop the memoized root map, and optionally everything cached below a root
      * that was just renamed.
      *

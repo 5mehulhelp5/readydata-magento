@@ -52,6 +52,33 @@ class CategoryLink
     }
 
     /**
+     * Products assigned to any of the given categories — the inverse of
+     * {@see getAssignments()}.
+     *
+     * Used for cache invalidation when a category subtree moves or is removed:
+     * with "Use Categories Path for Product URLs" on, those products' canonical
+     * URLs are derived from the category path, so core regenerates their rewrites
+     * and their cached pages go stale.
+     *
+     * @param int[] $categoryIds
+     * @return int[] distinct product entity IDs
+     */
+    public function getProductIdsByCategoryIds(array $categoryIds): array
+    {
+        if (!$categoryIds) {
+            return [];
+        }
+
+        $connection = $this->resourceConnection->getConnection();
+        $select = $connection->select()
+            ->distinct()
+            ->from($this->resourceConnection->getTableName(self::TABLE), ['product_id'])
+            ->where('category_id IN (?)', $categoryIds);
+
+        return array_map('intval', $connection->fetchCol($select));
+    }
+
+    /**
      * No-op upsert: new pairs are inserted with their given position,
      * existing pairs — including admin-set positions — are left untouched.
      *

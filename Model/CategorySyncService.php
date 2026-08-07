@@ -35,11 +35,18 @@ use ReadyData\Import\Model\ResourceModel\Category as CategoryResource;
  * hierarchy forces: entries are processed shallowest-path-first, so a parent
  * sent in the same request is committed before the child that needs it.
  *
- * Structural scope is deliberately narrow. A missing category is created —
- * including a level-1 root, which is simply a child of the catalog tree root
- * here — but reparenting an existing category is reported, not applied, because
- * a move re-paths an entire subtree and needs cycle detection this endpoint does
- * not yet have.
+ * Structural changes are all here, each gated on the caller being explicit about
+ * it. A missing category is created (including a level-1 root, which is simply a
+ * child of the catalog tree root here). A category is reparented only when the
+ * payload names a destination through parent_path/parent_category_id — never
+ * because its `path` disagrees with where it is, since a caller replaying a path
+ * they stored before an earlier rename or move would then undo it. And a category
+ * is deleted only on an explicit `delete` flag, with a second flag required
+ * before its descendants go with it. Moves and deletes each have their own config
+ * switch, both off by default.
+ *
+ * Deletes run after every other entry: a payload that creates something under a
+ * parent it also removes only reads one way round.
  */
 class CategorySyncService
 {
@@ -101,14 +108,22 @@ class CategorySyncService
         }
 
         $results = [];
-        $touchedIds = [];
         $aborted = false;
-        $renamedPaths = [];
-        $connection = $this->resourceConnection->getConnection();
+        $state = self::newState();
+        // Deletes are pulled out and run last: a request that creates a child
+        // under a parent it also deletes only makes sense in that order, and a
+        // caller reorganizing a subtree wants their moves and updates to land
+        // before the old nodes go.
+        [$writeEntries, $deleteEntries] = self::partitionDeletes($entries);
 
         try {
-            foreach ($this->bucketByDepth($entries) as $bucket) {
+            foreach ($this->bucketByDepth($writeEntries) as $bucket) {
                 $parents = $this->resolveParents($bucket);
+                // Where each entry wants its parent to BE, as opposed to where
+                // its path says it currently is. Resolved per bucket for the
+                // same reason parents are: a destination created in a shallower
+                // bucket is already committed and must be visible.
+                $destinations = $this->resolveDestinations($bucket);
                 // One children-by-name query for the whole bucket instead of
                 // one per entry, dropped again as soon as an entry writes:
                 // a rename inside this bucket can move a name from one ID to
@@ -117,15 +132,10 @@ class CategorySyncService
 
                 foreach ($bucket as $entry) {
                     if ($aborted) {
-                        $results[] = $this->result(
-                            $entry,
-                            CategorySyncResultInterface::STATUS_SKIPPED,
-                            CategorySyncResultInterface::REASON_ABORTED,
-                            ['An earlier category failed and continue_on_error is off.']
-                        );
+                        $results[] = $this->abortedResult($entry);
                         continue;
                     }
-                    if ($this->hasRenamedAncestor($entry, $renamedPaths)) {
+                    if ($this->hasRenamedAncestor($entry, $state['renamedPaths'])) {
                         $results[] = $this->result(
                             $entry,
                             CategorySyncResultInterface::STATUS_SKIPPED,
@@ -138,41 +148,38 @@ class CategorySyncService
 
                     $siblings ??= $this->loadSiblings($parents);
 
-                    // One transaction per category: a failure leaves no
-                    // half-written category, and the rollBack in the catch is
-                    // what clears the connection's partial-rollback flag after
-                    // a repository save failed inside it.
-                    $connection->beginTransaction();
-                    try {
-                        $result = $this->processOne(
+                    // `use (&$state)`, not an arrow function: an arrow function
+                    // captures by value, which would hand processOne() a copy and
+                    // silently drop every move's subtree bookkeeping.
+                    $result = $this->inTransaction(
+                        $entry,
+                        function () use (
                             $entry,
                             $parents,
+                            $destinations,
                             $siblings,
                             $storeId,
                             $storeRootId,
-                            $renamedPaths
-                        );
-                        $connection->commit();
-                    } catch (\Throwable $e) {
-                        $this->rollBackQuietly($connection);
-                        $this->logger->error(
-                            sprintf('Category "%s" sync failed: %s', $entry['label'], $e->getMessage()),
-                            ['exception' => $e]
-                        );
-                        $result = $this->result(
-                            $entry,
-                            CategorySyncResultInterface::STATUS_ERROR,
-                            null,
-                            [sprintf('Sync failed: %s', $e->getMessage())]
-                        );
-                    }
+                            &$state
+                        ): CategorySyncResultInterface {
+                            return $this->processOne(
+                                $entry,
+                                $parents,
+                                $destinations,
+                                $siblings,
+                                $storeId,
+                                $storeRootId,
+                                $state
+                            );
+                        }
+                    );
 
                     if (in_array(
                         $result->getStatus(),
                         [CategorySyncResultInterface::STATUS_CREATED, CategorySyncResultInterface::STATUS_UPDATED],
                         true
                     )) {
-                        $touchedIds[] = (int)$result->getEntityId();
+                        $state['touched'][] = (int)$result->getEntityId();
                         $siblings = null;
                     }
                     if ($result->getStatus() === CategorySyncResultInterface::STATUS_ERROR && !$continueOnError) {
@@ -181,28 +188,129 @@ class CategorySyncService
                     $results[] = $result;
                 }
             }
+
+            foreach (
+                $this->processDeletes(
+                    $deleteEntries,
+                    $storeId,
+                    $storeRootId,
+                    $continueOnError,
+                    $aborted,
+                    $state
+                ) as $result
+            ) {
+                $results[] = $result;
+            }
         } finally {
             $this->lockManager->unlock(self::LOCK_NAME);
             // In the finally, not after it: every category here is already
             // committed, so if a later bucket throws, skipping invalidation
             // would leave the storefront serving stale pages for work that
             // did land.
-            $this->invalidate($touchedIds);
+            $this->invalidate($state['touched'], $state['removed']);
         }
 
         $response = $this->buildResponse($received, $results, $startedAt);
         $this->logger->info(sprintf(
-            'Category sync finished: %d received, %d created, %d updated, %d unchanged, %d skipped, %d failed in %d ms',
+            'Category sync finished: %d received, %d created, %d updated, %d unchanged, %d deleted,'
+            . ' %d skipped, %d failed in %d ms',
             $response->getReceived(),
             $response->getCreated(),
             $response->getUpdated(),
             $response->getUnchanged(),
+            $response->getDeleted(),
             $response->getSkipped(),
             $response->getFailed(),
             $response->getElapsedMs()
         ));
 
         return $response;
+    }
+
+    /**
+     * Mutable per-request bookkeeping, threaded by reference rather than held on
+     * the (shared) service instance.
+     *
+     * - `touched`: categories written, for indexer/FPC invalidation.
+     * - `removed`: categories deleted, already expanded to their pre-delete
+     *   subtree — the rows are gone afterwards, so nothing can rebuild it.
+     * - `movedSubtrees`: every id that was inside a subtree this request moved.
+     * - `renamedPaths`: canonical paths whose meaning changed, for
+     *   {@see hasRenamedAncestor()}.
+     *
+     * @return array{touched: int[], removed: int[], movedSubtrees: array<int, true>,
+     *     renamedPaths: array<string, true>}
+     */
+    private static function newState(): array
+    {
+        return ['touched' => [], 'removed' => [], 'movedSubtrees' => [], 'renamedPaths' => []];
+    }
+
+    /**
+     * Split the entries into the ones that write values and the ones that delete.
+     *
+     * A rejected entry stays on the write side whatever its `delete` flag says:
+     * its payload never passed validation, so the flag is not to be trusted, and
+     * the write loop is what already reports validation failures.
+     *
+     * @param array<int, array{definition: ?CategoryDefinitionInterface, error: ?array, ...}> $entries
+     * @return array{0: array<int, array{...}>, 1: array<int, array{...}>}
+     */
+    private static function partitionDeletes(array $entries): array
+    {
+        $writes = [];
+        $deletes = [];
+        foreach ($entries as $entry) {
+            if ($entry['error'] === null && $entry['definition']->getDelete() === 1) {
+                $deletes[] = $entry;
+                continue;
+            }
+            $writes[] = $entry;
+        }
+
+        return [$writes, $deletes];
+    }
+
+    /**
+     * One transaction per category: a failure leaves no half-written category,
+     * and the rollBack in the catch is what clears the connection's
+     * partial-rollback flag after a repository save failed inside it.
+     *
+     * @param callable():CategorySyncResultInterface $work
+     */
+    private function inTransaction(array $entry, callable $work): CategorySyncResultInterface
+    {
+        $connection = $this->resourceConnection->getConnection();
+        $connection->beginTransaction();
+        try {
+            $result = $work();
+            $connection->commit();
+
+            return $result;
+        } catch (\Throwable $e) {
+            $this->rollBackQuietly($connection);
+            $this->logger->error(
+                sprintf('Category "%s" sync failed: %s', $entry['label'], $e->getMessage()),
+                ['exception' => $e]
+            );
+
+            return $this->result(
+                $entry,
+                CategorySyncResultInterface::STATUS_ERROR,
+                null,
+                [sprintf('Sync failed: %s', $e->getMessage())]
+            );
+        }
+    }
+
+    private function abortedResult(array $entry): CategorySyncResultInterface
+    {
+        return $this->result(
+            $entry,
+            CategorySyncResultInterface::STATUS_SKIPPED,
+            CategorySyncResultInterface::REASON_ABORTED,
+            ['An earlier category failed and continue_on_error is off.']
+        );
     }
 
     /**
@@ -216,16 +324,20 @@ class CategorySyncService
      * @param array<string, array{id: ?int, root_id: ?int, reason: ?string, message: ?string}> $parents
      *        entry key => resolved parent, with the reason when it did not resolve
      * @param array<int, array<string, int[]>> $siblings parent_id => [name => entity_id[]]
+     * @param array<string, array{id: ?int, reason: ?string, message: ?string, label: string}> $destinations
+     *        entry key => requested new parent, absent when the entry asked for none
      * @param int|null $storeRootId root category of the target store view, null at default scope
-     * @param array<string, true> $renamedPaths by reference; records renames for later entries
+     * @param array{touched: int[], removed: int[], movedSubtrees: array<int, true>,
+     *     renamedPaths: array<string, true>} $state by reference
      */
     private function processOne(
         array $entry,
         array $parents,
+        array $destinations,
         array $siblings,
         int $storeId,
         ?int $storeRootId,
-        array &$renamedPaths
+        array &$state
     ): CategorySyncResultInterface {
         if ($entry['error'] !== null) {
             return $this->result(
@@ -267,13 +379,18 @@ class CategorySyncService
                     $categoryId
                 );
             }
-            if ($parentId !== null && $parentId !== $row['parent_id']) {
+            $destination = $destinations[$entry['key']] ?? null;
+            // With no destination in the payload the path is still a cross-check,
+            // and a mismatch is the same refusal it always was: nobody asked us
+            // to reparent anything, so a path that disagrees is a discrepancy to
+            // report rather than an instruction to act on.
+            if ($destination === null && $parentId !== null && $parentId !== $row['parent_id']) {
                 return $this->skip(
                     $entry,
                     CategorySyncResultInterface::REASON_MOVE_NOT_SUPPORTED,
                     sprintf(
                         'The category is under parent %d but the path implies parent %d.'
-                        . ' Moving a category is not supported.',
+                        . ' Send parent_path or parent_category_id to move it.',
                         $row['parent_id'],
                         $parentId
                     ),
@@ -289,14 +406,63 @@ class CategorySyncService
                 return $refusal;
             }
 
+            $moved = false;
+            if ($destination !== null) {
+                $refusal = $this->applyMove(
+                    $entry,
+                    $row,
+                    $destination,
+                    $storeId,
+                    $messages,
+                    $moved,
+                    $state
+                );
+                if ($refusal !== null) {
+                    return $refusal;
+                }
+            }
+
+            // A rename can collide with a sibling exactly as a move can. Skipped
+            // when the move above already checked this parent, and at store
+            // scope, where the store-0 names path resolution uses are untouched.
+            if (!$moved && $storeId === 0) {
+                $refusal = $this->refuseSiblingConflict($entry, $categoryId, $row['parent_id'], false);
+                if ($refusal !== null) {
+                    return $refusal;
+                }
+            }
+
             return $this->applyUpdate(
                 $entry,
                 $categoryId,
                 $name,
                 $storeId,
+                // Re-read from the row, which applyMove() has updated: a move to
+                // or from level 1 changes whether this is a root, and
+                // applyUpdate() uses that to decide whether a rename has to
+                // invalidate the resolver's root map.
                 $row['level'] === 1,
                 $messages,
-                $renamedPaths
+                $state,
+                $moved
+            );
+        }
+
+        $destination = $destinations[$entry['key']] ?? null;
+        if ($destination !== null) {
+            // A move needs a stable identity, and a path is not one across a
+            // move: the moment the category lands somewhere else, the path that
+            // addressed it resolves to nothing (or worse, to a different
+            // category someone created in the meantime). Same reasoning as
+            // rename_requires_category_id.
+            return $this->skip(
+                $entry,
+                CategorySyncResultInterface::REASON_MOVE_REQUIRES_CATEGORY_ID,
+                sprintf(
+                    'Moving a category to "%s" requires category_id: after the move its old path no longer'
+                    . ' identifies it.',
+                    $destination['label']
+                )
             );
         }
 
@@ -360,6 +526,17 @@ class CategorySyncService
                 );
             }
 
+            // The name is free here by construction — a sibling carrying it would
+            // have been updated instead of reaching this branch — but the slug is
+            // not: it is derived from the name, so two differently named siblings
+            // can want the same one. Left to the save that is an opaque
+            // "URL key for specified store already exists" with the other
+            // category unnamed.
+            $conflict = $this->writer->findNewChildConflict($parentId, $leafName, $definition);
+            if ($conflict !== null) {
+                return $this->conflictRefusal($entry, $conflict, $parentId, null);
+            }
+
             $entityId = $this->writer->create($parentId, $leafName, $definition, $messages);
             if ($isRoot) {
                 // A new root changes the name => ID map the resolver memoizes
@@ -381,6 +558,15 @@ class CategorySyncService
             return $refusal;
         }
 
+        // A path-identified entry cannot rename (that needs category_id), but it
+        // can still hand over a url_key a sibling already uses.
+        if ($storeId === 0) {
+            $refusal = $this->refuseSiblingConflict($entry, (int)$matchedId, $parentId, false);
+            if ($refusal !== null) {
+                return $refusal;
+            }
+        }
+
         return $this->applyUpdate(
             $entry,
             (int)$matchedId,
@@ -388,7 +574,7 @@ class CategorySyncService
             $storeId,
             $isRoot,
             $messages,
-            $renamedPaths
+            $state
         );
     }
 
@@ -446,9 +632,269 @@ class CategorySyncService
     }
 
     /**
+     * Reparent a category, or refuse to.
+     *
+     * Returns null when the move was applied (or was a no-op because the
+     * category is already there), so the caller can go on to apply the entry's
+     * attribute values; returns the refusal otherwise.
+     *
+     * Ordered so the refusals a caller can act on come before the ones they
+     * cannot: what they asked for is impossible (cycle), then not permitted
+     * (scope, switch, store root), then not resolvable.
+     *
+     * @param array{entity_id: int, parent_id: int, level: int, path: string} $row stored category,
+     *        by reference: a move changes parent_id and level, and the caller
+     *        decides from the updated level whether this is still a root
+     * @param array{id: ?int, reason: ?string, message: ?string, label: string} $destination
+     * @param string[] $messages by reference
+     * @param bool $moved by reference; set when a move was actually applied, so the
+     *        entry reports "updated" even when no attribute value differed
+     * @param array{touched: int[], removed: int[], movedSubtrees: array<int, true>,
+     *     renamedPaths: array<string, true>} $state by reference
+     */
+    private function applyMove(
+        array $entry,
+        array &$row,
+        array $destination,
+        int $storeId,
+        array &$messages,
+        bool &$moved,
+        array &$state
+    ): ?CategorySyncResultInterface {
+        $categoryId = $row['entity_id'];
+        $newParentId = $destination['id'];
+
+        // Already where it should be. Not a move, not a message — this is the
+        // replayed-payload case and it has to stay free.
+        if ($newParentId !== null && $newParentId === $row['parent_id']) {
+            return null;
+        }
+
+        if ($storeId !== 0) {
+            return $this->skip(
+                $entry,
+                CategorySyncResultInterface::REASON_STORE_SCOPE_STRUCTURAL_CHANGE,
+                'A category can only be moved at default scope: parent_id, path and level are columns with no'
+                . ' store dimension. Omit store_view_code to move it.',
+                $categoryId
+            );
+        }
+        if (!$this->config->isCategoryMoveAllowed()) {
+            return $this->skip(
+                $entry,
+                CategorySyncResultInterface::REASON_MOVE_DISABLED,
+                'Category moves are disabled in configuration.',
+                $categoryId
+            );
+        }
+        if ($newParentId === null) {
+            return $this->skip(
+                $entry,
+                $destination['reason'] ?? CategorySyncResultInterface::REASON_PARENT_NOT_FOUND,
+                $destination['message']
+                    ?? sprintf('The destination parent "%s" could not be resolved.', $destination['label']),
+                $categoryId
+            );
+        }
+
+        $destinationRow = $this->categoryResource->getExistingByIds([$newParentId])[$newParentId] ?? null;
+        if ($destinationRow === null) {
+            return $this->skip(
+                $entry,
+                CategorySyncResultInterface::REASON_PARENT_NOT_FOUND,
+                sprintf('Destination parent ID %d does not exist.', $newParentId),
+                $categoryId
+            );
+        }
+        // Moving a category under itself or under one of its own descendants
+        // would detach the subtree from the tree entirely — the path REPLACE()
+        // would build a cycle no walk can leave. Core's Category::move() catches
+        // only the equal-IDs case, and CategoryManagement::move() (which does
+        // check this) reports every failure as "Could not move category".
+        if ($newParentId === $categoryId || str_starts_with($destinationRow['path'], $row['path'] . '/')) {
+            return $this->skip(
+                $entry,
+                CategorySyncResultInterface::REASON_MOVE_INTO_DESCENDANT,
+                $newParentId === $categoryId
+                    ? 'A category cannot be moved under itself.'
+                    : sprintf(
+                        'Destination parent %d is a descendant of category %d; a category cannot be moved'
+                        . ' into its own subtree.',
+                        $newParentId,
+                        $categoryId
+                    ),
+                $categoryId
+            );
+        }
+        if (isset($this->categoryResource->getStoreGroupRootCategoryIds()[$categoryId])) {
+            return $this->skip(
+                $entry,
+                CategorySyncResultInterface::REASON_ROOT_IN_USE,
+                sprintf(
+                    'Category %d is the root category of a store group; moving it would leave that storefront'
+                    . ' pointing at a category that is no longer a root.',
+                    $categoryId
+                ),
+                $categoryId
+            );
+        }
+        if (isset($state['movedSubtrees'][$categoryId])) {
+            return $this->staleAfterMove($entry, $categoryId);
+        }
+        // The destination may already hold a category of this name or slug. Left
+        // to the write, the name case succeeds and quietly makes the path
+        // ambiguous forever, and the slug case throws from deep inside the save.
+        $refusal = $this->refuseSiblingConflict($entry, $categoryId, $newParentId, true);
+        if ($refusal !== null) {
+            return $refusal;
+        }
+
+        // Captured before the write: afterwards the subtree hangs off a different
+        // path, and these are the pages whose url_path just changed.
+        $subtreeIds = array_merge(
+            [$categoryId],
+            $this->categoryResource->getDescendantIds([$categoryId])
+        );
+
+        $this->writer->move($categoryId, $newParentId);
+
+        $messages[] = sprintf('Moved from parent %d to parent %d.', $row['parent_id'], $newParentId);
+        if ($destinationRow['level'] === 0) {
+            $messages[] = 'The category is now a level-1 root and has no storefront presence until a store'
+                . ' group points at it.';
+        }
+        if ($row['level'] === 1) {
+            $messages[] = 'The category is no longer a root.';
+        }
+
+        // Both parents' children lists changed, and the whole subtree was
+        // re-pathed.
+        $state['touched'] = array_merge($state['touched'], $subtreeIds, [$row['parent_id'], $newParentId]);
+        foreach ($subtreeIds as $subtreeId) {
+            $state['movedSubtrees'][$subtreeId] = true;
+        }
+        // Every cached path under the old location, and every cached path under
+        // the new one, now resolves to the wrong node.
+        $this->pathResolver->forgetAllPaths();
+        if ($row['level'] === 1 || $destinationRow['level'] === 0) {
+            $this->pathResolver->forgetRoots();
+        }
+        if ($entry['segments'] !== []) {
+            $state['renamedPaths'][PathParser::buildKey($entry['segments'])] = true;
+        }
+        // The row the caller goes on to update now sits somewhere else.
+        $row['parent_id'] = $newParentId;
+        $row['level'] = $destinationRow['level'] + 1;
+        $moved = true;
+
+        return null;
+    }
+
+    /**
+     * Refuse a write that would land a category on a name or slug a sibling under
+     * $parentId already holds.
+     *
+     * Covers both ways of arriving at one: a **move** (the name it already has,
+     * under a new parent) and a **rename or explicit url_key** (a new name, under
+     * the parent it is already in). Default scope only — see
+     * {@see CategoryWriter::findSiblingConflict()} for what that does and does not
+     * catch.
+     *
+     * @param bool $moved whether the category is arriving from another parent
+     */
+    private function refuseSiblingConflict(
+        array $entry,
+        int $entityId,
+        int $parentId,
+        bool $moved
+    ): ?CategorySyncResultInterface {
+        $name = $entry['definition']->getName() !== null
+            ? trim((string)$entry['definition']->getName())
+            : null;
+
+        $conflict = $this->writer->findSiblingConflict(
+            $entityId,
+            $parentId,
+            $name,
+            $entry['definition'],
+            $moved
+        );
+
+        return $conflict !== null
+            ? $this->conflictRefusal($entry, $conflict, $parentId, $entityId)
+            : null;
+    }
+
+    /**
+     * Turn a sibling conflict into its refusal. Shared by the create, move and
+     * rename paths, so the same collision reads the same way whichever of them
+     * ran into it.
+     *
+     * @param array{kind: string, value: string, category_id: int} $conflict
+     * @param int|null $entityId null when the category does not exist yet
+     */
+    private function conflictRefusal(
+        array $entry,
+        array $conflict,
+        int $parentId,
+        ?int $entityId
+    ): CategorySyncResultInterface {
+        if ($conflict['kind'] === 'name') {
+            return $this->skip(
+                $entry,
+                CategorySyncResultInterface::REASON_DESTINATION_NAME_TAKEN,
+                sprintf(
+                    'Category %d under parent %d is already named "%s"; a second category with that name there'
+                    . ' would make the path ambiguous for every later write and for product assignment.'
+                    . ' Rename or remove one of them first.',
+                    $conflict['category_id'],
+                    $parentId,
+                    $conflict['value']
+                ),
+                $entityId
+            );
+        }
+
+        return $this->skip(
+            $entry,
+            CategorySyncResultInterface::REASON_DESTINATION_URL_KEY_TAKEN,
+            sprintf(
+                'url_key "%s" is already used by category %d under parent %d; the two would generate the same'
+                . ' URL. Send a different url_key, or rename or remove the other category first.',
+                $conflict['value'],
+                $conflict['category_id'],
+                $parentId
+            ),
+            $entityId
+        );
+    }
+
+    /**
+     * Core's ChildrenCategoriesProvider memoizes a category's children for the
+     * whole request, and both the move plugin and the URL rewrite observer read
+     * through it. So a second structural change inside a subtree this request
+     * already moved would regenerate rewrites from the pre-move children — wrong
+     * URLs, silently, with no error anywhere. There is no reset to call, so the
+     * only honest answer is to refuse and let the caller send it separately.
+     */
+    private function staleAfterMove(array $entry, int $entityId): CategorySyncResultInterface
+    {
+        return $this->skip(
+            $entry,
+            CategorySyncResultInterface::REASON_STALE_PARENT_PATH,
+            'This category is inside a subtree that was moved earlier in this request; send it in a separate'
+            . ' request so its URL rewrites are generated from the new tree.',
+            $entityId
+        );
+    }
+
+    /**
      * @param bool $isRoot whether the target is a level-1 root
      * @param string[] $messages
-     * @param array<string, true> $renamedPaths
+     * @param array{touched: int[], removed: int[], movedSubtrees: array<int, true>,
+     *     renamedPaths: array<string, true>} $state by reference
+     * @param bool $moved whether this entry already moved the category, which is a
+     *        change in its own right even when no attribute value differs
      */
     private function applyUpdate(
         array $entry,
@@ -457,7 +903,8 @@ class CategorySyncService
         int $storeId,
         bool $isRoot,
         array $messages,
-        array &$renamedPaths
+        array &$state,
+        bool $moved = false
     ): CategorySyncResultInterface {
         $changed = $this->writer->update($entityId, $name, $entry['definition'], $storeId, $messages);
 
@@ -476,7 +923,7 @@ class CategorySyncService
                 // would resolve to the wrong node.
                 $pathKey = PathParser::buildKey($entry['segments']);
                 $this->pathResolver->forget($pathKey);
-                $renamedPaths[$pathKey] = true;
+                $state['renamedPaths'][$pathKey] = true;
             }
             if ($isRoot) {
                 // forget() above cannot reach a root: single-segment paths are
@@ -492,7 +939,9 @@ class CategorySyncService
 
         return $this->result(
             $entry,
-            $changed ? CategorySyncResultInterface::STATUS_UPDATED : CategorySyncResultInterface::STATUS_UNCHANGED,
+            $changed || $moved
+                ? CategorySyncResultInterface::STATUS_UPDATED
+                : CategorySyncResultInterface::STATUS_UNCHANGED,
             null,
             $messages
         )->setEntityId($entityId);
@@ -606,6 +1055,423 @@ class CategorySyncService
         }
 
         return $parents;
+    }
+
+    /**
+     * Run the delete entries, deepest first.
+     *
+     * Ordering matters only for a payload that names both a parent and something
+     * beneath it: Magento's delete is recursive, so taking the parent first would
+     * leave the child's own entry reporting `already_absent` — true, but less
+     * useful than telling the caller each category they asked about was removed.
+     *
+     * @param array<int, array{...}> $deleteEntries
+     * @param bool $aborted by reference; shared with the write phase
+     * @param array{touched: int[], removed: int[], movedSubtrees: array<int, true>,
+     *     renamedPaths: array<string, true>} $state by reference
+     * @return CategorySyncResultInterface[]
+     */
+    private function processDeletes(
+        array $deleteEntries,
+        int $storeId,
+        ?int $storeRootId,
+        bool $continueOnError,
+        bool &$aborted,
+        array &$state
+    ): array {
+        if (!$deleteEntries) {
+            return [];
+        }
+
+        // Checked before anything is resolved, so a payload sent against an
+        // instance that does not allow deletion reports one uniform reason
+        // instead of a per-entry mix of tree findings. Mirrors how the endpoint's
+        // own master switch behaves.
+        if (!$this->config->isCategoryDeleteAllowed()) {
+            return array_map(
+                fn (array $entry): CategorySyncResultInterface => $this->result(
+                    $entry,
+                    CategorySyncResultInterface::STATUS_SKIPPED,
+                    CategorySyncResultInterface::REASON_DELETE_DISABLED,
+                    ['Category deletion is disabled in configuration.']
+                ),
+                $deleteEntries
+            );
+        }
+
+        $targets = $this->resolveDeleteTargets($deleteEntries, $storeId, $storeRootId);
+        // Deepest first. Entries that resolved to nothing keep their place — they
+        // do no work and their result is already decided.
+        usort(
+            $targets,
+            static fn (array $a, array $b): int => ($b['row']['level'] ?? -1) <=> ($a['row']['level'] ?? -1)
+        );
+
+        $results = [];
+        foreach ($targets as $target) {
+            $entry = $target['entry'];
+
+            if ($target['result'] !== null) {
+                $results[] = $target['result'];
+                continue;
+            }
+            if ($aborted) {
+                $results[] = $this->abortedResult($entry);
+                continue;
+            }
+
+            // By reference, for the same reason the write loop's closure is.
+            $result = $this->inTransaction(
+                $entry,
+                function () use ($entry, $target, &$state): CategorySyncResultInterface {
+                    return $this->deleteOne($entry, $target['row'], $state);
+                }
+            );
+
+            if ($result->getStatus() === CategorySyncResultInterface::STATUS_ERROR && !$continueOnError) {
+                $aborted = true;
+            }
+            $results[] = $result;
+        }
+
+        return $results;
+    }
+
+    /**
+     * Match each delete entry to the stored row it names, or to the result that
+     * settles it without a write.
+     *
+     * An entry whose path cannot be resolved is `already_absent` rather than
+     * `parent_not_found`: if the parent is not there, neither is the category, and
+     * the caller's desired state already holds. Ambiguity is the exception — two
+     * candidates mean we do not know which one to remove, and removing a subtree
+     * on a guess is not recoverable.
+     *
+     * @param array<int, array{...}> $deleteEntries
+     * @return array<int, array{entry: array, row: ?array, result: ?CategorySyncResultInterface}>
+     */
+    private function resolveDeleteTargets(array $deleteEntries, int $storeId, ?int $storeRootId): array
+    {
+        $parents = $this->resolveParents($deleteEntries);
+        $siblings = $this->loadSiblings($parents);
+
+        $pending = [];
+        $idsToLoad = [];
+        foreach ($deleteEntries as $entry) {
+            $definition = $entry['definition'];
+            $categoryId = $definition->getCategoryId();
+
+            if ($categoryId !== null && $categoryId > 0) {
+                $pending[] = ['entry' => $entry, 'id' => $categoryId, 'result' => null];
+                $idsToLoad[] = $categoryId;
+                continue;
+            }
+
+            $segments = $entry['segments'];
+            $parent = $parents[$entry['key']] ?? [];
+            $parentId = $parent['id'] ?? null;
+            if ($parentId === null) {
+                $pending[] = [
+                    'entry' => $entry,
+                    'id' => null,
+                    'result' => $this->alreadyAbsent($entry, $entry['label']),
+                ];
+                continue;
+            }
+
+            $leafName = (string)end($segments);
+            $matches = $siblings[$parentId][$leafName] ?? [];
+            if (count($matches) > 1) {
+                $pending[] = [
+                    'entry' => $entry,
+                    'id' => null,
+                    'result' => $this->skip(
+                        $entry,
+                        CategorySyncResultInterface::REASON_AMBIGUOUS_PATH,
+                        sprintf(
+                            '%d categories named "%s" share this parent (IDs %s); send category_id to say which'
+                            . ' one to delete.',
+                            count($matches),
+                            $leafName,
+                            implode(', ', $matches)
+                        )
+                    ),
+                ];
+                continue;
+            }
+            if ($matches === []) {
+                $pending[] = [
+                    'entry' => $entry,
+                    'id' => null,
+                    'result' => $this->alreadyAbsent($entry, $entry['label']),
+                ];
+                continue;
+            }
+
+            $pending[] = ['entry' => $entry, 'id' => (int)$matches[0], 'result' => null];
+            $idsToLoad[] = (int)$matches[0];
+        }
+
+        $rows = $this->categoryResource->getExistingByIds(array_values(array_unique($idsToLoad)));
+
+        $targets = [];
+        foreach ($pending as $item) {
+            if ($item['result'] !== null) {
+                $targets[] = ['entry' => $item['entry'], 'row' => null, 'result' => $item['result']];
+                continue;
+            }
+
+            $row = $rows[$item['id']] ?? null;
+            if ($row === null) {
+                $targets[] = [
+                    'entry' => $item['entry'],
+                    'row' => null,
+                    'result' => $this->alreadyAbsent($item['entry'], sprintf('#%d', $item['id'])),
+                ];
+                continue;
+            }
+
+            // Scope and tree refusals are decided here so they keep the ordering
+            // the write path uses: wrong_store_root ahead of
+            // store_scope_structural_change, both after the category is known.
+            $result = null;
+            if ($row['level'] < 1) {
+                $result = $this->skip(
+                    $item['entry'],
+                    CategorySyncResultInterface::REASON_ROOT_NOT_WRITABLE,
+                    'The catalog tree root is not a category and cannot be deleted.',
+                    $item['id']
+                );
+            } elseif ($storeRootId !== null && $this->rootIdOfPath($row['path']) !== $storeRootId) {
+                $result = $this->wrongStoreRoot(
+                    $item['entry'],
+                    $this->rootIdOfPath($row['path']),
+                    $storeRootId,
+                    $item['id']
+                );
+            } elseif ($storeId !== 0) {
+                $result = $this->skip(
+                    $item['entry'],
+                    CategorySyncResultInterface::REASON_STORE_SCOPE_STRUCTURAL_CHANGE,
+                    'A category can only be deleted at default scope: the row is shared by every store.'
+                    . ' Omit store_view_code to delete it.',
+                    $item['id']
+                );
+            }
+
+            $targets[] = ['entry' => $item['entry'], 'row' => $row, 'result' => $result];
+        }
+
+        return $targets;
+    }
+
+    /**
+     * Delete one already-identified category, or refuse.
+     *
+     * @param array{entity_id: int, parent_id: int, level: int, path: string} $row
+     * @param array{touched: int[], removed: int[], movedSubtrees: array<int, true>,
+     *     renamedPaths: array<string, true>} $state by reference
+     */
+    private function deleteOne(array $entry, array $row, array &$state): CategorySyncResultInterface
+    {
+        $entityId = $row['entity_id'];
+
+        if (isset($this->categoryResource->getStoreGroupRootCategoryIds()[$entityId])) {
+            return $this->skip(
+                $entry,
+                CategorySyncResultInterface::REASON_ROOT_IN_USE,
+                sprintf(
+                    'Category %d is the root category of a store group; deleting it would leave that storefront'
+                    . ' with no catalog. Repoint the store group first.',
+                    $entityId
+                ),
+                $entityId
+            );
+        }
+        if (isset($state['movedSubtrees'][$entityId])) {
+            return $this->staleAfterMove($entry, $entityId);
+        }
+
+        // Captured before the delete for two reasons: the guard below needs the
+        // count, and afterwards there is nothing left to derive the stale cache
+        // entries from.
+        $descendantIds = $this->categoryResource->getDescendantIds([$entityId]);
+        if ($descendantIds !== [] && $entry['definition']->getDeleteChildren() !== 1) {
+            return $this->skip(
+                $entry,
+                CategorySyncResultInterface::REASON_HAS_CHILDREN,
+                sprintf(
+                    'Category %d has %d categories beneath it, which a delete would remove too;'
+                    . ' send delete_children: 1 to confirm.',
+                    $entityId,
+                    count($descendantIds)
+                ),
+                $entityId
+            );
+        }
+
+        $this->writer->delete($entityId);
+
+        $messages = [];
+        if ($descendantIds !== []) {
+            $messages[] = sprintf('Deleted with %d categories beneath it.', count($descendantIds));
+        }
+        $messages[] = 'Product assignments to the deleted categories were removed; the products themselves'
+            . ' were not.';
+
+        $state['removed'] = array_merge($state['removed'], [$entityId], $descendantIds);
+        // The parent's children list changed.
+        $state['touched'][] = $row['parent_id'];
+        $this->pathResolver->forgetAllPaths();
+        if ($row['level'] === 1) {
+            $this->pathResolver->forgetRoots();
+        }
+        if ($entry['segments'] !== []) {
+            $state['renamedPaths'][PathParser::buildKey($entry['segments'])] = true;
+        }
+
+        return $this->result($entry, CategorySyncResultInterface::STATUS_DELETED, null, $messages)
+            ->setEntityId($entityId);
+    }
+
+    /**
+     * A delete with nothing to delete. Reported as `unchanged` rather than
+     * `skipped`: the caller asked for the category to be gone and it is, which is
+     * what keeps a replayed delete free.
+     */
+    private function alreadyAbsent(array $entry, string $label): CategorySyncResultInterface
+    {
+        return $this->result(
+            $entry,
+            CategorySyncResultInterface::STATUS_UNCHANGED,
+            CategorySyncResultInterface::REASON_ALREADY_ABSENT,
+            [sprintf('Category "%s" does not exist; nothing to delete.', $label)]
+        );
+    }
+
+    /**
+     * Resolve the parent each entry wants to END UP under, for the entries that
+     * asked for one. Entries with no `parent_path`/`parent_category_id` are absent
+     * from the result, which is what "leave the parent alone" looks like — an
+     * entry present with a null id asked for a destination we could not find.
+     *
+     * `parent_category_id` wins over `parent_path`: it is the way to name a
+     * destination whose path is ambiguous, so consulting the path as well would
+     * defeat the point.
+     *
+     * @param array<int, array{definition: ?CategoryDefinitionInterface, key: string, ...}> $bucket
+     * @return array<string, array{id: ?int, reason: ?string, message: ?string, label: string}>
+     */
+    private function resolveDestinations(array $bucket): array
+    {
+        $destinations = [];
+        $deepPaths = [];
+        $deepByEntryKey = [];
+        $roots = null;
+
+        foreach ($bucket as $entry) {
+            if ($entry['error'] !== null) {
+                continue;
+            }
+            $definition = $entry['definition'];
+
+            $parentCategoryId = $definition->getParentCategoryId();
+            if ($parentCategoryId !== null && $parentCategoryId > 0) {
+                $destinations[$entry['key']] = [
+                    'id' => $parentCategoryId,
+                    'reason' => null,
+                    'message' => null,
+                    'label' => sprintf('#%d', $parentCategoryId),
+                ];
+                continue;
+            }
+
+            try {
+                $segments = $this->validator->validateParent($definition);
+            } catch (CategoryValidationException $e) {
+                $destinations[$entry['key']] = [
+                    'id' => null,
+                    'reason' => $e->getReason(),
+                    'message' => $e->getMessage(),
+                    'label' => trim((string)$definition->getParentPath()),
+                ];
+                continue;
+            }
+            if ($segments === []) {
+                continue;
+            }
+
+            $label = PathParser::buildKey($segments);
+
+            // Same treatment the entry's own first segment gets: duplicate root
+            // names are two distinct catalogs, and picking the lowest ID for a
+            // write is exactly the guess this endpoint refuses to make.
+            $roots ??= $this->categoryResource->getRootCategoryIds();
+            $rootIds = $roots[$segments[0]] ?? [];
+            if (count($rootIds) > 1) {
+                $destinations[$entry['key']] = [
+                    'id' => null,
+                    'reason' => CategorySyncResultInterface::REASON_AMBIGUOUS_PATH,
+                    'message' => sprintf(
+                        '%d root categories are named "%s" (IDs %s); send parent_category_id to pick the'
+                        . ' destination.',
+                        count($rootIds),
+                        $segments[0],
+                        implode(', ', $rootIds)
+                    ),
+                    'label' => $label,
+                ];
+                continue;
+            }
+            if ($rootIds === []) {
+                $destinations[$entry['key']] = [
+                    'id' => null,
+                    'reason' => CategorySyncResultInterface::REASON_UNKNOWN_ROOT,
+                    'message' => sprintf(
+                        'Unknown root category "%s" in the destination parent path.',
+                        $segments[0]
+                    ),
+                    'label' => $label,
+                ];
+                continue;
+            }
+
+            if (count($segments) === 1) {
+                // A single-segment destination names a root: the category becomes
+                // one of that root's direct children.
+                $destinations[$entry['key']] = [
+                    'id' => $rootIds[0],
+                    'reason' => null,
+                    'message' => null,
+                    'label' => $label,
+                ];
+                continue;
+            }
+
+            $deepPaths[$label] = $segments;
+            $deepByEntryKey[$entry['key']] = $label;
+        }
+
+        if ($deepPaths) {
+            // lookupPaths(), never resolvePaths(): a destination the caller
+            // mistyped must be reported, not conjured into existence.
+            $resolved = $this->pathResolver->lookupPaths($deepPaths);
+            foreach ($deepByEntryKey as $entryKey => $label) {
+                $parentId = $resolved[$label] ?? null;
+                $destinations[$entryKey] = [
+                    'id' => $parentId,
+                    'reason' => $parentId !== null
+                        ? null
+                        : CategorySyncResultInterface::REASON_PARENT_NOT_FOUND,
+                    'message' => $parentId !== null
+                        ? null
+                        : sprintf('Destination parent category "%s" does not exist; send it too.', $label),
+                    'label' => $label,
+                ];
+            }
+        }
+
+        return $destinations;
     }
 
     /**
@@ -846,11 +1712,13 @@ class CategorySyncService
      * one, and the categories are committed either way.
      *
      * @param int[] $touchedIds
+     * @param int[] $removedIds deleted categories, already expanded to the subtree
+     *        that went with them
      */
-    private function invalidate(array $touchedIds): void
+    private function invalidate(array $touchedIds, array $removedIds = []): void
     {
         try {
-            $this->invalidationHandler->execute($touchedIds);
+            $this->invalidationHandler->execute($touchedIds, $removedIds);
         } catch (\Throwable $e) {
             $this->logger->error(
                 sprintf('Category sync: post-sync invalidation failed: %s', $e->getMessage()),
@@ -882,12 +1750,13 @@ class CategorySyncService
      */
     private function buildResponse(int $received, array $results, int $startedAt): CategorySyncResponseInterface
     {
-        $created = $updated = $unchanged = $skipped = $failed = 0;
+        $created = $updated = $unchanged = $deleted = $skipped = $failed = 0;
         foreach ($results as $result) {
             match ($result->getStatus()) {
                 CategorySyncResultInterface::STATUS_CREATED => $created++,
                 CategorySyncResultInterface::STATUS_UPDATED => $updated++,
                 CategorySyncResultInterface::STATUS_UNCHANGED => $unchanged++,
+                CategorySyncResultInterface::STATUS_DELETED => $deleted++,
                 CategorySyncResultInterface::STATUS_SKIPPED => $skipped++,
                 default => $failed++,
             };
@@ -900,6 +1769,7 @@ class CategorySyncService
             ->setCreated($created)
             ->setUpdated($updated)
             ->setUnchanged($unchanged)
+            ->setDeleted($deleted)
             ->setSkipped($skipped)
             ->setFailed($failed)
             ->setElapsedMs((int)((hrtime(true) - $startedAt) / 1_000_000))

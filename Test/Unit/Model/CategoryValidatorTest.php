@@ -166,6 +166,140 @@ class CategoryValidatorTest extends TestCase
         self::assertSame(['Default Category', 'Men'], $this->validator->validate($definition));
     }
 
+    public function testDeleteFlagMustBeZeroOrOne(): void
+    {
+        $definition = (new CategoryDefinition())->setPath('Default Category/Men')->setDelete(2);
+
+        $this->assertRejects($definition, CategorySyncResultInterface::REASON_INVALID_DEFINITION);
+    }
+
+    public function testDeleteChildrenFlagMustBeZeroOrOne(): void
+    {
+        $definition = (new CategoryDefinition())
+            ->setPath('Default Category/Men')
+            ->setDelete(1)
+            ->setDeleteChildren(7);
+
+        $this->assertRejects($definition, CategorySyncResultInterface::REASON_INVALID_DEFINITION);
+    }
+
+    public function testPlainDeleteIsAccepted(): void
+    {
+        $definition = (new CategoryDefinition())->setPath('Default Category/Men')->setDelete(1);
+
+        self::assertSame(['Default Category', 'Men'], $this->validator->validate($definition));
+    }
+
+    public function testDeleteWithDeleteChildrenIsAccepted(): void
+    {
+        $definition = (new CategoryDefinition())
+            ->setPath('Default Category/Men')
+            ->setDelete(1)
+            ->setDeleteChildren(1);
+
+        self::assertSame(['Default Category', 'Men'], $this->validator->validate($definition));
+    }
+
+    public function testDeleteWithANameToCrossCheckIsAccepted(): void
+    {
+        // A bare category_id needs a corroborating field, and for a delete the
+        // name is the only one available — it is checked, not written.
+        $definition = (new CategoryDefinition())->setCategoryId(42)->setName('Clearance')->setDelete(1);
+
+        self::assertSame([], $this->validator->validate($definition));
+    }
+
+    /**
+     * @dataProvider deleteConflictProvider
+     */
+    public function testDeleteCannotAlsoSetValues(callable $mutate): void
+    {
+        $definition = (new CategoryDefinition())->setPath('Default Category/Men')->setDelete(1);
+        $mutate($definition);
+
+        $this->assertRejects($definition, CategorySyncResultInterface::REASON_INVALID_DEFINITION);
+    }
+
+    /**
+     * @return array<string, array{callable}>
+     */
+    public static function deleteConflictProvider(): array
+    {
+        return [
+            'url_key' => [static fn (CategoryDefinition $d) => $d->setUrlKey('mens')],
+            'is_active' => [static fn (CategoryDefinition $d) => $d->setIsActive(0)],
+            'include_in_menu' => [static fn (CategoryDefinition $d) => $d->setIncludeInMenu(1)],
+            'is_anchor' => [static fn (CategoryDefinition $d) => $d->setIsAnchor(1)],
+            'position' => [static fn (CategoryDefinition $d) => $d->setPosition(3)],
+            'parent_path' => [static fn (CategoryDefinition $d) => $d->setParentPath('Default Category/Women')],
+            'parent_category_id' => [static fn (CategoryDefinition $d) => $d->setParentCategoryId(9)],
+            'custom_attributes' => [
+                static fn (CategoryDefinition $d) => $d->setCustomAttributes([
+                    (new CustomAttribute())->setAttributeCode('description')->setValue('x'),
+                ]),
+            ],
+            'clear_attributes' => [static fn (CategoryDefinition $d) => $d->setClearAttributes(['meta_title'])],
+        ];
+    }
+
+    public function testDeleteChildrenWithoutDeleteIsRejected(): void
+    {
+        $definition = (new CategoryDefinition())
+            ->setPath('Default Category/Men')
+            ->setDeleteChildren(1);
+
+        $this->assertRejects($definition, CategorySyncResultInterface::REASON_INVALID_DEFINITION);
+    }
+
+    public function testNoParentPathMeansNoDestination(): void
+    {
+        $definition = (new CategoryDefinition())->setPath('Default Category/Men');
+
+        self::assertSame([], $this->validator->validateParent($definition));
+    }
+
+    public function testBlankParentPathMeansNoDestination(): void
+    {
+        $definition = (new CategoryDefinition())->setPath('Default Category/Men')->setParentPath('   ');
+
+        self::assertSame([], $this->validator->validateParent($definition));
+    }
+
+    public function testParentPathIsParsedWithTheSameGrammarAsPath(): void
+    {
+        $definition = (new CategoryDefinition())->setParentPath('Default Category/Wo\\/Men');
+
+        self::assertSame(['Default Category', 'Wo/Men'], $this->validator->validateParent($definition));
+    }
+
+    public function testSingleSegmentParentPathNamesARoot(): void
+    {
+        $definition = (new CategoryDefinition())->setParentPath('Outdoor Catalog');
+
+        self::assertSame(['Outdoor Catalog'], $this->validator->validateParent($definition));
+    }
+
+    public function testBareNumericParentPathIsRejected(): void
+    {
+        // parent_category_id is the field for that, so digits here can only be a
+        // mistake — same reasoning as the entry's own path.
+        $definition = (new CategoryDefinition())->setParentPath('42');
+
+        try {
+            $this->validator->validateParent($definition);
+            self::fail('Expected the parent path to be rejected.');
+        } catch (CategoryValidationException $e) {
+            self::assertSame(CategorySyncResultInterface::REASON_INVALID_DEFINITION, $e->getReason());
+        }
+    }
+
+    public function testEscapedNumericParentPathNamesACategoryCalledANumber(): void
+    {
+        $definition = (new CategoryDefinition())->setParentPath('\\42');
+
+        self::assertSame(['42'], $this->validator->validateParent($definition));
+    }
+
     private function assertRejects(CategoryDefinition $definition, string $expectedReason): void
     {
         try {

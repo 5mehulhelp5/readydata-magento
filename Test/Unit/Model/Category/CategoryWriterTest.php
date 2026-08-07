@@ -487,6 +487,401 @@ class CategoryWriterTest extends TestCase
         self::assertSame([0, 3], $this->storeSwitches);
     }
 
+    public function testMoveGoesThroughTheCategoryModelUnderStoreZeroEmulation(): void
+    {
+        $this->setCurrentStore(3);
+
+        $category = $this->categoryMock(['name' => 'Shirts']);
+        $newParent = $this->categoryMock(['name' => 'Women']);
+        $newParent->method('hasChildren')->willReturn(false);
+
+        $this->categoryRepository->method('get')->willReturnCallback(
+            static fn (int $id, $storeId = null): CategoryModel => $id === self::CATEGORY_ID
+                ? $category
+                : $newParent
+        );
+
+        $category->expects(self::once())->method('move')->with(20, null);
+
+        $this->writer->move(self::CATEGORY_ID, 20);
+
+        // Store 0 for the write, then back — CategoryRepository::save() and
+        // move() both read the target store from the store manager.
+        self::assertSame([0, 3], $this->storeSwitches);
+    }
+
+    public function testMoveLoadsThroughTheRepositorySoOrigDataIsPresent(): void
+    {
+        $category = $this->categoryMock();
+        $newParent = $this->categoryMock();
+        $newParent->method('hasChildren')->willReturn(false);
+
+        $gets = [];
+        $this->categoryRepository->method('get')->willReturnCallback(
+            function (int $id, $storeId = null) use (&$gets, $category, $newParent): CategoryModel {
+                $gets[] = [$id, $storeId];
+                return $id === self::CATEGORY_ID ? $category : $newParent;
+            }
+        );
+
+        $this->writer->move(self::CATEGORY_ID, 20);
+
+        // Both at store 0. The category especially: only a repository-loaded
+        // model carries the orig data that makes dataHasChangedFor('parent_id')
+        // true after the move, which is what
+        // CategoryProcessUrlRewriteMovingObserver gates URL rewrite
+        // regeneration on.
+        self::assertSame([[self::CATEGORY_ID, 0], [20, 0]], $gets);
+    }
+
+    public function testMoveAppendsAfterTheDestinationsLastChild(): void
+    {
+        $category = $this->categoryMock();
+        $newParent = $this->categoryMock();
+        $newParent->method('hasChildren')->willReturn(true);
+        $newParent->method('getChildren')->willReturn('31,32,33');
+
+        $this->categoryRepository->method('get')->willReturnCallback(
+            static fn (int $id, $storeId = null): CategoryModel => $id === self::CATEGORY_ID
+                ? $category
+                : $newParent
+        );
+
+        // Passing null here would make _processPositions() use position 1, which
+        // puts the moved category FIRST and shifts every existing sibling up.
+        // Nobody asked for a reorder, so it appends.
+        $category->expects(self::once())->method('move')->with(20, 33);
+
+        $this->writer->move(self::CATEGORY_ID, 20);
+    }
+
+    public function testMoveFailureIsNotSwallowedAndTheStoreIsRestored(): void
+    {
+        $this->setCurrentStore(3);
+
+        $category = $this->categoryMock();
+        $newParent = $this->categoryMock();
+        $newParent->method('hasChildren')->willReturn(false);
+        $category->method('move')->willThrowException(new \RuntimeException('cannot move'));
+
+        $this->categoryRepository->method('get')->willReturnCallback(
+            static fn (int $id, $storeId = null): CategoryModel => $id === self::CATEGORY_ID
+                ? $category
+                : $newParent
+        );
+
+        try {
+            $this->writer->move(self::CATEGORY_ID, 20);
+            self::fail('Expected the move failure to propagate.');
+        } catch (\RuntimeException) {
+            // The caller's transaction has to see this: the repository's own
+            // nested rollback leaves the connection partially rolled back.
+        }
+
+        self::assertSame([0, 3], $this->storeSwitches);
+    }
+
+    public function testDeleteGoesThroughTheRepositoryUnderStoreZeroEmulation(): void
+    {
+        $this->setCurrentStore(3);
+
+        $this->categoryRepository->expects(self::once())->method('deleteByIdentifier')
+            ->with(self::CATEGORY_ID);
+
+        $this->writer->delete(self::CATEGORY_ID);
+
+        self::assertSame([0, 3], $this->storeSwitches);
+    }
+
+    public function testDeleteFailureIsNotSwallowedAndTheStoreIsRestored(): void
+    {
+        $this->setCurrentStore(3);
+        $this->categoryRepository->method('deleteByIdentifier')
+            ->willThrowException(new \RuntimeException('cannot delete'));
+
+        try {
+            $this->writer->delete(self::CATEGORY_ID);
+            self::fail('Expected the delete failure to propagate.');
+        } catch (\RuntimeException) {
+            // expected
+        }
+
+        self::assertSame([0, 3], $this->storeSwitches);
+    }
+
+    public function testCreateReportsASiblingAlreadyUsingTheDerivedSlug(): void
+    {
+        $blank = $this->categoryMock();
+        $blank->method('formatUrlKey')->willReturnCallback(
+            static fn (string $s): string => strtolower(str_replace(' ', '-', $s))
+        );
+        $this->categoryFactory->method('create')->willReturn($blank);
+        // Nothing is named "Clearance", but a sibling already owns "clearance".
+        $this->categoryResource->method('getChildUrlKeysByParentIds')
+            ->willReturn([10 => ['clearance' => [33]]]);
+
+        self::assertSame(
+            ['kind' => 'url_key', 'value' => 'clearance', 'category_id' => 33],
+            $this->writer->findNewChildConflict(10, 'Clearance', new CategoryDefinition())
+        );
+    }
+
+    public function testCreateWithAnExplicitUrlKeySidestepsTheCollision(): void
+    {
+        $this->categoryResource->method('getChildUrlKeysByParentIds')
+            ->willReturn([10 => ['clearance' => [33]]]);
+        // The explicit key is what would be written, so the derived one is moot
+        // and the factory is never needed.
+        $this->categoryFactory->expects(self::never())->method('create');
+
+        self::assertNull($this->writer->findNewChildConflict(
+            10,
+            'Clearance',
+            (new CategoryDefinition())->setUrlKey('mens-clearance-rd')
+        ));
+    }
+
+    public function testCreateWithAnExplicitUrlKeyThatCollidesIsStillCaught(): void
+    {
+        $this->categoryResource->method('getChildUrlKeysByParentIds')
+            ->willReturn([10 => ['taken' => [33]]]);
+
+        self::assertSame(
+            ['kind' => 'url_key', 'value' => 'taken', 'category_id' => 33],
+            $this->writer->findNewChildConflict(
+                10,
+                'Clearance',
+                (new CategoryDefinition())->setUrlKey('taken')
+            )
+        );
+    }
+
+    public function testCreateNeverQueriesSiblingNames(): void
+    {
+        $blank = $this->categoryMock();
+        $blank->method('formatUrlKey')->willReturn('clearance');
+        $this->categoryFactory->method('create')->willReturn($blank);
+        $this->categoryResource->method('getChildUrlKeysByParentIds')->willReturn([]);
+        // A name collision cannot reach the create branch, so asking is waste.
+        $this->categoryResource->expects(self::never())->method('getChildIdsByParentIds');
+
+        self::assertNull($this->writer->findNewChildConflict(10, 'Clearance', new CategoryDefinition()));
+    }
+
+    public function testCreateCollisionCheckRunsAtDefaultScope(): void
+    {
+        $this->setCurrentStore(3);
+        $blank = $this->categoryMock();
+        $blank->method('formatUrlKey')->willReturn('clearance');
+        $this->categoryFactory->method('create')->willReturn($blank);
+        $this->categoryResource->method('getChildUrlKeysByParentIds')->willReturn([]);
+
+        $this->writer->findNewChildConflict(10, 'Clearance', new CategoryDefinition());
+
+        // Same emulation the create itself runs in, so the predicted slug is
+        // byte-for-byte the one that would be written.
+        self::assertSame([0, 3], $this->storeSwitches);
+    }
+
+    public function testMoveOntoATakenNameReportsTheNamesake(): void
+    {
+        $loaded = $this->categoryMock(['name' => 'Shirts', 'url_key' => 'shirts']);
+        $this->categoryRepository->method('get')->willReturn($loaded);
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([20 => ['Shirts' => [33]]]);
+
+        self::assertSame(
+            ['kind' => 'name', 'value' => 'Shirts', 'category_id' => 33],
+            $this->writer->findSiblingConflict(self::CATEGORY_ID, 20, null, new CategoryDefinition(), true)
+        );
+    }
+
+    public function testMoveOntoAFreeNameButTakenSlugReportsTheSlug(): void
+    {
+        $loaded = $this->categoryMock(['name' => 'Shirts', 'url_key' => 'shirts']);
+        $this->categoryRepository->method('get')->willReturn($loaded);
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([20 => ['Blouses' => [33]]]);
+        // Different names, same slug: url_rewrite's (request_path, store_id)
+        // unique key is what would blow up, deep inside the save.
+        $this->categoryResource->method('getChildUrlKeysByParentIds')
+            ->willReturn([20 => ['shirts' => [33]]]);
+
+        self::assertSame(
+            ['kind' => 'url_key', 'value' => 'shirts', 'category_id' => 33],
+            $this->writer->findSiblingConflict(self::CATEGORY_ID, 20, null, new CategoryDefinition(), true)
+        );
+    }
+
+    public function testMoveToAClearDestinationReportsNoConflict(): void
+    {
+        $loaded = $this->categoryMock(['name' => 'Shirts', 'url_key' => 'shirts']);
+        $this->categoryRepository->method('get')->willReturn($loaded);
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([20 => ['Blouses' => [33]]]);
+        $this->categoryResource->method('getChildUrlKeysByParentIds')
+            ->willReturn([20 => ['blouses' => [33]]]);
+
+        self::assertNull(
+            $this->writer->findSiblingConflict(self::CATEGORY_ID, 20, null, new CategoryDefinition(), true)
+        );
+    }
+
+    public function testACategoryNeverConflictsWithItself(): void
+    {
+        $loaded = $this->categoryMock(['name' => 'Shirts', 'url_key' => 'shirts']);
+        $this->categoryRepository->method('get')->willReturn($loaded);
+        // Its own row is what the sibling map returns.
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([10 => ['Shirts' => [self::CATEGORY_ID]]]);
+        $this->categoryResource->method('getChildUrlKeysByParentIds')
+            ->willReturn([10 => ['shirts' => [self::CATEGORY_ID]]]);
+
+        self::assertNull(
+            $this->writer->findSiblingConflict(self::CATEGORY_ID, 10, null, new CategoryDefinition(), true)
+        );
+    }
+
+    public function testADuplicateNameListContainingSelfStillFindsTheOther(): void
+    {
+        $loaded = $this->categoryMock(['name' => 'Shirts', 'url_key' => 'shirts']);
+        $this->categoryRepository->method('get')->willReturn($loaded);
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([20 => ['Shirts' => [self::CATEGORY_ID, 33]]]);
+
+        $conflict = $this->writer->findSiblingConflict(
+            self::CATEGORY_ID,
+            20,
+            null,
+            new CategoryDefinition(),
+            true
+        );
+
+        self::assertSame(33, $conflict['category_id']);
+    }
+
+    public function testARenamePredictsTheDerivedSlugAndCatchesItsCollision(): void
+    {
+        $loaded = $this->categoryMock(['name' => 'Shirts', 'url_key' => 'shirts']);
+        $loaded->method('formatUrlKey')->willReturnCallback(
+            static fn (string $s): string => strtolower(str_replace(' ', '-', $s))
+        );
+        $this->categoryRepository->method('get')->willReturn($loaded);
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([10 => ['Shirts' => [self::CATEGORY_ID]]]);
+        // No sibling is called "Winter Coats", but one already owns the slug the
+        // rename would derive.
+        $this->categoryResource->method('getChildUrlKeysByParentIds')
+            ->willReturn([10 => ['winter-coats' => [33]]]);
+
+        self::assertSame(
+            ['kind' => 'url_key', 'value' => 'winter-coats', 'category_id' => 33],
+            $this->writer->findSiblingConflict(
+                self::CATEGORY_ID,
+                10,
+                'Winter Coats',
+                new CategoryDefinition(),
+                false
+            )
+        );
+    }
+
+    public function testAnExplicitUrlKeyWinsOverTheDerivedOne(): void
+    {
+        $loaded = $this->categoryMock(['name' => 'Shirts', 'url_key' => 'shirts']);
+        $loaded->method('formatUrlKey')->willReturnCallback(
+            static fn (string $s): string => strtolower(str_replace(' ', '-', $s))
+        );
+        $this->categoryRepository->method('get')->willReturn($loaded);
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([10 => ['Shirts' => [self::CATEGORY_ID]]]);
+        $this->categoryResource->method('getChildUrlKeysByParentIds')
+            ->willReturn([10 => ['winter-coats' => [33]]]);
+
+        // The derived slug would collide; the explicit one does not, and it is
+        // the explicit one that gets written.
+        self::assertNull($this->writer->findSiblingConflict(
+            self::CATEGORY_ID,
+            10,
+            'Winter Coats',
+            (new CategoryDefinition())->setUrlKey('coats-winter'),
+            false
+        ));
+    }
+
+    public function testStandingStillQueriesNothingAtAll(): void
+    {
+        $loaded = $this->categoryMock(['name' => 'Shirts', 'url_key' => 'shirts']);
+        $this->categoryRepository->method('get')->willReturn($loaded);
+        // Same name, same slug, same parent: a replayed payload must stay free.
+        $this->categoryResource->expects(self::never())->method('getChildIdsByParentIds');
+        $this->categoryResource->expects(self::never())->method('getChildUrlKeysByParentIds');
+
+        self::assertNull(
+            $this->writer->findSiblingConflict(self::CATEGORY_ID, 10, 'Shirts', new CategoryDefinition(), false)
+        );
+    }
+
+    public function testAMoveAlwaysQueriesEvenWithNothingChanging(): void
+    {
+        $loaded = $this->categoryMock(['name' => 'Shirts', 'url_key' => 'shirts']);
+        $this->categoryRepository->method('get')->willReturn($loaded);
+        // The name is unchanged but the parent is not, so the collision is real.
+        $this->categoryResource->expects(self::once())->method('getChildIdsByParentIds')->willReturn([]);
+
+        self::assertNull(
+            $this->writer->findSiblingConflict(self::CATEGORY_ID, 20, 'Shirts', new CategoryDefinition(), true)
+        );
+    }
+
+    public function testAnEmptyUrlKeyIsNotTreatedAsACollision(): void
+    {
+        $loaded = $this->categoryMock(['name' => 'Shirts', 'url_key' => '']);
+        $this->categoryRepository->method('get')->willReturn($loaded);
+        $this->categoryResource->method('getChildIdsByParentIds')->willReturn([]);
+        $this->categoryResource->expects(self::never())->method('getChildUrlKeysByParentIds');
+
+        self::assertNull(
+            $this->writer->findSiblingConflict(self::CATEGORY_ID, 20, null, new CategoryDefinition(), true)
+        );
+    }
+
+    public function testTheNameConflictTakesPrecedenceOverTheSlugConflict(): void
+    {
+        $loaded = $this->categoryMock(['name' => 'Shirts', 'url_key' => 'shirts']);
+        $this->categoryRepository->method('get')->willReturn($loaded);
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([20 => ['Shirts' => [33]]]);
+        $this->categoryResource->method('getChildUrlKeysByParentIds')
+            ->willReturn([20 => ['shirts' => [44]]]);
+
+        $conflict = $this->writer->findSiblingConflict(
+            self::CATEGORY_ID,
+            20,
+            null,
+            new CategoryDefinition(),
+            true
+        );
+
+        // The ambiguity is the more fundamental problem, and the one with no
+        // database backstop at all.
+        self::assertSame('name', $conflict['kind']);
+    }
+
+    public function testTheConflictCheckRunsAtDefaultScope(): void
+    {
+        $this->setCurrentStore(3);
+        $loaded = $this->categoryMock(['name' => 'Shirts', 'url_key' => 'shirts']);
+        $this->categoryRepository->method('get')->willReturn($loaded);
+        $this->categoryResource->method('getChildIdsByParentIds')->willReturn([]);
+
+        $this->writer->findSiblingConflict(self::CATEGORY_ID, 20, null, new CategoryDefinition(), true);
+
+        // Store 0 is the scope a structural write uses, and the scope whose names
+        // path resolution matches.
+        self::assertSame([0, 3], $this->storeSwitches);
+    }
+
     public function testFirstClassFieldWinsOverADuplicateCustomAttribute(): void
     {
         $loaded = $this->categoryMock(['name' => 'Shirts', 'is_active' => '1']);

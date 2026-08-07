@@ -12,6 +12,8 @@ class CategoryDefinition implements CategoryDefinitionInterface
 {
     private ?string $path = null;
     private ?int $categoryId = null;
+    private ?string $parentPath = null;
+    private ?int $parentCategoryId = null;
     private ?string $name = null;
     private ?string $urlKey = null;
     private ?int $isActive = null;
@@ -20,6 +22,8 @@ class CategoryDefinition implements CategoryDefinitionInterface
     private ?int $position = null;
     private ?array $customAttributes = null;
     private ?array $clearAttributes = null;
+    private ?int $delete = null;
+    private ?int $deleteChildren = null;
 
     public function getPath(): ?string
     {
@@ -40,6 +44,28 @@ class CategoryDefinition implements CategoryDefinitionInterface
     public function setCategoryId(?int $categoryId): CategoryDefinitionInterface
     {
         $this->categoryId = $categoryId;
+        return $this;
+    }
+
+    public function getParentPath(): ?string
+    {
+        return $this->parentPath;
+    }
+
+    public function setParentPath(?string $parentPath): CategoryDefinitionInterface
+    {
+        $this->parentPath = $parentPath;
+        return $this;
+    }
+
+    public function getParentCategoryId(): ?int
+    {
+        return $this->parentCategoryId;
+    }
+
+    public function setParentCategoryId(?int $parentCategoryId): CategoryDefinitionInterface
+    {
+        $this->parentCategoryId = $parentCategoryId;
         return $this;
     }
 
@@ -128,6 +154,28 @@ class CategoryDefinition implements CategoryDefinitionInterface
     public function setClearAttributes(?array $clearAttributes): CategoryDefinitionInterface
     {
         $this->clearAttributes = $clearAttributes;
+        return $this;
+    }
+
+    public function getDelete(): ?int
+    {
+        return $this->delete;
+    }
+
+    public function setDelete(?int $delete): CategoryDefinitionInterface
+    {
+        $this->delete = $delete;
+        return $this;
+    }
+
+    public function getDeleteChildren(): ?int
+    {
+        return $this->deleteChildren;
+    }
+
+    public function setDeleteChildren(?int $deleteChildren): CategoryDefinitionInterface
+    {
+        $this->deleteChildren = $deleteChildren;
         return $this;
     }
 }

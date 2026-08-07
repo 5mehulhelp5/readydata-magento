@@ -14,6 +14,7 @@ class CategorySyncResponse implements CategorySyncResponseInterface
     private int $created = 0;
     private int $updated = 0;
     private int $unchanged = 0;
+    private int $deleted = 0;
     private int $skipped = 0;
     private int $failed = 0;
     private int $elapsedMs = 0;
@@ -60,6 +61,17 @@ class CategorySyncResponse implements CategorySyncResponseInterface
     public function setUnchanged(int $unchanged): CategorySyncResponseInterface
     {
         $this->unchanged = $unchanged;
+        return $this;
+    }
+
+    public function getDeleted(): int
+    {
+        return $this->deleted;
+    }
+
+    public function setDeleted(int $deleted): CategorySyncResponseInterface
+    {
+        $this->deleted = $deleted;
         return $this;
     }
 

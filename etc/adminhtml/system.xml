@@ -55,6 +55,22 @@
                     <comment>Allow the /V1/readydata/categories endpoint to create/update categories. Off by default: it reshapes storefront navigation and category URLs.</comment>
                     <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
                 </field>
+                <field id="allow_move" translate="label comment" type="select" sortOrder="20" showInDefault="1">
+                    <label>Allow Category Moves</label>
+                    <comment>Allow a payload that names parent_path/parent_category_id to reparent a category. Off by default: a move re-paths the whole descendant subtree and regenerates every URL under it (old URLs 301 when Create Permanent Redirect is on).</comment>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                    <depends>
+                        <field id="enabled">1</field>
+                    </depends>
+                </field>
+                <field id="allow_delete" translate="label comment" type="select" sortOrder="30" showInDefault="1">
+                    <label>Allow Category Deletion</label>
+                    <comment>Allow a payload that sets "delete": 1 to remove a category. Off by default: deletion is recursive and irreversible, taking the descendant subtree, its URL rewrites and its product assignments with it. Products themselves are never deleted.</comment>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                    <depends>
+                        <field id="enabled">1</field>
+                    </depends>
+                </field>
             </group>
             <group id="media" translate="label" type="text" sortOrder="27" showInDefault="1">
                 <label>Media Gallery</label>

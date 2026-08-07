@@ -42,6 +42,8 @@ class Config
     private const XML_PATH_HYDRATE_MEDIA = 'readydata_import/events/hydrate_media';
     private const XML_PATH_AUTO_CREATE_ATTRIBUTES = 'readydata_import/attributes/auto_create';
     private const XML_PATH_CATEGORIES_ENABLED = 'readydata_import/categories/enabled';
+    private const XML_PATH_CATEGORIES_ALLOW_MOVE = 'readydata_import/categories/allow_move';
+    private const XML_PATH_CATEGORIES_ALLOW_DELETE = 'readydata_import/categories/allow_delete';
     private const XML_PATH_MEDIA_ENABLED = 'readydata_import/media/enabled';
     private const XML_PATH_MEDIA_DOWNLOAD_TIMEOUT = 'readydata_import/media/download_timeout';
     private const XML_PATH_MEDIA_DOWNLOAD_CONCURRENCY = 'readydata_import/media/download_concurrency';
@@ -151,6 +153,27 @@ class Config
     public function isCategorySyncEnabled(): bool
     {
         return $this->scopeConfig->isSetFlag(self::XML_PATH_CATEGORIES_ENABLED);
+    }
+
+    /**
+     * Whether the category endpoint may reparent a category. Off by default and
+     * separate from the endpoint's own switch: a move re-paths the whole
+     * descendant subtree and rewrites every URL under it, which is a much larger
+     * blast radius than creating or renaming a single node.
+     */
+    public function isCategoryMoveAllowed(): bool
+    {
+        return $this->scopeConfig->isSetFlag(self::XML_PATH_CATEGORIES_ALLOW_MOVE);
+    }
+
+    /**
+     * Whether the category endpoint may delete a category. Off by default: a
+     * delete is recursive and irreversible, taking the descendant subtree, its
+     * URL rewrites and its product assignments with it.
+     */
+    public function isCategoryDeleteAllowed(): bool
+    {
+        return $this->scopeConfig->isSetFlag(self::XML_PATH_CATEGORIES_ALLOW_DELETE);
     }
 
     /**

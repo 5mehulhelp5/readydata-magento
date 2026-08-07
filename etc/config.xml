@@ -17,6 +17,8 @@
             </attributes>
             <categories>
                 <enabled>0</enabled>
+                <allow_move>0</allow_move>
+                <allow_delete>0</allow_delete>
             </categories>
             <media>
                 <enabled>1</enabled>
