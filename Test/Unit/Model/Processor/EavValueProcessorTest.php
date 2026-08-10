@@ -449,10 +449,13 @@ class EavValueProcessorTest extends TestCase
 
     public function testAScopedUrlKeyIsWrittenAndPublishedUnderItsStore(): void
     {
-        $context = $this->createContext(
-            ['url_key' => 'winter-jacket'],
-            storeValues: [$this->block(3, ['url_key' => 'winterjacke'])]
-        );
+        // First-class on the block, exactly as on the product — reaching it
+        // only through custom_attributes would be an odd asymmetry.
+        $block = new ProductStoreValues();
+        $block->setStoreId(3);
+        $block->setUrlKey('winterjacke');
+
+        $context = $this->createContext(['url_key' => 'winter-jacket'], storeValues: [$block]);
 
         $this->processor->process($context);
 

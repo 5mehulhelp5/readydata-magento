@@ -35,6 +35,7 @@ Authorization: Bearer <integration token>   (ACL: ReadyData_Import::import)
       "visibility": 4,
       "websites": ["base"],
       "categories": ["Default Category/Men/Shirts", "42"],
+      "categories_replace_scope": [2],
       "stock": {"qty": 100, "is_in_stock": true},
       "url_key": "example-product",
       "links": {"related": ["DEF-456"], "cross_sell": ["GHI-789"]},
@@ -55,9 +56,9 @@ Authorization: Bearer <integration token>   (ACL: ReadyData_Import::import)
       ],
       "clear_attributes": ["special_label"],
       "store_values": [
-        {"store_id": 3, "name": "Winterjacke",
+        {"store_id": 3, "name": "Beispielprodukt", "url_key": "beispielprodukt",
          "custom_attributes": [{"attribute_code": "description", "value": "<p>Langer Text</p>"}]},
-        {"store_view_code": "fr_fr", "name": "Veste d'hiver",
+        {"store_view_code": "fr_fr", "name": "Produit exemple",
          "clear_attributes": ["special_label"]}
       ]
     }
@@ -65,6 +66,9 @@ Authorization: Bearer <integration token>   (ACL: ReadyData_Import::import)
   "settings": {"store_view_code": "default", "continue_on_error": true}
 }
 ```
+
+`settings` also accepts `store_id` (instead of `store_view_code`, and winning
+over it), `root_category_id` and `batch_size`.
 
 ### Attribute value scoping
 
@@ -94,8 +98,9 @@ every localized value set it has, instead of one request per store view.
 
 Each block addresses its store view by `store_id` or `store_view_code` (the ID
 wins) and carries what the product itself carries at the default scope: the
-value-bearing fields `name`, `price`, `status`, `visibility`, `weight`, plus
-`custom_attributes` and `clear_attributes`. Everything with no store dimension
+value-bearing fields `name`, `price`, `status`, `visibility`, `weight`,
+`url_key`, plus `custom_attributes` and `clear_attributes`. Everything with no
+store dimension
 — `websites`, `categories`, `links`, `media`, `stock`, `tier_prices`, the
 attribute set and the product type — stays on the product and is written once.
 
@@ -187,8 +192,9 @@ untouched; `[]` removes them all.
 - Only the path leaf is linked; enable `is_anchor` on ancestors for rollup.
 - Position is not settable: new links get position 0, existing links keep
   their admin-set positions.
-- Assignments are **global** (no store dimension) — send `categories` on one
-  store pass only.
+- Assignments are **global** (no store dimension): they are written once,
+  whatever scopes the payload names, and a `store_values` block cannot carry
+  them.
 - `\` escapes the next character: `\/` is a literal slash inside a name
   (`"Default Category/Wo\/Men"` names the category `Wo/Men`), `\\` a literal
   backslash (names containing `\` MUST escape it), and a trailing lone `\`
@@ -305,7 +311,8 @@ ordered list of target SKUs:
   the safety valve, so a feed that echoes the linking SKU into its own related
   list still gets its obsolete links removed. Duplicate SKUs within one array are
   deduplicated, first occurrence wins.
-- Links are **global** (no store dimension) — send them on one store pass only.
+- Links are **global** (no store dimension): written once, whatever scopes the
+  payload names.
 - Grouped-product children are a different link type and are not touched.
 
 ### Tier prices
@@ -368,9 +375,9 @@ A `tier_prices` array declares the product's tier (group) prices — one entry p
   `percentage_discount` 2 decimals, and both sides of the diff are compared at
   those scales — which is what makes a re-import a no-op instead of a
   delete-and-reinsert churn.
-- Tier prices are **global** (no store dimension) — `store_view_code` does not
-  affect them, the website dimension lives in the entry — so send them on one
-  store pass only.
+- Tier prices are **global** (no store dimension): `store_view_code` does not
+  affect them, the website dimension lives in the entry, and they are written
+  once whatever scopes the payload names.
 - Skipped entirely for product types outside the `tier_price` attribute's
   `apply_to` (**configurable** and **grouped** on a stock install): a warning is
   reported and existing rows are left alone, never removed.
@@ -478,8 +485,11 @@ The two forms are told apart by the scheme.
   to resolve, that product is applied additively — new entries and metadata
   updates apply, nothing existing is removed.
 - Media is written at the **default scope only** (`store_id = 0`):
-  `store_view_code` does not affect it, so **send media on one store pass only**.
-  Store-scoped labels and positions are out of scope. The one exception is a role
+  `store_view_code` does not affect it, and a `store_values` block cannot carry
+  it, so it is written once whatever scopes the payload names.
+  **Per-store labels, positions and `disabled` flags are out of scope** — the
+  gallery value tables do have a store dimension, and unlike everything else on
+  this endpoint the module does not write it. The one exception is a role
   attribute that already has a store-scoped row, which is kept in sync.
 - **What observers see**: by default the products handed to product-save
   observers carry no gallery, and what this import changed is published as a
@@ -495,7 +505,7 @@ The two forms are told apart by the scheme.
   later run would trust.
 
 Response: summary counters (`received`, `created`, `updated`, `failed`,
-`elapsedMs`), the `store_id` the request actually ran in, and a per-SKU
+`elapsed_ms`), the `store_id` the request actually ran in, and a per-SKU
 `results` array with `status`, `messages` and — when the product named scopes
 beyond the request's own — `store_results`. Errors are per-product; a failing
 product does not abort the request.
@@ -635,7 +645,7 @@ between groups); a named group is created if missing; an omitted group uses the
 set's default group; an omitted set uses the entity's default set.
 
 Response: summary counters (`received`, `created`, `updated`, `unchanged`,
-`skipped`, `failed`, `elapsedMs`) plus a per-attribute `results` array with
+`skipped`, `failed`, `elapsed_ms`) plus a per-attribute `results` array with
 `status`, a machine-readable `reason`, and `messages`.
 
 ### Amasty layered navigation
@@ -1227,19 +1237,26 @@ transaction, whenever that indexer is in "Update on Save".
 Attaching a root to a store group (`store_group.root_category_id`), category
 images, and assigning products from the category side (that is owned by the
 product payload's `categories` field) are out of scope. Moving and deleting are
-supported but each need their config switch turned on, and a move is limited to
-one per subtree per request (see "Moving a category").
+supported but each need their config switch turned on, a move between root
+categories needs a switch of its own, and a move is limited to one per subtree
+per request (see "Moving a category").
 
 ## What it does today
 
 - Creates/updates `catalog_product_entity` + all scalar EAV values with
   multi-row `INSERT ... ON DUPLICATE KEY UPDATE` (one statement per value
   table per batch, chunked at 1000 rows).
+- **Any number of store scopes in one request**: the request's own scope plus a
+  `store_values` block per store view, each honouring the attribute's own
+  global / website / store configuration, and each reporting its own outcome in
+  `store_results` (see "Store-scoped values" and "Scoped results" above).
 - Resolves select/multiselect option labels to IDs; auto-creates missing
   options (configurable).
 - Website assignment (additive; new products default to the default website).
 - Category assignments (replace semantics, paths or IDs, auto-creation of
-  missing subtrees — see "Category assignments" above).
+  missing subtrees), with the replace bounded to chosen root categories and
+  paths pinnable to one root on a catalog with same-named roots (see "Category
+  assignments" above).
 - Configurable products: super attributes + child links (replace semantics,
   additive safety valve — see "Configurable products" above).
 - Related / up-sell / cross-sell links: replace semantics per link type with a
@@ -1430,6 +1447,21 @@ base for a step that should be registered but inert until it is written.
   via the standalone **`POST /V1/readydata/attributes`** endpoint (see "Attribute
   definitions"), a data patch, or the admin (for super attributes: a
   **global-scope select** added to the product's attribute set).
+- **A batch is one transaction, and that now spans every scope a product
+  names.** A failure while writing a product's third `store_values` block rolls
+  back the first two, and the rest of the batch with them — where separate
+  per-store requests used to fail independently. This is deliberate (a
+  half-localized product is worse than an unlocalized one) but it changes what
+  `continue_on_error` means: it resumes at the next *batch*, never at the next
+  scope. The per-scope messages in `store_results` say which scope caused it.
+- **A product `categories` replace reaches the whole catalog by default.** On a
+  catalog whose root trees are fed by different sources, each feed's push then
+  deletes the links the others just wrote, and the only symptom is storefront
+  navigation quietly going missing — the existing additive safety valve does not
+  catch it, because those references resolve perfectly. Bound it with
+  `categories_replace_scope` per product or
+  `readydata_import/categories/replace_scope` instance-wide (see "How far the
+  replace reaches").
 - **Bypasses the product model**: plugins/observers on product save do NOT
   run. That is the point, but audit your customizations before adopting.
   Exception: **categories** are saved through the category model/repository
@@ -1543,8 +1575,11 @@ base for a step that should be registered but inert until it is written.
   staged catalog is not yet supported (clear per-product error is returned).
   Media is written against the product's *current* row, with no staging-update
   awareness — the same posture as the rest of the module.
-- **Media is written at the default scope only**; `store_view_code` does not
-  affect it. Send media roles inside `media`, never in `custom_attributes`: for
+- **Media is written at the default scope only**; neither `store_view_code` nor
+  a `store_values` block affects it, and per-store labels, positions and
+  `disabled` flags are **out of scope** — it is the one part of the product
+  payload with a store dimension the module does not write. Send media roles
+  inside `media`, never in `custom_attributes`: for
   a product carrying a `media` block the media role write happens last and
   repoints the default scope **and** every store view that already had a row —
   including one a `custom_attributes` role just created earlier in the same

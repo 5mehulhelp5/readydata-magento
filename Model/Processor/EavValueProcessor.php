@@ -388,6 +388,7 @@ class EavValueProcessor implements ProcessorInterface
                 'status' => $block->getStatus(),
                 'visibility' => $block->getVisibility(),
                 'weight' => $block->getWeight(),
+                'url_key' => $block->getUrlKey(),
             ],
             static fn ($value): bool => $value !== null
         );

@@ -17,6 +17,7 @@ class ProductStoreValues implements ProductStoreValuesInterface
     private ?int $status = null;
     private ?int $visibility = null;
     private ?float $weight = null;
+    private ?string $urlKey = null;
     private ?array $customAttributes = null;
     private ?array $clearAttributes = null;
 
@@ -94,6 +95,17 @@ class ProductStoreValues implements ProductStoreValuesInterface
     public function setWeight(float $weight): ProductStoreValuesInterface
     {
         $this->weight = $weight;
+        return $this;
+    }
+
+    public function getUrlKey(): ?string
+    {
+        return $this->urlKey;
+    }
+
+    public function setUrlKey(string $urlKey): ProductStoreValuesInterface
+    {
+        $this->urlKey = $urlKey;
         return $this;
     }
 

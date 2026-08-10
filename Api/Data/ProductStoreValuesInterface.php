@@ -36,6 +36,7 @@ interface ProductStoreValuesInterface
     public const STATUS = 'status';
     public const VISIBILITY = 'visibility';
     public const WEIGHT = 'weight';
+    public const URL_KEY = 'url_key';
     public const CUSTOM_ATTRIBUTES = 'custom_attributes';
     public const CLEAR_ATTRIBUTES = 'clear_attributes';
 
@@ -130,6 +131,25 @@ interface ProductStoreValuesInterface
      * @return $this
      */
     public function setWeight(float $weight): self;
+
+    /**
+     * Store-scoped URL key. That store view's rewrites are generated from it,
+     * and every other store keeps the default one.
+     *
+     * Never *generated* here, unlike the product's own: a slug derived from a
+     * name is the product's identity on the storefront, and deriving one per
+     * store view would invent a different URL for each. Absent means the store
+     * view keeps resolving on the default-scope key.
+     *
+     * @return string|null
+     */
+    public function getUrlKey(): ?string;
+
+    /**
+     * @param string $urlKey
+     * @return $this
+     */
+    public function setUrlKey(string $urlKey): self;
 
     /**
      * Additional EAV attribute values for this scope, as code/value pairs —
