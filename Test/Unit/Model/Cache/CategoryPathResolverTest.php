@@ -11,6 +11,7 @@ use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
 use ReadyData\Import\Logger\Logger;
 use ReadyData\Import\Model\Cache\CategoryPathResolver;
+use ReadyData\Import\Model\Cache\RootCategoryRegistry;
 use ReadyData\Import\Model\Category\CategoryWriter;
 use ReadyData\Import\Model\ResourceModel\Category as CategoryResource;
 
@@ -33,6 +34,7 @@ class CategoryPathResolverTest extends TestCase
         $this->resolver = new CategoryPathResolver(
             $this->categoryResource,
             $this->categoryWriter,
+            new RootCategoryRegistry($this->categoryResource),
             $this->createMock(Logger::class)
         );
     }
@@ -213,6 +215,7 @@ class CategoryPathResolverTest extends TestCase
         return new CategoryPathResolver(
             $categoryResource,
             $this->categoryWriter,
+            new RootCategoryRegistry($categoryResource),
             $this->createMock(Logger::class)
         );
     }
@@ -240,11 +243,14 @@ class CategoryPathResolverTest extends TestCase
         self::assertSame(2, $calls);
     }
 
-    public function testForgetRootsRereadsTheRootMap(): void
+    /**
+     * A root a caller created mid-request would otherwise stay invisible: the
+     * name => ID map is memoized for the life of the shared registry, and no
+     * path cache entry covers a root for forget() to drop. The resolver reads
+     * the map through the registry, so invalidating it there is enough.
+     */
+    public function testARootAddedMidRequestBecomesVisibleOnceTheRegistryIsInvalidated(): void
     {
-        // A root a caller created mid-request would otherwise stay invisible:
-        // this map is memoized for the life of the shared instance, and no path
-        // cache entry covers a root for forget() to drop.
         $rootCalls = 0;
         $categoryResource = $this->createMock(CategoryResource::class);
         $categoryResource->method('getRootCategoryIds')
@@ -257,6 +263,7 @@ class CategoryPathResolverTest extends TestCase
         $resolver = new CategoryPathResolver(
             $categoryResource,
             $this->categoryWriter,
+            $registry = new RootCategoryRegistry($categoryResource),
             $this->createMock(Logger::class)
         );
 
@@ -266,14 +273,14 @@ class CategoryPathResolverTest extends TestCase
         $resolver->lookupPaths($paths);
         self::assertSame(1, $rootCalls);
 
-        $resolver->forgetRoots();
+        $registry->forget();
         $resolver->forget('Default Category/Men');
         $resolver->lookupPaths($paths);
 
         self::assertSame(2, $rootCalls);
     }
 
-    public function testForgetRootsDropsThePathsCachedUnderARenamedRoot(): void
+    public function testForgetPathsUnderRootDropsEverythingCachedBelowARenamedRoot(): void
     {
         $calls = 0;
         $this->categoryResource->method('getChildrenByParentIds')
@@ -288,7 +295,7 @@ class CategoryPathResolverTest extends TestCase
 
         // The root was renamed, so every path that starts with its old name is
         // stale — not just the root's own entry.
-        $this->resolver->forgetRoots('Default Category');
+        $this->resolver->forgetPathsUnderRoot('Default Category');
         $this->resolver->lookupPaths($paths);
 
         self::assertSame(2, $calls);

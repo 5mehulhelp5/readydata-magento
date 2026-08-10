@@ -51,6 +51,10 @@ class Category
      * the only way to check a caller's `root_category_id` against the name it
      * claims.
      *
+     * Unmemoized on purpose: every consumer goes through
+     * {@see \ReadyData\Import\Model\Cache\RootCategoryRegistry}, which holds the
+     * memo and the invalidation contract that comes with it.
+     *
      * @return array<string, int[]> store-0 name => entity_id[], ascending
      */
     public function getRootCategoryIds(): array

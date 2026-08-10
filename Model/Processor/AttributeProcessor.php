@@ -6,6 +6,7 @@ declare(strict_types=1);
 
 namespace ReadyData\Import\Model\Processor;
 
+use ReadyData\Import\Api\Data\ProductInterface;
 use ReadyData\Import\Model\BatchContext;
 use ReadyData\Import\Model\Cache\AttributeMetadataCache;
 use ReadyData\Import\Model\Config;
@@ -20,9 +21,25 @@ use ReadyData\Import\Model\ResourceModel\AttributeOption;
 class AttributeProcessor implements ProcessorInterface
 {
     /**
-     * Attribute codes behind the first-class ProductInterface fields.
+     * Attribute codes behind the first-class ProductValuesInterface fields,
+     * spelled from the interface constants so this list and the payload cannot
+     * name different things.
      */
-    public const CORE_ATTRIBUTE_CODES = ['name', 'price', 'status', 'visibility', 'weight', 'url_key'];
+    public const CORE_ATTRIBUTE_CODES = [
+        ProductInterface::NAME,
+        ProductInterface::PRICE,
+        ProductInterface::STATUS,
+        ProductInterface::VISIBILITY,
+        ProductInterface::WEIGHT,
+        ProductInterface::URL_KEY,
+    ];
+
+    /**
+     * Selects whose options come from a static PHP source, not from
+     * eav_attribute_option: their values travel as the ints core defines, so
+     * there is no label to resolve and nothing to auto-create.
+     */
+    public const STATIC_SOURCE_SELECT_CODES = [ProductInterface::STATUS, ProductInterface::VISIBILITY];
 
     /**
      * Context data bag key: options auto-created this batch, as
@@ -42,6 +59,11 @@ class AttributeProcessor implements ProcessorInterface
         $labelsByAttributeCode = [];
         $codes = self::CORE_ATTRIBUTE_CODES;
 
+        // Option labels are harvested from the product's own custom attributes
+        // ONLY. A `store_values` block's custom attributes are resolved against
+        // existing options by EavValueProcessor and never create one, which is
+        // why ImportService::needsWriteLock() does not consult them — extend
+        // both together if that ever changes.
         foreach ($context->getValidProducts() as $product) {
             foreach ($product->getCustomAttributes() ?? [] as $customAttribute) {
                 $code = $customAttribute->getAttributeCode();
@@ -69,8 +91,9 @@ class AttributeProcessor implements ProcessorInterface
             if ($meta === null || !in_array($meta['frontend_input'], ['select', 'multiselect'], true)) {
                 continue;
             }
-            // Skip selects with static sources (status, visibility keep int values).
-            if ($meta['backend_type'] === 'static' || in_array($code, ['status', 'visibility'], true)) {
+            if ($meta['backend_type'] === 'static'
+                || in_array($code, self::STATIC_SOURCE_SELECT_CODES, true)
+            ) {
                 continue;
             }
 

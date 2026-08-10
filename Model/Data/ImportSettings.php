@@ -32,7 +32,7 @@ class ImportSettings implements ImportSettingsInterface
         return $this->storeId;
     }
 
-    public function setStoreId(int $storeId): ImportSettingsInterface
+    public function setStoreId(?int $storeId): ImportSettingsInterface
     {
         $this->storeId = $storeId;
         return $this;
@@ -43,7 +43,7 @@ class ImportSettings implements ImportSettingsInterface
         return $this->rootCategoryId;
     }
 
-    public function setRootCategoryId(int $rootCategoryId): ImportSettingsInterface
+    public function setRootCategoryId(?int $rootCategoryId): ImportSettingsInterface
     {
         $this->rootCategoryId = $rootCategoryId;
         return $this;

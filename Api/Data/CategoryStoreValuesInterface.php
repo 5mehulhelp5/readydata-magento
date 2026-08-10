@@ -18,7 +18,7 @@ namespace ReadyData\Import\Api\Data;
  *
  * @api
  */
-interface CategoryStoreValuesInterface extends CategoryValuesInterface
+interface CategoryStoreValuesInterface extends CategoryValuesInterface, ScopedValuesInterface
 {
     public const STORE_ID = 'store_id';
     public const STORE_VIEW_CODE = 'store_view_code';

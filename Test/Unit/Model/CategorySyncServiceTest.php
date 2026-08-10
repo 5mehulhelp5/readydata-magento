@@ -18,8 +18,11 @@ use ReadyData\Import\Api\Data\CategoryStoreResultInterfaceFactory;
 use ReadyData\Import\Api\Data\CategorySyncResponseInterfaceFactory;
 use ReadyData\Import\Api\Data\CategorySyncResultInterface;
 use ReadyData\Import\Api\Data\CategorySyncResultInterfaceFactory;
+use ReadyData\Import\Api\Data\ScopedValuesInterface;
+use ReadyData\Import\Api\Data\ScopeResultInterface;
 use ReadyData\Import\Logger\Logger;
 use ReadyData\Import\Model\Cache\CategoryPathResolver;
+use ReadyData\Import\Model\Cache\RootCategoryRegistry;
 use ReadyData\Import\Model\Cache\StoreWebsiteMap;
 use ReadyData\Import\Model\Category\CategoryWriter;
 use ReadyData\Import\Model\Category\PathParser;
@@ -49,6 +52,7 @@ class CategorySyncServiceTest extends TestCase
     private LockManagerInterface&MockObject $lockManager;
     private AdapterInterface&MockObject $connection;
     private CategoryPathResolver&MockObject $pathResolver;
+    private RootCategoryRegistry $rootCategories;
     private CategoryResource&MockObject $categoryResource;
     private CategoryWriter&MockObject $writer;
     private CategoryInvalidationHandler&MockObject $invalidationHandler;
@@ -99,6 +103,11 @@ class CategorySyncServiceTest extends TestCase
         $this->categoryResource->method('getRootCategoryIds')
             ->willReturnCallback(fn (): array => $this->rootIds);
 
+        // Real, over the same mock: the fixture mutates $this->rootIds to model a
+        // root created mid-request, and the registry re-reads it after forget() —
+        // which is the contract under test.
+        $this->rootCategories = new RootCategoryRegistry($this->categoryResource);
+
         $this->writer = $this->createMock(CategoryWriter::class);
         $this->invalidationHandler = $this->createMock(CategoryInvalidationHandler::class);
 
@@ -108,6 +117,10 @@ class CategorySyncServiceTest extends TestCase
         // storefront shows a different root than the request's own scope.
         $storeWebsiteMap->method('getRootCategoryId')
             ->willReturnCallback(fn (int $storeId): int => $this->storeRoots[$storeId] ?? $this->storeRootId);
+        $scopeFormatter = new StoreWebsiteMap($this->createMock(ResourceConnection::class));
+        $storeWebsiteMap->method('describeScope')->willReturnCallback(
+            static fn (ScopedValuesInterface $block): string => $scopeFormatter->describeScope($block)
+        );
         $storeWebsiteMap->method('findScopeStoreId')->willReturnCallback(
             fn (?int $storeId, ?string $code): ?int => match (true) {
                 $storeId !== null => in_array($storeId, [0, 1, 2, 3], true) ? $storeId : null,
@@ -125,8 +138,11 @@ class CategorySyncServiceTest extends TestCase
      * that needs a different Config or LockManager builds its own instance
      * rather than reflecting one in.
      */
-    private function buildService(?Config $config = null, ?LockManagerInterface $lockManager = null): CategorySyncService
-    {
+    private function buildService(
+        ?Config $config = null,
+        ?LockManagerInterface $lockManager = null,
+        ?RootCategoryRegistry $rootCategories = null
+    ): CategorySyncService {
         $resultFactory = $this->createMock(CategorySyncResultInterfaceFactory::class);
         $resultFactory->method('create')
             ->willReturnCallback(static fn (): CategorySyncResult => new CategorySyncResult());
@@ -143,6 +159,7 @@ class CategorySyncServiceTest extends TestCase
             $this->resourceConnection,
             new CategoryValidator(new PathParser()),
             $this->pathResolver,
+            $rootCategories ?? $this->rootCategories,
             $this->categoryResource,
             $this->writer,
             $this->storeWebsiteMap,
@@ -320,8 +337,9 @@ class CategorySyncServiceTest extends TestCase
         $this->writer->expects(self::once())->method('create')
             ->with(CategoryModel::TREE_ROOT_ID, 'Outdoor Catalog')
             ->willReturn(self::OUTDOOR_ID);
-        // The resolver memoizes the root name => ID map for the request.
-        $this->pathResolver->expects(self::once())->method('forgetRoots');
+        // The registry memoizes the root name => ID map for the request, so a
+        // deeper path in the same request has to see the new root.
+        $this->pathResolver->expects(self::never())->method('forgetPathsUnderRoot');
 
         $response = $this->service->sync([$this->definition('Outdoor Catalog')]);
 
@@ -359,14 +377,21 @@ class CategorySyncServiceTest extends TestCase
         $this->writer->expects(self::once())->method('update')
             ->with(self::ROOT_ID, 'Main Catalog', self::anything(), null, 0)
             ->willReturn(true);
-        // A root lives only in the resolver's root map — no path cache entry
-        // covers it — so forget() cannot reach it.
-        $this->pathResolver->expects(self::once())->method('forgetRoots')->with('Default Category');
+        // A root lives only in the registry's name => ID map — no path cache
+        // entry covers it — so the resolver's forget() cannot reach it. What the
+        // resolver does own is everything cached BELOW the old name.
+        $registry = $this->createMock(RootCategoryRegistry::class);
+        $registry->method('resolve')->willReturn(
+            ['id' => self::ROOT_ID, 'outcome' => RootCategoryRegistry::OUTCOME_OK,
+             'candidates' => [self::ROOT_ID], 'pinnedName' => 'Default Category']
+        );
+        $registry->expects(self::once())->method('forget');
+        $this->pathResolver->expects(self::once())->method('forgetPathsUnderRoot')->with('Default Category');
 
         $definition = $this->definition('Default Category')
             ->setCategoryId(self::ROOT_ID)
             ->setName('Main Catalog');
-        $response = $this->service->sync([$definition]);
+        $response = $this->buildService(rootCategories: $registry)->sync([$definition]);
 
         self::assertSame(1, $response->getUpdated());
     }
@@ -727,6 +752,57 @@ class CategorySyncServiceTest extends TestCase
             CategorySyncResultInterface::REASON_STALE_PARENT_PATH,
             $byPath['Default Category/Men/Shirts']->getReason()
         );
+    }
+
+    /**
+     * A rename is recorded before the commit that makes it true, and its
+     * store_values blocks run inside the same transaction. When one of them
+     * throws, the rollback undoes the rename — so the bookkeeping has to go with
+     * it, or every later entry under the old path is skipped for a rename this
+     * request no longer performed.
+     */
+    public function testARolledBackRenameDoesNotMakeLaterEntriesStale(): void
+    {
+        $this->categoryResource->method('getExistingByIds')->willReturn([
+            self::MEN_ID => [
+                'entity_id' => self::MEN_ID,
+                'parent_id' => self::ROOT_ID,
+                'level' => 2,
+                'path' => '1/2/10',
+            ],
+        ]);
+        $this->categoryResource->method('getChildIdsByParentIds')->willReturn([]);
+        $this->pathResolver->method('lookupPaths')->willReturn(['Default Category/Men' => self::MEN_ID]);
+        // The default-scope rename lands; the store-scoped block does not — a
+        // store-scoped url_key colliding in url_rewrite, say.
+        $this->writer->method('update')->willReturnCallback(
+            function (int $id, ?string $name, $values, ?int $position, int $storeId): bool {
+                if ($storeId !== 0) {
+                    throw new LocalizedException(__('URL key for specified store already exists.'));
+                }
+                return true;
+            }
+        );
+        $this->writer->method('create')->willReturn(self::SHIRTS_ID);
+
+        $response = $this->service->sync([
+            $this->definition('Default Category/Men')
+                ->setCategoryId(self::MEN_ID)
+                ->setName('Gentlemen')
+                ->setStoreValues([(new CategoryStoreValues())->setStoreId(1)->setName('Herren')]),
+            $this->definition('Default Category/Men/Shirts'),
+        ]);
+
+        $byPath = [];
+        foreach ($response->getResults() as $result) {
+            $byPath[$result->getPath()] = $result;
+        }
+        self::assertSame(CategorySyncResultInterface::STATUS_ERROR, $byPath['Default Category/Men']->getStatus());
+        self::assertSame(
+            CategorySyncResultInterface::STATUS_CREATED,
+            $byPath['Default Category/Men/Shirts']->getStatus()
+        );
+        self::assertNull($byPath['Default Category/Men/Shirts']->getReason());
     }
 
     public function testDisabledSyncSkipsEverythingWithoutTakingTheLock(): void
@@ -1402,7 +1478,10 @@ class CategorySyncServiceTest extends TestCase
         $result = $response->getResults()[0];
         self::assertSame(CategorySyncResultInterface::STATUS_UPDATED, $result->getStatus());
         $storeResults = $result->getStoreResults();
-        self::assertSame(CategorySyncResultInterface::REASON_UNKNOWN_STORE, $storeResults[0]->getReason());
+        // No store view resolved, so no store ID to report it under — and 0
+        // would name the default scope, which this list never covers.
+        self::assertNull($storeResults[0]->getStoreId());
+        self::assertSame(ScopeResultInterface::REASON_UNKNOWN_STORE, $storeResults[0]->getReason());
         self::assertSame(CategoryStoreResultInterface::STATUS_UPDATED, $storeResults[1]->getStatus());
     }
 
@@ -1419,7 +1498,8 @@ class CategorySyncServiceTest extends TestCase
         $response = $this->service->sync([$definition]);
 
         $storeResults = $response->getResults()[0]->getStoreResults();
-        self::assertSame(CategorySyncResultInterface::REASON_INVALID_DEFINITION, $storeResults[0]->getReason());
+        self::assertNull($storeResults[0]->getStoreId());
+        self::assertSame(ScopeResultInterface::REASON_INVALID_DEFINITION, $storeResults[0]->getReason());
         self::assertStringContainsString('cannot name the default scope', $storeResults[0]->getMessages()[0]);
     }
 
@@ -1437,7 +1517,7 @@ class CategorySyncServiceTest extends TestCase
 
         $storeResults = $response->getResults()[0]->getStoreResults();
         self::assertSame(CategoryStoreResultInterface::STATUS_UPDATED, $storeResults[0]->getStatus());
-        self::assertSame(CategorySyncResultInterface::REASON_INVALID_DEFINITION, $storeResults[1]->getReason());
+        self::assertSame(ScopeResultInterface::REASON_INVALID_DEFINITION, $storeResults[1]->getReason());
         self::assertStringContainsString('merge them', $storeResults[1]->getMessages()[0]);
     }
 
@@ -1455,7 +1535,7 @@ class CategorySyncServiceTest extends TestCase
         $response = $this->service->sync([$definition]);
 
         $storeResults = $response->getResults()[0]->getStoreResults();
-        self::assertSame(CategorySyncResultInterface::REASON_WRONG_STORE_ROOT, $storeResults[0]->getReason());
+        self::assertSame(ScopeResultInterface::REASON_WRONG_STORE_ROOT, $storeResults[0]->getReason());
     }
 
     public function testACategoryThatWasSkippedReportsNoScopesAtAll(): void
@@ -1581,14 +1661,15 @@ class CategorySyncServiceTest extends TestCase
         $this->writer->expects(self::once())
             ->method('move')
             ->with(self::MEN_ID, CategoryModel::TREE_ROOT_ID);
-        // The root name => ID map the resolver memoizes has a new entry.
-        $this->pathResolver->expects(self::once())->method('forgetRoots');
+        // The memoized root name => ID map has a new entry.
+        $registry = $this->createMock(RootCategoryRegistry::class);
+        $registry->expects(self::once())->method('forget');
 
         $definition = (new CategoryDefinition())
             ->setCategoryId(self::MEN_ID)
             ->setName('Men')
             ->setParentCategoryId(CategoryModel::TREE_ROOT_ID);
-        $response = $this->service->sync([$definition]);
+        $response = $this->buildService(rootCategories: $registry)->sync([$definition]);
 
         $result = $response->getResults()[0];
         self::assertSame(CategorySyncResultInterface::STATUS_UPDATED, $result->getStatus());

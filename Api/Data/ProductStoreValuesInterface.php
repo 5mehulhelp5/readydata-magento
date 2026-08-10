@@ -18,16 +18,17 @@ namespace ReadyData\Import\Api\Data;
  * is refused here rather than written — see {@see getCustomAttributes()}.
  *
  * The fields are exactly the ones that carry attribute values at the default
- * scope; everything else on the product (sku, type, attribute set, websites,
- * categories, links, media, stock, tier prices) has no store dimension and
- * stays on the product itself.
+ * scope — {@see ProductValuesInterface}, shared with the product itself, so the
+ * two can never drift. Everything else on the product (sku, type, attribute
+ * set, websites, categories, links, media, stock, tier prices) has no store
+ * dimension and stays on the product.
  *
  * A `url_key` here is a real store-scoped slug: that store view's rewrites are
  * generated from it, and the others keep the default one.
  *
  * @api
  */
-interface ProductStoreValuesInterface
+interface ProductStoreValuesInterface extends ProductValuesInterface, ScopedValuesInterface
 {
     public const STORE_ID = 'store_id';
     public const STORE_VIEW_CODE = 'store_view_code';
@@ -54,10 +55,10 @@ interface ProductStoreValuesInterface
     public function getStoreId(): ?int;
 
     /**
-     * @param int $storeId
+     * @param int|null $storeId
      * @return $this
      */
-    public function setStoreId(int $storeId): self;
+    public function setStoreId(?int $storeId): self;
 
     /**
      * Target store view code, for callers that address stores by code.
@@ -68,69 +69,10 @@ interface ProductStoreValuesInterface
     public function getStoreViewCode(): ?string;
 
     /**
-     * @param string $storeViewCode
+     * @param string|null $storeViewCode
      * @return $this
      */
-    public function setStoreViewCode(string $storeViewCode): self;
-
-    /**
-     * @return string|null
-     */
-    public function getName(): ?string;
-
-    /**
-     * @param string $name
-     * @return $this
-     */
-    public function setName(string $name): self;
-
-    /**
-     * @return float|null
-     */
-    public function getPrice(): ?float;
-
-    /**
-     * @param float $price
-     * @return $this
-     */
-    public function setPrice(float $price): self;
-
-    /**
-     * 1 = enabled, 2 = disabled.
-     *
-     * @return int|null
-     */
-    public function getStatus(): ?int;
-
-    /**
-     * @param int $status
-     * @return $this
-     */
-    public function setStatus(int $status): self;
-
-    /**
-     * 1 = not visible, 2 = catalog, 3 = search, 4 = catalog & search.
-     *
-     * @return int|null
-     */
-    public function getVisibility(): ?int;
-
-    /**
-     * @param int $visibility
-     * @return $this
-     */
-    public function setVisibility(int $visibility): self;
-
-    /**
-     * @return float|null
-     */
-    public function getWeight(): ?float;
-
-    /**
-     * @param float $weight
-     * @return $this
-     */
-    public function setWeight(float $weight): self;
+    public function setStoreViewCode(?string $storeViewCode): self;
 
     /**
      * Store-scoped URL key. That store view's rewrites are generated from it,

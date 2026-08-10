@@ -6,6 +6,7 @@ declare(strict_types=1);
 
 namespace ReadyData\Import\Model\Processor;
 
+use ReadyData\Import\Api\Data\ProductInterface;
 use ReadyData\Import\Model\BatchContext;
 use ReadyData\Import\Model\Cache\AttributeMetadataCache;
 use ReadyData\Import\Model\Cache\StoreWebsiteMap;
@@ -326,18 +327,19 @@ class UrlRewriteProcessor implements ProcessorInterface
         if (!$linkIds) {
             return [];
         }
-        $meta = $this->attributeMetadataCache->get('visibility');
+        $meta = $this->attributeMetadataCache->get(ProductInterface::VISIBILITY);
         if ($meta === null) {
             return [];
         }
         $attributeId = $meta['attribute_id'];
-        $store0 = $this->eavValue->getValues('int', $attributeId, $linkIds, 0);
+        $backendType = $meta['backend_type'];
+        $store0 = $this->eavValue->getValues($backendType, $attributeId, $linkIds, 0);
 
         $result = [];
         foreach ($storeIds as $storeId) {
             $storeValues = $storeId === 0
                 ? $store0
-                : $this->eavValue->getValues('int', $attributeId, $linkIds, $storeId);
+                : $this->eavValue->getValues($backendType, $attributeId, $linkIds, $storeId);
             // Store-specific values override the store-0 defaults.
             $result[$storeId] = array_map('intval', $storeValues + $store0);
         }
@@ -378,9 +380,13 @@ class UrlRewriteProcessor implements ProcessorInterface
             }
         }
         if ($missingLinkIds) {
-            $meta = $this->attributeMetadataCache->get('url_key');
+            $meta = $this->attributeMetadataCache->get(ProductInterface::URL_KEY);
             if ($meta !== null) {
-                $stored = $this->eavValue->getValues('varchar', $meta['attribute_id'], array_keys($missingLinkIds));
+                $stored = $this->eavValue->getValues(
+                    $meta['backend_type'],
+                    $meta['attribute_id'],
+                    array_keys($missingLinkIds)
+                );
                 foreach ($stored as $linkId => $urlKey) {
                     $urlKeys[$missingLinkIds[(int)$linkId]][0] = (string)$urlKey;
                 }
@@ -406,7 +412,7 @@ class UrlRewriteProcessor implements ProcessorInterface
     private function backfillScopedUrlKeys(BatchContext $context, array $urlKeys, array $storeIds): array
     {
         $linkIds = $context->get(EntityProcessor::CONTEXT_LINK_IDS, []);
-        $meta = $this->attributeMetadataCache->get('url_key');
+        $meta = $this->attributeMetadataCache->get(ProductInterface::URL_KEY);
         $storeIds = array_values(array_filter($storeIds, static fn (int $storeId): bool => $storeId !== 0));
         if ($meta === null || !$storeIds || !$linkIds) {
             return $urlKeys;
@@ -422,18 +428,25 @@ class UrlRewriteProcessor implements ProcessorInterface
             return $urlKeys;
         }
 
-        foreach ($storeIds as $storeId) {
-            $stored = $this->eavValue->getValues(
-                'varchar',
-                $meta['attribute_id'],
-                array_keys($skuByLinkId),
-                $storeId
-            );
-            foreach ($stored as $linkId => $urlKey) {
-                $sku = $skuByLinkId[(int)$linkId] ?? null;
+        // Every scope in one query — the same read MediaProcessor uses for its
+        // store-scoped role attributes. Per-store reads would cost one query per
+        // store view on a catalog where that number is the whole point.
+        $wanted = array_fill_keys($storeIds, true);
+        $stored = $this->eavValue->getValuesForStores(
+            $meta['backend_type'],
+            [$meta['attribute_id']],
+            array_keys($skuByLinkId)
+        );
+
+        foreach ($stored as $linkId => $byAttribute) {
+            $sku = $skuByLinkId[(int)$linkId] ?? null;
+            if ($sku === null) {
+                continue;
+            }
+            foreach ($byAttribute[$meta['attribute_id']] ?? [] as $storeId => $urlKey) {
                 // Never over the batch's own write: that is the newer value.
-                if ($sku !== null && !isset($urlKeys[$sku][$storeId]) && (string)$urlKey !== '') {
-                    $urlKeys[$sku][$storeId] = (string)$urlKey;
+                if (isset($wanted[$storeId]) && !isset($urlKeys[$sku][$storeId]) && (string)$urlKey !== '') {
+                    $urlKeys[$sku][(int)$storeId] = (string)$urlKey;
                 }
             }
         }

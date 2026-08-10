@@ -78,11 +78,15 @@ interface ImportResultInterface
 
     /**
      * One entry per store scope this product's payload named beyond the
-     * request's own — that is, per resolved `store_values` block. Null when the
-     * payload named none, which is every payload that predates `store_values`.
+     * request's own — that is, one per `store_values` block, in payload order.
+     * Null when the payload named none, which is every payload that predates
+     * `store_values`.
      *
-     * A block whose store view could not be resolved has no scope to report
-     * under and stays a product-level message.
+     * A block whose store view could not be resolved still gets its row, with
+     * `store_id: null` and a `reason`, so the rows and the blocks stay in step.
+     * The exception is a block naming the request's own scope: it is merged into
+     * the product's own pass, and the product's top-level result is already that
+     * scope's outcome.
      *
      * @return \ReadyData\Import\Api\Data\StoreResultInterface[]|null
      */

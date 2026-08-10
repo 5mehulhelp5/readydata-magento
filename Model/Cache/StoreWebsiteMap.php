@@ -8,6 +8,8 @@ namespace ReadyData\Import\Model\Cache;
 
 use Magento\Framework\App\ResourceConnection;
 use Magento\Framework\Exception\LocalizedException;
+use Magento\Store\Model\Store;
+use ReadyData\Import\Api\Data\ScopedValuesInterface;
 
 /**
  * Request-scoped cache of store/website code => ID maps, read straight
@@ -34,7 +36,7 @@ class StoreWebsiteMap
      */
     public function resolveStoreId(?string $storeViewCode): int
     {
-        if ($storeViewCode === null || $storeViewCode === '' || $storeViewCode === 'admin') {
+        if ($storeViewCode === null || $storeViewCode === '' || $storeViewCode === Store::ADMIN_CODE) {
             return 0;
         }
 
@@ -76,14 +78,35 @@ class StoreWebsiteMap
         if ($storeId !== null) {
             return $this->hasStoreId($storeId) ? $storeId : null;
         }
+        // A block that names no scope at all resolves to nothing, where an
+        // omitted request-level scope means the default one — hence the guard
+        // before delegating.
         if ($storeViewCode === null || $storeViewCode === '') {
             return null;
         }
-        if ($storeViewCode === 'admin') {
-            return 0;
+
+        try {
+            return $this->resolveStoreId($storeViewCode);
+        } catch (LocalizedException) {
+            return null;
+        }
+    }
+
+    /**
+     * How a `store_values` block is named back to the caller when its scope
+     * cannot be resolved — one wording for both endpoints, since the block shape
+     * is the same ({@see ScopedValuesInterface}).
+     */
+    public function describeScope(ScopedValuesInterface $block): string
+    {
+        if ($block->getStoreId() !== null) {
+            return sprintf('store view ID %d', $block->getStoreId());
+        }
+        if ((string)$block->getStoreViewCode() !== '') {
+            return sprintf('store view "%s"', $block->getStoreViewCode());
         }
 
-        return $this->getStoreMap()[$storeViewCode] ?? null;
+        return 'a block naming no store view';
     }
 
     /**

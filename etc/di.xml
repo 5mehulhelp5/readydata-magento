@@ -137,6 +137,13 @@
     <type name="ReadyData\Import\Model\Cache\AttributeMetadataCache" shared="true"/>
     <type name="ReadyData\Import\Model\Cache\StoreWebsiteMap" shared="true"/>
     <type name="ReadyData\Import\Model\Cache\CategoryPathResolver" shared="true"/>
+    <!--
+        Shared is load-bearing here, not just an optimization: the category
+        endpoint invalidates this memo whenever it creates, renames, promotes or
+        removes a root, and a second instance would keep serving the stale map to
+        whichever consumer held it.
+    -->
+    <type name="ReadyData\Import\Model\Cache\RootCategoryRegistry" shared="true"/>
     <type name="ReadyData\Import\Model\Cache\CustomerGroupMap" shared="true"/>
     <type name="ReadyData\Import\Model\ResourceModel\AttributeOption" shared="true"/>
     <type name="ReadyData\Import\Model\ResourceModel\AmastyAttribute" shared="true"/>

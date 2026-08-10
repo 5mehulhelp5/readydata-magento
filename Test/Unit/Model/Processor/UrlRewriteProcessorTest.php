@@ -61,6 +61,7 @@ class UrlRewriteProcessorTest extends TestCase
 
         $this->eavValue = $this->createMock(EavValue::class);
         $this->eavValue->method('getValues')->willReturn([]);
+        $this->eavValue->method('getValuesForStores')->willReturn([]);
 
         $this->attributeMetadataCache = $this->createMock(AttributeMetadataCache::class);
 
@@ -155,11 +156,11 @@ class UrlRewriteProcessorTest extends TestCase
                 : null
         );
         $this->eavValue = $this->createMock(EavValue::class);
-        $this->eavValue->method('getValues')->willReturnCallback(
-            // Only store 2 carries an override; store 1 falls back to default.
-            static fn (string $type, int $attributeId, array $linkIds, int $storeId = 0): array =>
-                $storeId === 2 ? [77 => 'weisses-hemd'] : []
-        );
+        $this->eavValue->method('getValues')->willReturn([]);
+        // Every scope in one read: only store 2 carries an override, store 1
+        // falls back to the default key.
+        $this->eavValue->expects(self::once())->method('getValuesForStores')
+            ->willReturn([77 => [97 => [2 => 'weisses-hemd']]]);
         $this->rebuildProcessor();
 
         $context = $this->createContext(['SKU-A' => 42], urlKey: 'white-shirt', linkIds: ['SKU-A' => 77]);
@@ -185,7 +186,8 @@ class UrlRewriteProcessorTest extends TestCase
                 : null
         );
         $this->eavValue = $this->createMock(EavValue::class);
-        $this->eavValue->method('getValues')->willReturn([77 => 'stale-slug']);
+        $this->eavValue->method('getValues')->willReturn([]);
+        $this->eavValue->method('getValuesForStores')->willReturn([77 => [97 => [2 => 'stale-slug']]]);
         $this->rebuildProcessor();
 
         $context = $this->createContext(['SKU-A' => 42], urlKey: 'white-shirt', linkIds: ['SKU-A' => 77]);

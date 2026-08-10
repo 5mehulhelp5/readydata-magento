@@ -33,6 +33,7 @@ use ReadyData\Import\Model\ImportState;
 use ReadyData\Import\Model\Indexer\InvalidationHandler;
 use ReadyData\Import\Model\Processor\PreparableInterface;
 use ReadyData\Import\Model\Processor\ProcessorInterface;
+use ReadyData\Import\Model\ResourceModel\ProductEntity;
 
 /**
  * Covers the pre-transaction phase contract; the pipeline itself is exercised by
@@ -48,9 +49,16 @@ class ImportServiceTest extends TestCase
     /** @var string[] ordered log of the calls the tests care about */
     private array $calls = [];
 
+    /**
+     * @var string[] SKUs the catalog already holds. The lock's pre-flight check
+     *      reads this, because an insert of an unknown SKU is itself a race.
+     */
+    private array $existingSkus = [];
+
     protected function setUp(): void
     {
         $this->calls = [];
+        $this->existingSkus = ['P1'];
 
         $this->connection = $this->createMock(AdapterInterface::class);
         $this->connection->method('beginTransaction')->willReturnCallback(function (): AdapterInterface {
@@ -175,8 +183,9 @@ class ImportServiceTest extends TestCase
 
     /**
      * The lock serializes every import against every other one, and against the
-     * category endpoint. A payload that can reach neither read-then-create has
-     * nothing to serialize against and should not pay for it.
+     * category endpoint. A payload that can reach no read-then-create has
+     * nothing to serialize against and should not pay for it — a price refresh
+     * over products that already exist, typically.
      */
     public function testAPayloadThatCanCreateNothingUnkeyedRunsWithoutTheLock(): void
     {
@@ -184,6 +193,41 @@ class ImportServiceTest extends TestCase
         $this->lockManager->expects(self::never())->method('unlock');
 
         $this->serviceWith([])->import([$this->product('P1')->setPrice(9.99)]);
+    }
+
+    /**
+     * catalog_product_entity.sku carries a plain index, not a unique key —
+     * Magento enforces SKU uniqueness in PHP. Two concurrent runs naming the
+     * same new SKU both miss the read and both insert, and no payload field
+     * reveals it: only the database can say whether the row is already there.
+     */
+    public function testAnUnknownSkuTakesTheLock(): void
+    {
+        $this->existingSkus = [];
+        $this->lockManager->expects(self::once())->method('lock')->willReturn(true);
+        $this->lockManager->expects(self::once())->method('unlock');
+
+        $this->serviceWith([])->import([$this->product('P1')->setPrice(9.99)]);
+    }
+
+    /**
+     * catalog_product_entity_media_gallery has no key on (attribute_id, value),
+     * so two concurrent runs carrying the same file for one product both insert
+     * it. `[]` counts too: it means "remove everything", which is still work.
+     */
+    public function testAMediaFieldTakesTheLock(): void
+    {
+        $this->lockManager->expects(self::once())->method('lock')->willReturn(true);
+
+        $this->serviceWith([])->import([$this->product('P1')->setMedia([])]);
+    }
+
+    public function testAMediaFieldRunsLockFreeWhenTheMediaStepIsDisabled(): void
+    {
+        // A disabled media importer inserts nothing, so nothing can race.
+        $this->lockManager->expects(self::never())->method('lock');
+
+        $this->serviceWith([], mediaEnabled: false)->import([$this->product('P1')->setMedia([])]);
     }
 
     public function testACategoriesFieldTakesTheLock(): void
@@ -198,9 +242,8 @@ class ImportServiceTest extends TestCase
     }
 
     /**
-     * eav_attribute_option_value is unique on (store_id, option_id), never on
-     * the label, so two concurrent imports writing the same new option label
-     * both miss and both insert.
+     * eav_attribute_option has no key on the label at all, so two concurrent
+     * imports writing the same new option label both miss and both insert.
      */
     public function testCustomAttributesTakeTheLockWhenOptionAutoCreationIsOn(): void
     {
@@ -223,11 +266,14 @@ class ImportServiceTest extends TestCase
         $this->serviceWith([], createMissingOptions: false)->import([$product]);
     }
 
-    public function testCustomAttributesInsideAStoreValuesBlockAlsoTakeTheLock(): void
+    /**
+     * A scoped block's custom attributes only ever resolve option labels they
+     * did not create — AttributeProcessor harvests labels from the product's own
+     * custom attributes alone — so locking for them buys nothing.
+     */
+    public function testCustomAttributesInsideAStoreValuesBlockDoNotTakeTheLock(): void
     {
-        // A scoped block reaches the same option auto-creation the product's
-        // own custom attributes do.
-        $this->lockManager->expects(self::once())->method('lock')->willReturn(true);
+        $this->lockManager->expects(self::never())->method('lock');
 
         $product = $this->product('P1')->setStoreValues([
             (new ProductStoreValues())->setStoreId(3)->setCustomAttributes([
@@ -295,10 +341,44 @@ class ImportServiceTest extends TestCase
         $storeResults = $response->getResults()[0]->getStoreResults();
         self::assertCount(2, $storeResults);
         self::assertSame([5, 3], array_map(static fn ($r): int => $r->getStoreId(), $storeResults));
-        self::assertSame(StoreResultInterface::STATUS_WRITTEN, $storeResults[0]->getStatus());
+        self::assertSame(StoreResultInterface::STATUS_UPDATED, $storeResults[0]->getStatus());
         self::assertSame([], $storeResults[0]->getMessages());
         self::assertSame(StoreResultInterface::STATUS_SKIPPED, $storeResults[1]->getStatus());
         self::assertSame(['every value it carried was refused'], $storeResults[1]->getMessages());
+        self::assertNull($storeResults[0]->getReason());
+    }
+
+    /**
+     * One row per block the payload sent, whether or not its store view existed
+     * — a caller matching rows against blocks has nothing to reconcile. There is
+     * no store ID to report it under, and 0 would name the default scope, which
+     * this list never covers.
+     */
+    public function testAnUnresolvableBlockReportsItsOwnRowWithoutAStoreId(): void
+    {
+        $processor = $this->createMock(ProcessorInterface::class);
+        $processor->method('isEnabled')->willReturn(true);
+        $processor->method('getSortOrder')->willReturn(300);
+        $processor->method('process')->willReturnCallback(
+            static function (BatchContext $context): void {
+                $context->registerUnresolvedScope(
+                    'P1',
+                    StoreResultInterface::REASON_UNKNOWN_STORE,
+                    'no such store view'
+                );
+            }
+        );
+
+        $storeResults = $this->serviceWith([$processor])
+            ->import([$this->product('P1')])
+            ->getResults()[0]
+            ->getStoreResults();
+
+        self::assertCount(1, $storeResults);
+        self::assertNull($storeResults[0]->getStoreId());
+        self::assertSame(StoreResultInterface::STATUS_SKIPPED, $storeResults[0]->getStatus());
+        self::assertSame(StoreResultInterface::REASON_UNKNOWN_STORE, $storeResults[0]->getReason());
+        self::assertSame(['no such store view'], $storeResults[0]->getMessages());
     }
 
     /**
@@ -400,13 +480,23 @@ class ImportServiceTest extends TestCase
     private function serviceWith(
         array $processors,
         int $storeId = 0,
-        bool $createMissingOptions = false
+        bool $createMissingOptions = false,
+        bool $mediaEnabled = true
     ): ImportService {
         $config = $this->createMock(Config::class);
         $config->method('isEnabled')->willReturn(true);
         $config->method('getBatchSize')->willReturn(500);
         $config->method('isContinueOnError')->willReturn(true);
         $config->method('isCreateMissingOptions')->willReturn($createMissingOptions);
+        $config->method('isMediaEnabled')->willReturn($mediaEnabled);
+
+        $productEntity = $this->createMock(ProductEntity::class);
+        $productEntity->method('getExistingBySkus')->willReturnCallback(
+            fn (array $skus): array => array_fill_keys(
+                array_values(array_intersect($skus, $this->existingSkus)),
+                ['entity_id' => 42]
+            )
+        );
 
         $resourceConnection = $this->createMock(ResourceConnection::class);
         $resourceConnection->method('getConnection')->willReturn($this->connection);
@@ -431,6 +521,7 @@ class ImportServiceTest extends TestCase
             $resourceConnection,
             $this->lockManager,
             $batchContextFactory,
+            $productEntity,
             $storeWebsiteMap,
             $this->invalidationHandler,
             $this->createMock(ImportEventDispatcher::class),

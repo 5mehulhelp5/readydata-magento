@@ -24,6 +24,7 @@ use ReadyData\Import\Model\Indexer\InvalidationHandler;
 use ReadyData\Import\Model\Processor\CategoryLinkProcessor;
 use ReadyData\Import\Model\Processor\PreparableInterface;
 use ReadyData\Import\Model\Processor\ProcessorInterface;
+use ReadyData\Import\Model\ResourceModel\ProductEntity;
 
 /**
  * Orchestrates a bulk import: batching, transactions, the processor
@@ -32,32 +33,11 @@ use ReadyData\Import\Model\Processor\ProcessorInterface;
 class ImportService
 {
     /**
-     * Held by every request that can perform an **unkeyed read-then-create**:
-     * look for a row, not find it, insert it — where the database has no unique
-     * key to catch a second request doing the same thing at the same time.
-     *
-     * There are two such sequences, and the lock exists for both:
-     *
-     * - **categories.** The product import creates them on demand (see
-     *   CategoryPathResolver) and so does the category sync endpoint. Nothing
-     *   is unique on (parent_id, name) or on a category url_key, so two
-     *   concurrent runs both miss and both insert — leaving a duplicate sibling,
-     *   or a url_rewrite unique-key violation that fails whichever request
-     *   loses.
-     * - **attribute options.** With option auto-creation on, AttributeProcessor
-     *   creates missing select/multiselect options. `eav_attribute_option_value`
-     *   is unique on (store_id, option_id), NOT on the label, so two concurrent
-     *   runs writing a product with the same new option label both miss and both
-     *   insert, and the attribute ends up with two options of the same name.
-     *
-     * A request that can do neither does not take the lock at all — see
-     * {@see needsWriteLock()}. The name is deliberately generic: it is one lock
-     * for both races, and the value is unchanged from when it guarded only the
-     * tree.
+     * @deprecated Use {@see ImportLocks::PRODUCT_IMPORT}, which documents what
+     *             the lock guards and is shared with the category endpoint.
+     * @see ImportLocks::PRODUCT_IMPORT
      */
-    public const WRITE_LOCK_NAME = 'readydata_product_import';
-
-    private const LOCK_TIMEOUT_SEC = 10;
+    public const WRITE_LOCK_NAME = ImportLocks::PRODUCT_IMPORT;
 
     /**
      * @var ProcessorInterface[]
@@ -72,6 +52,7 @@ class ImportService
         private readonly ResourceConnection $resourceConnection,
         private readonly LockManagerInterface $lockManager,
         private readonly BatchContextFactory $batchContextFactory,
+        private readonly ProductEntity $productEntity,
         private readonly StoreWebsiteMap $storeWebsiteMap,
         private readonly InvalidationHandler $invalidationHandler,
         private readonly ImportEventDispatcher $eventDispatcher,
@@ -116,7 +97,7 @@ class ImportService
         );
 
         $needsLock = $this->needsWriteLock($products);
-        if ($needsLock && !$this->lockManager->lock(self::WRITE_LOCK_NAME, self::LOCK_TIMEOUT_SEC)) {
+        if ($needsLock && !$this->lockManager->lock(ImportLocks::PRODUCT_IMPORT, ImportLocks::TIMEOUT_SEC)) {
             throw new LocalizedException(__('Another import is already running. Try again later.'));
         }
 
@@ -153,7 +134,7 @@ class ImportService
         } finally {
             $this->importState->leave();
             if ($needsLock) {
-                $this->lockManager->unlock(self::WRITE_LOCK_NAME);
+                $this->lockManager->unlock(ImportLocks::PRODUCT_IMPORT);
             }
         }
 
@@ -266,7 +247,7 @@ class ImportService
     {
         $this->resourceConnection->getConnection()->fetchOne('SELECT 1');
 
-        if ($holdsLock && !$this->lockManager->isLocked(self::WRITE_LOCK_NAME)) {
+        if ($holdsLock && !$this->lockManager->isLocked(ImportLocks::PRODUCT_IMPORT)) {
             throw new \RuntimeException(
                 'the import lock was lost during preparation, most likely with the database connection'
             );
@@ -274,32 +255,57 @@ class ImportService
     }
 
     /**
-     * Whether this payload can perform either of the unkeyed read-then-create
-     * sequences {@see WRITE_LOCK_NAME} exists for. A payload that can do
-     * neither runs lock-free, concurrently with anything else.
+     * Whether this payload can reach any of the unkeyed read-then-create
+     * sequences {@see ImportLocks::PRODUCT_IMPORT} exists for. A payload that
+     * can reach none runs lock-free, concurrently with anything else — a price
+     * or stock refresh over products that already exist, typically.
      *
-     * Both tests are deliberately **conservative** — they ask what the payload
+     * The first test costs one indexed query and is the reason the others are
+     * worth making: `catalog_product_entity.sku` is NOT unique, so an insert of
+     * an unknown SKU is itself a race, and no payload field reveals it — only
+     * the database can say whether the row is already there. Reading it here
+     * rather than trusting the payload is what keeps the lock-free path narrow
+     * enough to be safe. A SKU that exists now and is deleted before the batch
+     * writes would slip through; a product vanishing mid-import fails the batch
+     * on its own terms.
+     *
+     * The rest are deliberately **conservative** — they ask what the payload
      * *could* reach, not what it would turn out to do:
      *
      * - a `categories` field is the only way into CategoryPathResolver, and
      *   whether any of its entries turns out to need creating is not knowable
      *   without resolving the tree, which is the work the lock is protecting;
+     * - a `media` field is the only way into a gallery insert, and whether a
+     *   file is already on the product is not knowable without the gallery read
+     *   that same insert follows. `[]` counts: it means "remove everything",
+     *   which is still work;
      * - a custom attribute value is the only way into option auto-creation, and
      *   telling a `select` from a text attribute needs the metadata cache the
      *   pipeline warms later. `status` and `visibility` are selects too, but
      *   AttributeProcessor skips them, and they are first-class fields here
-     *   rather than custom attributes.
+     *   rather than custom attributes. `store_values` blocks are deliberately
+     *   NOT consulted: their custom attributes only ever resolve option labels
+     *   they did not create — see AttributeProcessor::ensureOptions().
      *
      * Erring towards taking the lock costs a serialized request; erring the
-     * other way costs a duplicate category or a duplicate attribute option, and
-     * neither is cheap to undo.
+     * other way costs a duplicate product, category, image or attribute option,
+     * and none of those is cheap to undo.
      *
      * @param ProductInterface[] $products
      */
     private function needsWriteLock(array $products): bool
     {
+        $skus = array_map(static fn (ProductInterface $product): string => $product->getSku(), $products);
+        if (count($this->productEntity->getExistingBySkus($skus)) !== count($skus)) {
+            return true;
+        }
+
+        $mediaEnabled = $this->config->isMediaEnabled();
         foreach ($products as $product) {
             if ($product->getCategories() !== null) {
+                return true;
+            }
+            if ($mediaEnabled && $product->getMedia() !== null) {
                 return true;
             }
         }
@@ -311,11 +317,6 @@ class ImportService
         foreach ($products as $product) {
             if ($product->getCustomAttributes()) {
                 return true;
-            }
-            foreach ($product->getStoreValues() ?? [] as $storeValues) {
-                if ($storeValues->getCustomAttributes()) {
-                    return true;
-                }
             }
         }
 
@@ -409,13 +410,14 @@ class ImportService
     private function buildStoreResults(BatchContext $context, string|int $sku): array
     {
         $storeResults = [];
-        foreach ($context->getScopeStoreIds($sku) as $scopeStoreId) {
+        foreach ($context->getScopeResults($sku) as $scope) {
             /** @var StoreResultInterface $storeResult */
             $storeResult = $this->storeResultFactory->create();
             $storeResults[] = $storeResult
-                ->setStoreId($scopeStoreId)
-                ->setStatus($context->getScopeStatus($sku, $scopeStoreId))
-                ->setMessages($context->getScopeMessages($sku, $scopeStoreId));
+                ->setStoreId($scope['store_id'])
+                ->setStatus($scope['status'])
+                ->setReason($scope['reason'])
+                ->setMessages($scope['messages']);
         }
 
         return $storeResults;

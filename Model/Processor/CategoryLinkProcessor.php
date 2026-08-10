@@ -8,6 +8,7 @@ namespace ReadyData\Import\Model\Processor;
 
 use ReadyData\Import\Model\BatchContext;
 use ReadyData\Import\Model\Cache\CategoryPathResolver;
+use ReadyData\Import\Model\Cache\RootCategoryRegistry;
 use ReadyData\Import\Model\Category\PathParser;
 use ReadyData\Import\Model\Config;
 use ReadyData\Import\Model\ResourceModel\Category as CategoryResource;
@@ -48,17 +49,12 @@ class CategoryLinkProcessor implements ProcessorInterface
     public const CONTEXT_AFFECTED_CATEGORY_IDS = 'affected_category_ids';
     public const CONTEXT_AFFECTED_PRODUCT_IDS = 'affected_product_ids';
 
-    /**
-     * @var array<int, true>|null every root category ID, memoized per request;
-     *      read only to validate an explicit categories_replace_scope
-     */
-    private ?array $rootIds = null;
-
     public function __construct(
         private readonly CategoryLink $categoryLink,
         private readonly CategoryPathResolver $pathResolver,
         private readonly PathParser $pathParser,
         private readonly CategoryResource $categoryResource,
+        private readonly RootCategoryRegistry $rootCategories,
         private readonly Config $config
     ) {
     }
@@ -277,13 +273,21 @@ class CategoryLinkProcessor implements ProcessorInterface
 
         $keptCount = count($removals) - count($permitted);
         if ($keptCount > 0) {
-            $context->addMessage($sku, sprintf(
-                'Category replacement was limited to root %s; %d existing assignment(s) outside it were kept.',
-                $allowedRoots === []
-                    ? 'categories: none'
-                    : 'categor' . (count($allowedRoots) === 1 ? 'y ' : 'ies ') . implode(', ', $allowedRoots),
-                $keptCount
-            ));
+            // Two whole sentences rather than one with inflected fragments: a
+            // message assembled from "categor" + "y"/"ies" cannot be translated
+            // and reads as a bug when the list is empty.
+            $context->addMessage($sku, $allowedRoots === []
+                ? sprintf(
+                    'Category replacement was limited to no root categories, so nothing was removed;'
+                    . ' %d existing assignment(s) were kept.',
+                    $keptCount
+                )
+                : sprintf(
+                    'Category replacement was limited to root categories %s;'
+                    . ' %d existing assignment(s) outside them were kept.',
+                    implode(', ', $allowedRoots),
+                    $keptCount
+                ));
         }
 
         return $permitted;
@@ -338,16 +342,9 @@ class CategoryLinkProcessor implements ProcessorInterface
      */
     private function validRoots(BatchContext $context, string|int $sku, array $declared): array
     {
-        if ($this->rootIds === null) {
-            $this->rootIds = array_fill_keys(
-                array_merge(...array_values($this->categoryResource->getRootCategoryIds()) ?: [[]]),
-                true
-            );
-        }
-
         $valid = [];
         foreach (array_unique(array_map('intval', $declared)) as $rootId) {
-            if (isset($this->rootIds[$rootId])) {
+            if ($this->rootCategories->isRoot($rootId)) {
                 $valid[] = $rootId;
                 continue;
             }

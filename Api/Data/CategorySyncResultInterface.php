@@ -169,8 +169,12 @@ interface CategorySyncResultInterface
 
     /**
      * One entry per store scope this category's payload named beyond the
-     * request's own — that is, per `store_values` block. Null when the payload
-     * named none, which is every payload that predates `store_values`.
+     * request's own — that is, one per `store_values` block, in payload order.
+     * Null when the payload named none, which is every payload that predates
+     * `store_values`.
+     *
+     * A block that never resolved to a store view carries `store_id: null`; the
+     * reason says why.
      *
      * @return \ReadyData\Import\Api\Data\CategoryStoreResultInterface[]|null
      */

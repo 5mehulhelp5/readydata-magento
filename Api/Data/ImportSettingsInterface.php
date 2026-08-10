@@ -45,10 +45,10 @@ interface ImportSettingsInterface
     public function getStoreId(): ?int;
 
     /**
-     * @param int $storeId
+     * @param int|null $storeId
      * @return $this
      */
-    public function setStoreId(int $storeId): self;
+    public function setStoreId(?int $storeId): self;
 
     /**
      * Pins the first segment of every category path in this request to one
@@ -72,10 +72,10 @@ interface ImportSettingsInterface
     public function getRootCategoryId(): ?int;
 
     /**
-     * @param int $rootCategoryId
+     * @param int|null $rootCategoryId
      * @return $this
      */
-    public function setRootCategoryId(int $rootCategoryId): self;
+    public function setRootCategoryId(?int $rootCategoryId): self;
 
     /**
      * @return bool|null

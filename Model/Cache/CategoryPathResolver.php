@@ -22,8 +22,9 @@ use ReadyData\Import\Model\ResourceModel\Category as CategoryResource;
  * "/" cannot collide with a deeper path). The first segment must name a level-1
  * root that already exists — this resolver never creates one, so a typo in a
  * product feed cannot spawn a new tree. (The category sync endpoint does create
- * roots, on explicit request; it tells this resolver through
- * {@see forgetRoots()}.) Missing segments below a root are created through
+ * roots, on explicit request; it tells
+ * RootCategoryRegistry, and this resolver through
+ * {@see forgetPathsUnderRoot()}.) Missing segments below a root are created through
  * CategoryWriter, i.e. through the category repository: the model save
  * maintains path/level/children_count, generates the url_key and category URL
  * rewrites, and handles EE row_id — a deliberate exception to the module's
@@ -51,14 +52,10 @@ class CategoryPathResolver
      */
     private array $createdPaths = [];
 
-    /**
-     * @var array<string, int[]>|null store-0 root name => entity_id[], ascending
-     */
-    private ?array $rootIdsByName = null;
-
     public function __construct(
         private readonly CategoryResource $categoryResource,
         private readonly CategoryWriter $categoryWriter,
+        private readonly RootCategoryRegistry $rootCategories,
         private readonly Logger $logger
     ) {
     }
@@ -146,24 +143,15 @@ class CategoryPathResolver
     }
 
     /**
-     * Drop the memoized root map, and optionally everything cached below a root
-     * that was just renamed.
+     * Drop everything cached below a root that was just renamed: "OldRoot/Men"
+     * points at a category whose path no longer starts with that name.
      *
-     * The root map is not covered by {@see forget()}: a root's own name is never
-     * a cache key here (single-segment paths are refused outright), so a root
-     * created or renamed by the category sync endpoint would otherwise stay
-     * invisible — or keep resolving under its old name — for the rest of the
-     * request. Deeper keys have to go too: "OldRoot/Men" points at a category
-     * whose path no longer starts with that name.
+     * The root name => ID map itself is not here — it belongs to
+     * {@see RootCategoryRegistry}, shared with every other consumer, and the
+     * caller that renamed the root invalidates it there.
      */
-    public function forgetRoots(?string $renamedRootName = null): void
+    public function forgetPathsUnderRoot(string $renamedRootName): void
     {
-        $this->rootIdsByName = null;
-
-        if ($renamedRootName === null) {
-            return;
-        }
-
         // The escaped canonical form, so a root whose name contains "/" cannot
         // match a deeper path's prefix — same reasoning as prefixKey().
         $prefix = PathParser::buildKey([$renamedRootName]) . '/';
@@ -320,55 +308,45 @@ class CategoryPathResolver
     }
 
     /**
-     * The root a path's first segment resolves to, honouring a pin.
+     * The root a path's first segment resolves to, honouring a pin, in the
+     * messages this resolver reports to its caller.
      *
-     * Without a pin this keeps the historical behaviour: the lowest entity ID
-     * among the roots sharing that name. That is a read's answer to an
-     * ambiguity, and it is why the pin exists — two roots with one name are two
-     * different catalogs, and picking the older one is a guess.
-     *
-     * With a pin the name must still match. A path saying one tree and a pin
-     * saying another is a contradiction, and silently following the pin would
-     * quietly file a subtree in the catalog the caller did not name.
+     * The mechanics live in {@see RootCategoryRegistry::resolve()}; what is local
+     * to this class is the POLICY it passes: ambiguity is not refused here, it is
+     * settled by taking the lowest entity ID. That is a read's answer, and it is
+     * why the pin exists — two roots with one name are two different catalogs,
+     * and picking the older one is a guess. A write refuses instead; see
+     * CategorySyncService.
      *
      * @return array{id: ?int, message: ?string}
      */
     private function resolveRootId(string $firstSegment, ?int $pinnedRootId): array
     {
-        if ($pinnedRootId === null) {
-            $rootId = $this->getRoots()[$firstSegment] ?? null;
+        $root = $this->rootCategories->resolve($firstSegment, $pinnedRootId, false);
 
-            return $rootId === null
-                ? [
-                    'id' => null,
-                    'message' => sprintf(
-                        'Unknown root category "%s" — root categories are not auto-created.',
-                        $firstSegment
-                    ),
-                ]
-                : ['id' => $rootId, 'message' => null];
-        }
-
-        $pinnedName = $this->getRootNameById()[$pinnedRootId] ?? null;
-        if ($pinnedName === null) {
-            return [
+        return match ($root['outcome']) {
+            RootCategoryRegistry::OUTCOME_OK => ['id' => $root['id'], 'message' => null],
+            RootCategoryRegistry::OUTCOME_PIN_NOT_ROOT => [
                 'id' => null,
                 'message' => sprintf('Root category ID %d does not exist.', $pinnedRootId),
-            ];
-        }
-        if ($pinnedName !== $firstSegment) {
-            return [
+            ],
+            RootCategoryRegistry::OUTCOME_PIN_NAME_MISMATCH => [
                 'id' => null,
                 'message' => sprintf(
                     'Path starts with root "%s" but root category ID %d is named "%s".',
                     $firstSegment,
                     $pinnedRootId,
-                    $pinnedName
+                    $root['pinnedName']
                 ),
-            ];
-        }
-
-        return ['id' => $pinnedRootId, 'message' => null];
+            ],
+            default => [
+                'id' => null,
+                'message' => sprintf(
+                    'Unknown root category "%s" — root categories are not auto-created.',
+                    $firstSegment
+                ),
+            ],
+        };
     }
 
     /**
@@ -475,49 +453,5 @@ class CategoryPathResolver
     private function prefixKey(array $walk): string
     {
         return PathParser::buildKey(array_slice($walk['segments'], 0, $walk['depth'] + 1));
-    }
-
-    /**
-     * Root name => lowest entity_id, the answer a READ gives an ambiguous root
-     * name. A write should pin instead — see {@see resolveRootId()}.
-     *
-     * @return array<string, int>
-     */
-    private function getRoots(): array
-    {
-        return array_map(
-            static fn (array $ids): int => $ids[0],
-            $this->getRootIdsByName()
-        );
-    }
-
-    /**
-     * @return array<int, string> root entity_id => store-0 name
-     */
-    private function getRootNameById(): array
-    {
-        $names = [];
-        foreach ($this->getRootIdsByName() as $name => $ids) {
-            foreach ($ids as $id) {
-                $names[$id] = $name;
-            }
-        }
-
-        return $names;
-    }
-
-    /**
-     * @return array<string, int[]>
-     */
-    private function getRootIdsByName(): array
-    {
-        // This resolver never creates a root, so a rollback of its own work
-        // cannot make this stale. A caller that creates or renames one has to
-        // say so through forgetRoots().
-        //
-        // Every candidate ID per name is kept, not just the lowest: a pin has
-        // to be checkable against the name it claims, and that answer is gone
-        // once duplicates are collapsed.
-        return $this->rootIdsByName ??= $this->categoryResource->getRootCategoryIds();
     }
 }

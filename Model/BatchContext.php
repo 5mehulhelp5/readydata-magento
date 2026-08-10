@@ -51,17 +51,28 @@ class BatchContext
     private array $messages = [];
 
     /**
-     * Store scopes a product carries BEYOND the request's own, and whether
-     * anything was actually written in each. The request's own scope is not in
-     * here — it is what the product's own status describes.
+     * Store scopes a product carries BEYOND the request's own, in the order the
+     * payload named them. The request's own scope is not in here — it is what
+     * the product's own status describes.
      *
-     * Registered when the scope resolves rather than when it is written, so a
+     * A list rather than a store-ID map, because a block whose store view could
+     * not be resolved still gets a row: it has no store ID to be keyed by, and
+     * dropping it would break the one-row-per-block correspondence a caller
+     * matches its payload against.
+     *
+     * Registered when the block is read rather than when it is written, so a
      * scope whose every value was refused still reports itself (as skipped,
      * carrying the refusals) instead of vanishing from the response.
      *
-     * @var array<string, array<int, bool>> SKU => store ID => anything applied
+     * @var array<string, array<int, array{store_id: int|null, applied: bool,
+     *     reason: string|null, messages: string[]}>>
      */
     private array $scopes = [];
+
+    /**
+     * @var array<string, array<int, int>> SKU => store ID => index in $scopes
+     */
+    private array $scopeIndex = [];
 
     /**
      * @var array<string, mixed> free-form state shared between processors
@@ -214,28 +225,40 @@ class BatchContext
     public function getMessages(string|int $sku): array
     {
         return array_map(
-            static fn (array $message): string => $message['store_id'] === null
-                ? $message['text']
-                : sprintf('[store %d] %s', $message['store_id'], $message['text']),
+            static fn (array $message): string => self::render($message),
             $this->messages[$sku] ?? []
         );
     }
 
     /**
      * Messages recorded against one store scope, untagged. `null` selects the
-     * product's own (unscoped) messages.
+     * product's own messages.
+     *
+     * The product's list is the exact COMPLEMENT of the per-scope lists, not
+     * just the untagged messages: a message tagged to a scope that has no
+     * result row to carry it — the request's own scope, which a `store_values`
+     * block may name and be merged into — is reported here, prefixed, rather
+     * than nowhere. The response reads these two views and nothing else, so a
+     * recorded message has to survive in one of them whatever tagged it.
      *
      * @return string[]
      */
     public function getScopeMessages(string|int $sku, ?int $storeId): array
     {
-        return array_values(array_map(
-            static fn (array $message): string => $message['text'],
-            array_filter(
-                $this->messages[$sku] ?? [],
-                static fn (array $message): bool => $message['store_id'] === $storeId
-            )
-        ));
+        $messages = [];
+        foreach ($this->messages[$sku] ?? [] as $message) {
+            if ($storeId !== null) {
+                if ($message['store_id'] === $storeId) {
+                    $messages[] = $message['text'];
+                }
+                continue;
+            }
+            if ($message['store_id'] === null || !$this->hasScope($sku, $message['store_id'])) {
+                $messages[] = self::render($message);
+            }
+        }
+
+        return $messages;
     }
 
     /**
@@ -244,7 +267,36 @@ class BatchContext
      */
     public function registerScope(string|int $sku, int $storeId): void
     {
-        $this->scopes[$sku][$storeId] ??= false;
+        if (isset($this->scopeIndex[$sku][$storeId])) {
+            return;
+        }
+
+        $this->scopes[$sku][] = [
+            'store_id' => $storeId,
+            'applied' => false,
+            'reason' => null,
+            'messages' => [],
+        ];
+        $this->scopeIndex[$sku][$storeId] = array_key_last($this->scopes[$sku]);
+    }
+
+    /**
+     * Note a block whose store view could not be resolved. It reports as a
+     * skipped scope with no store ID: the payload named a scope, so it gets a
+     * row, but there is no store view to attribute it to — and 0 would name the
+     * default scope, the one scope this list never covers.
+     *
+     * The message travels on the row because it cannot be tagged: tags are store
+     * IDs, and this block has none.
+     */
+    public function registerUnresolvedScope(string|int $sku, string $reason, string $message): void
+    {
+        $this->scopes[$sku][] = [
+            'store_id' => null,
+            'applied' => false,
+            'reason' => $reason,
+            'messages' => [$message],
+        ];
     }
 
     /**
@@ -253,34 +305,45 @@ class BatchContext
      */
     public function markScopeApplied(string|int $sku, int $storeId): void
     {
-        $this->scopes[$sku][$storeId] = true;
-    }
-
-    /**
-     * Store IDs the product carries scoped values for, in the order the
-     * payload named them.
-     *
-     * @return int[]
-     */
-    public function getScopeStoreIds(string|int $sku): array
-    {
-        return array_keys($this->scopes[$sku] ?? []);
-    }
-
-    /**
-     * Outcome of one scope in StoreResultInterface terms. A failed product
-     * fails every one of its scopes: the batch is one transaction, so nothing
-     * it wrote survives, in any scope.
-     */
-    public function getScopeStatus(string|int $sku, int $storeId): string
-    {
-        if ($this->isFailed($sku)) {
-            return StoreResultInterface::STATUS_ERROR;
+        $index = $this->scopeIndex[$sku][$storeId] ?? null;
+        if ($index !== null) {
+            $this->scopes[$sku][$index]['applied'] = true;
         }
+    }
 
-        return ($this->scopes[$sku][$storeId] ?? false)
-            ? StoreResultInterface::STATUS_WRITTEN
-            : StoreResultInterface::STATUS_SKIPPED;
+    /**
+     * One row per scope the product's payload named beyond the request's own, in
+     * payload order, ready for {@see StoreResultInterface}.
+     *
+     * A failed product fails every one of its scopes: the batch is one
+     * transaction, so nothing it wrote survives, in any scope.
+     *
+     * @return array<int, array{store_id: int|null, status: string, reason: string|null,
+     *     messages: string[]}>
+     */
+    public function getScopeResults(string|int $sku): array
+    {
+        $failed = $this->isFailed($sku);
+
+        return array_map(
+            function (array $scope) use ($sku, $failed): array {
+                $storeId = $scope['store_id'];
+
+                return [
+                    'store_id' => $storeId,
+                    'status' => match (true) {
+                        $failed => StoreResultInterface::STATUS_ERROR,
+                        $scope['applied'] => StoreResultInterface::STATUS_UPDATED,
+                        default => StoreResultInterface::STATUS_SKIPPED,
+                    },
+                    'reason' => $scope['reason'],
+                    'messages' => $storeId === null
+                        ? $scope['messages']
+                        : $this->getScopeMessages($sku, $storeId),
+                ];
+            },
+            $this->scopes[$sku] ?? []
+        );
     }
 
     /**
@@ -309,5 +372,26 @@ class BatchContext
         return $this->isExisting($sku)
             ? ImportResultInterface::STATUS_UPDATED
             : ImportResultInterface::STATUS_CREATED;
+    }
+
+    /**
+     * Whether a store scope of this product has a result row of its own.
+     */
+    private function hasScope(string|int $sku, int $storeId): bool
+    {
+        return isset($this->scopeIndex[$sku][$storeId]);
+    }
+
+    /**
+     * One message as a caller reads it: scope-tagged ones say which store view
+     * they came from, so they cannot be mistaken for the product's own.
+     *
+     * @param array{store_id: int|null, text: string} $message
+     */
+    private static function render(array $message): string
+    {
+        return $message['store_id'] === null
+            ? $message['text']
+            : sprintf('[store %d] %s', $message['store_id'], $message['text']);
     }
 }

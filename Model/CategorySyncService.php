@@ -19,9 +19,11 @@ use ReadyData\Import\Api\Data\CategorySyncResponseInterface;
 use ReadyData\Import\Api\Data\CategorySyncResponseInterfaceFactory;
 use ReadyData\Import\Api\Data\CategorySyncResultInterface;
 use ReadyData\Import\Api\Data\CategorySyncResultInterfaceFactory;
+use ReadyData\Import\Api\Data\ScopeResultInterface;
 use ReadyData\Import\Api\Data\ImportSettingsInterface;
 use ReadyData\Import\Logger\Logger;
 use ReadyData\Import\Model\Cache\CategoryPathResolver;
+use ReadyData\Import\Model\Cache\RootCategoryRegistry;
 use ReadyData\Import\Model\Cache\StoreWebsiteMap;
 use ReadyData\Import\Model\Category\CategoryWriter;
 use ReadyData\Import\Model\Category\PathParser;
@@ -63,8 +65,7 @@ class CategorySyncService
      * write. The product import takes the same lock only when its payload can
      * reach a read-then-create; see {@see ImportService::needsWriteLock()}.
      */
-    public const LOCK_NAME = ImportService::WRITE_LOCK_NAME;
-    private const LOCK_TIMEOUT_SEC = 10;
+    public const LOCK_NAME = ImportLocks::PRODUCT_IMPORT;
 
     public function __construct(
         private readonly Config $config,
@@ -72,6 +73,7 @@ class CategorySyncService
         private readonly ResourceConnection $resourceConnection,
         private readonly CategoryValidator $validator,
         private readonly CategoryPathResolver $pathResolver,
+        private readonly RootCategoryRegistry $rootCategories,
         private readonly CategoryResource $categoryResource,
         private readonly CategoryWriter $writer,
         private readonly StoreWebsiteMap $storeWebsiteMap,
@@ -109,7 +111,7 @@ class CategorySyncService
         $storeRootId = $storeId === 0 ? null : $this->storeWebsiteMap->getRootCategoryId($storeId);
         $continueOnError = $settings?->getContinueOnError() ?? $this->config->isContinueOnError();
 
-        if (!$this->lockManager->lock(self::LOCK_NAME, self::LOCK_TIMEOUT_SEC)) {
+        if (!$this->lockManager->lock(self::LOCK_NAME, ImportLocks::TIMEOUT_SEC)) {
             // Wording matches the product endpoint verbatim: callers already
             // recognise it and back off.
             throw new LocalizedException(__('Another import is already running. Try again later.'));
@@ -161,6 +163,7 @@ class CategorySyncService
                     // silently drop every move's subtree bookkeeping.
                     $result = $this->inTransaction(
                         $entry,
+                        $state,
                         function () use (
                             $entry,
                             $parents,
@@ -287,11 +290,23 @@ class CategorySyncService
      * and the rollBack in the catch is what clears the connection's
      * partial-rollback flag after a repository save failed inside it.
      *
+     * @param array{touched: int[], removed: int[], movedSubtrees: array<int, true>,
+     *     renamedPaths: array<string, true>} $state by reference, and rolled back
+     *     with the transaction — see the body
      * @param callable():CategorySyncResultInterface $work
      */
-    private function inTransaction(array $entry, callable $work): CategorySyncResultInterface
-    {
+    private function inTransaction(
+        array $entry,
+        array &$state,
+        callable $work
+    ): CategorySyncResultInterface {
         $connection = $this->resourceConnection->getConnection();
+        // Restored on failure, because $work() records what it did BEFORE the
+        // commit that makes it true: a rename noted in `renamedPaths` or a
+        // subtree noted in `movedSubtrees` would otherwise outlive the rollback
+        // that undid it, and every later entry under that path would be skipped
+        // as `stale_parent_path` for a rename this request no longer performed.
+        $snapshot = $state;
         $connection->beginTransaction();
         try {
             $result = $work();
@@ -300,6 +315,7 @@ class CategorySyncService
             return $result;
         } catch (\Throwable $e) {
             $this->rollBackQuietly($connection);
+            $state = $snapshot;
             $this->logger->error(
                 sprintf('Category "%s" sync failed: %s', $entry['label'], $e->getMessage()),
                 ['exception' => $e]
@@ -330,6 +346,7 @@ class CategorySyncService
      *     segments: string[],
      *     key: string,
      *     label: string,
+     *     root_pin: ?int,
      *     error: ?array{reason: string, message: string}
      * } $entry
      * @param array<string, array{id: ?int, root_id: ?int, reason: ?string, message: ?string}> $parents
@@ -551,10 +568,10 @@ class CategorySyncService
 
             $entityId = $this->writer->create($parentId, $leafName, $definition, $messages);
             if ($isRoot) {
-                // A new root changes the name => ID map the resolver memoizes
-                // for the whole request; without this a deeper path sent in the
-                // same request would not find it.
-                $this->pathResolver->forgetRoots();
+                // A new root changes the name => ID map memoized for the whole
+                // request; without this a deeper path sent in the same request
+                // would not find it.
+                $this->rootCategories->forget();
             }
 
             return $this->result(
@@ -627,8 +644,8 @@ class CategorySyncService
         foreach ($blocks as $block) {
             if (!$block instanceof CategoryStoreValuesInterface) {
                 $storeResults[] = $this->storeSkip(
-                    0,
-                    CategorySyncResultInterface::REASON_INVALID_DEFINITION,
+                    null,
+                    ScopeResultInterface::REASON_INVALID_DEFINITION,
                     'Entry is not a store values block.'
                 );
                 continue;
@@ -640,16 +657,18 @@ class CategorySyncService
             );
             if ($storeId === null) {
                 $storeResults[] = $this->storeSkip(
-                    0,
-                    CategorySyncResultInterface::REASON_UNKNOWN_STORE,
-                    sprintf('No such store view: %s.', self::describeScope($block))
+                    null,
+                    ScopeResultInterface::REASON_UNKNOWN_STORE,
+                    sprintf('No such store view: %s.', $this->storeWebsiteMap->describeScope($block))
                 );
                 continue;
             }
             if ($storeId === 0) {
+                // Reported without a store ID: 0 would name the default scope,
+                // and this list is exactly the scopes that are NOT it.
                 $storeResults[] = $this->storeSkip(
-                    0,
-                    CategorySyncResultInterface::REASON_INVALID_DEFINITION,
+                    null,
+                    ScopeResultInterface::REASON_INVALID_DEFINITION,
                     'A store_values block cannot name the default scope; the category itself writes it.'
                 );
                 continue;
@@ -660,7 +679,7 @@ class CategorySyncService
                 // something the caller should have to reason about.
                 $storeResults[] = $this->storeSkip(
                     $storeId,
-                    CategorySyncResultInterface::REASON_INVALID_DEFINITION,
+                    ScopeResultInterface::REASON_INVALID_DEFINITION,
                     'An earlier store_values block already names this store view; merge them.'
                 );
                 continue;
@@ -708,7 +727,7 @@ class CategorySyncService
             // one block and nothing else.
             return $this->storeSkip(
                 $storeId,
-                CategorySyncResultInterface::REASON_WRONG_STORE_ROOT,
+                ScopeResultInterface::REASON_WRONG_STORE_ROOT,
                 $e->getMessage()
             );
         }
@@ -719,7 +738,7 @@ class CategorySyncService
 
         return $this->storeSkip(
             $storeId,
-            CategorySyncResultInterface::REASON_WRONG_STORE_ROOT,
+            ScopeResultInterface::REASON_WRONG_STORE_ROOT,
             sprintf(
                 'The category belongs to root category %d, but this store view shows root category %d.',
                 $rootId,
@@ -728,26 +747,13 @@ class CategorySyncService
         );
     }
 
-    private function storeSkip(int $storeId, string $reason, string $message): CategoryStoreResultInterface
+    private function storeSkip(?int $storeId, string $reason, string $message): CategoryStoreResultInterface
     {
         return $this->storeResultFactory->create()
             ->setStoreId($storeId)
             ->setStatus(CategoryStoreResultInterface::STATUS_SKIPPED)
             ->setReason($reason)
             ->setMessages([$message]);
-    }
-
-    /** How an unresolvable store_values block is named back to the caller. */
-    private static function describeScope(CategoryStoreValuesInterface $block): string
-    {
-        if ($block->getStoreId() !== null) {
-            return sprintf('ID %d', $block->getStoreId());
-        }
-        if ((string)$block->getStoreViewCode() !== '') {
-            return sprintf('"%s"', $block->getStoreViewCode());
-        }
-
-        return 'a block naming none';
     }
 
     /**
@@ -769,7 +775,7 @@ class CategorySyncService
     ): CategorySyncResultInterface {
         return $this->skip(
             $entry,
-            CategorySyncResultInterface::REASON_WRONG_STORE_ROOT,
+            ScopeResultInterface::REASON_WRONG_STORE_ROOT,
             sprintf(
                 'The category belongs to root category %s, but the selected store view shows root category %d;'
                 . ' send it at default scope, or with a store view of its own root.',
@@ -976,7 +982,8 @@ class CategorySyncService
         // the new one, now resolves to the wrong node.
         $this->pathResolver->forgetAllPaths();
         if ($row['level'] === 1 || $destinationRow['level'] === 0) {
-            $this->pathResolver->forgetRoots();
+            // Promoted to a root or demoted out of the level-1 layer.
+            $this->rootCategories->forget();
         }
         if ($entry['segments'] !== []) {
             $state['renamedPaths'][PathParser::buildKey($entry['segments'])] = true;
@@ -1137,13 +1144,16 @@ class CategorySyncService
             }
             if ($isRoot) {
                 // forget() above cannot reach a root: single-segment paths are
-                // refused by the resolver, so a root only ever lives in its
-                // separately memoized name => ID map. The old name is passed
-                // when we know it, which also drops the paths cached below it;
-                // an entry addressed by category_id has no path in the payload
+                // refused by the resolver, so a root only ever lives in the
+                // name => ID map the registry holds.
+                $this->rootCategories->forget();
+                // The paths cached BELOW the old name go too, when we know it.
+                // An entry addressed by category_id has no path in the payload
                 // and needs none, since those run in the last bucket, after
                 // every path has already been resolved.
-                $this->pathResolver->forgetRoots($renamedFrom);
+                if ($renamedFrom !== null) {
+                    $this->pathResolver->forgetPathsUnderRoot($renamedFrom);
+                }
             }
         }
 
@@ -1171,10 +1181,6 @@ class CategorySyncService
         $parents = [];
         $deepPaths = [];
         $deepByEntryKey = [];
-        // Deliberately per call, and this call is per bucket: a root created in
-        // a shallower bucket is already committed and MUST be visible here.
-        // Hoisting this to a property would break same-request root creation.
-        $roots = null;
 
         foreach ($bucket as $entry) {
             $segments = $entry['segments'];
@@ -1197,11 +1203,11 @@ class CategorySyncService
                 continue;
             }
 
-            // The resolver collapses duplicate root names to the lowest ID,
-            // which is fine for a read but not for a write, so the first
-            // segment is resolved here with every candidate ID in hand.
-            $roots ??= $this->categoryResource->getRootCategoryIds();
-            $root = $this->pickRoot($segments[0], $entry['root_pin'], $roots);
+            // Refused rather than guessed when the name is ambiguous — see
+            // pickRoot(). The registry is re-read after every root this request
+            // creates, renames or removes, so a root from a shallower bucket is
+            // already visible here.
+            $root = $this->pickRoot($segments[0], $entry['root_pin'], 'The path');
             if ($root['id'] === null) {
                 $parents[$entry['key']] = self::noParent($root['reason'], $root['message']);
                 continue;
@@ -1320,6 +1326,7 @@ class CategorySyncService
             // By reference, for the same reason the write loop's closure is.
             $result = $this->inTransaction(
                 $entry,
+                $state,
                 function () use ($entry, $target, &$state): CategorySyncResultInterface {
                     return $this->deleteOne($entry, $target['row'], $state);
                 }
@@ -1521,7 +1528,7 @@ class CategorySyncService
         $state['touched'][] = $row['parent_id'];
         $this->pathResolver->forgetAllPaths();
         if ($row['level'] === 1) {
-            $this->pathResolver->forgetRoots();
+            $this->rootCategories->forget();
         }
         if ($entry['segments'] !== []) {
             $state['renamedPaths'][PathParser::buildKey($entry['segments'])] = true;
@@ -1564,7 +1571,6 @@ class CategorySyncService
         $destinations = [];
         $deepPaths = [];
         $deepByEntryKey = [];
-        $roots = null;
 
         foreach ($bucket as $entry) {
             if ($entry['error'] !== null) {
@@ -1603,8 +1609,12 @@ class CategorySyncService
             // Same treatment the entry's own first segment gets: duplicate root
             // names are two distinct catalogs, and picking the lowest ID for a
             // write is exactly the guess this endpoint refuses to make.
-            $roots ??= $this->categoryResource->getRootCategoryIds();
-            $root = $this->pickRoot($segments[0], $entry['root_pin'], $roots, true);
+            $root = $this->pickRoot(
+                $segments[0],
+                $entry['root_pin'],
+                'The destination parent path',
+                true
+            );
             if ($root['id'] === null) {
                 $destinations[$entry['key']] = [
                     'id' => null,
@@ -1658,73 +1668,65 @@ class CategorySyncService
     }
 
     /**
-     * Which root a path's first segment names.
+     * Which root a path's first segment names, in this endpoint's vocabulary.
      *
-     * Magento enforces no uniqueness on root names, and two roots sharing one
-     * are two different catalogs. A read elsewhere in this module settles that
-     * by taking the lowest entity ID; a write must not, so without a pin the
-     * ambiguity is refused outright. `root_category_id` — on the entry or on
-     * `settings` — is what makes such a path writable, and the only thing that
-     * can, since a first run has no `category_id` yet.
+     * The mechanics live in {@see RootCategoryRegistry::resolve()}; what is local
+     * to this endpoint is the POLICY it passes and the words it reports. A WRITE
+     * refuses an ambiguous root name outright rather than taking the lowest
+     * entity ID the way a read does: two roots sharing a name are two distinct
+     * catalogs, and picking one is exactly the guess this endpoint will not make.
+     * `root_category_id` — on the entry or on `settings` — is what makes such a
+     * path writable, and the only thing that can, since a first run has no
+     * `category_id` yet.
      *
-     * A pin that contradicts the name is itself a refusal. Following it would
-     * file the category in a catalog the path did not name; refusing the name
-     * would ignore the more specific of the caller's two statements. Neither is
-     * a guess worth making on a subtree.
-     *
-     * @param array<string, int[]> $roots store-0 name => entity_id[]
+     * @param string $subject how the offending path is named back to the caller,
+     *        e.g. 'The path' or 'The destination parent path'
      * @param bool $forDestination phrases the refusals for a move's destination
      * @return array{id: ?int, reason: ?string, message: ?string}
      */
     private function pickRoot(
         string $firstSegment,
         ?int $pinnedRootId,
-        array $roots,
+        string $subject,
         bool $forDestination = false
     ): array {
-        $rootIds = $roots[$firstSegment] ?? [];
+        $root = $this->rootCategories->resolve($firstSegment, $pinnedRootId, true);
 
-        if ($pinnedRootId !== null) {
-            if (!in_array($pinnedRootId, $rootIds, true)) {
-                $named = array_keys(array_filter(
-                    $roots,
-                    static fn (array $ids): bool => in_array($pinnedRootId, $ids, true)
-                ));
-
-                return [
-                    'id' => null,
-                    'reason' => CategorySyncResultInterface::REASON_UNKNOWN_ROOT,
-                    'message' => $named === []
-                        ? sprintf('root_category_id %d is not a root category.', $pinnedRootId)
-                        : sprintf(
-                            '%s starts with root "%s" but root_category_id %d is named "%s".',
-                            $forDestination ? 'The destination parent path' : 'The path',
-                            $firstSegment,
-                            $pinnedRootId,
-                            $named[0]
-                        ),
-                ];
-            }
-
-            return ['id' => $pinnedRootId, 'reason' => null, 'message' => null];
-        }
-
-        if (count($rootIds) > 1) {
-            return [
+        return match ($root['outcome']) {
+            RootCategoryRegistry::OUTCOME_OK => [
+                'id' => $root['id'],
+                'reason' => null,
+                'message' => null,
+            ],
+            RootCategoryRegistry::OUTCOME_PIN_NOT_ROOT => [
+                'id' => null,
+                'reason' => CategorySyncResultInterface::REASON_UNKNOWN_ROOT,
+                'message' => sprintf('root_category_id %d is not a root category.', $pinnedRootId),
+            ],
+            RootCategoryRegistry::OUTCOME_PIN_NAME_MISMATCH => [
+                'id' => null,
+                'reason' => CategorySyncResultInterface::REASON_UNKNOWN_ROOT,
+                'message' => sprintf(
+                    '%s starts with root "%s" but root_category_id %d is named "%s".',
+                    $subject,
+                    $firstSegment,
+                    $pinnedRootId,
+                    $root['pinnedName']
+                ),
+            ],
+            RootCategoryRegistry::OUTCOME_AMBIGUOUS => [
                 'id' => null,
                 'reason' => CategorySyncResultInterface::REASON_AMBIGUOUS_PATH,
                 'message' => sprintf(
                     '%d root categories are named "%s" (IDs %s); send root_category_id to pick one, or'
                     . ' %s.',
-                    count($rootIds),
+                    count($root['candidates']),
                     $firstSegment,
-                    implode(', ', $rootIds),
+                    implode(', ', $root['candidates']),
                     $forDestination ? 'parent_category_id to name the destination' : 'category_id'
                 ),
-            ];
-        }
-        if ($rootIds === []) {
-            return [
+            ],
+            default => [
                 'id' => null,
                 'reason' => CategorySyncResultInterface::REASON_UNKNOWN_ROOT,
                 'message' => $forDestination
@@ -1733,10 +1735,8 @@ class CategorySyncService
                         'Unknown root category "%s" — send it as a single-segment path to create it.',
                         $firstSegment
                     ),
-            ];
-        }
-
-        return ['id' => $rootIds[0], 'reason' => null, 'message' => null];
+            ],
+        };
     }
 
     /**

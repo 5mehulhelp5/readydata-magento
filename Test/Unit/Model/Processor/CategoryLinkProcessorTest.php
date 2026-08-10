@@ -10,6 +10,7 @@ use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
 use ReadyData\Import\Model\BatchContext;
 use ReadyData\Import\Model\Cache\CategoryPathResolver;
+use ReadyData\Import\Model\Cache\RootCategoryRegistry;
 use ReadyData\Import\Model\Category\PathParser;
 use ReadyData\Import\Model\Config;
 use ReadyData\Import\Model\Data\Product;
@@ -38,6 +39,7 @@ class CategoryLinkProcessorTest extends TestCase
             $this->pathResolver,
             new PathParser(),
             $this->categoryResource,
+            new RootCategoryRegistry($this->categoryResource),
             $this->config
         );
     }
@@ -56,6 +58,7 @@ class CategoryLinkProcessorTest extends TestCase
             $this->pathResolver,
             new PathParser(),
             $this->categoryResource,
+            new RootCategoryRegistry($this->categoryResource),
             $config
         );
     }
@@ -256,7 +259,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->processorWithScope(Config::REPLACE_SCOPE_PAYLOAD_ROOTS)->process($context);
 
         self::assertStringContainsString(
-            'limited to root category 29; 1 existing assignment(s) outside it were kept',
+            'limited to root categories 29; 1 existing assignment(s) outside them were kept',
             $context->getMessages('SKU-1')[0]
         );
     }
@@ -319,7 +322,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->processorWithScope(Config::REPLACE_SCOPE_PAYLOAD_ROOTS)->process($context);
 
         self::assertStringContainsString(
-            'limited to root categories: none; 1 existing assignment(s) outside it were kept',
+            'limited to no root categories, so nothing was removed; 1 existing assignment(s) were kept',
             $context->getMessages('SKU-1')[0]
         );
     }

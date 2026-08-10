@@ -13,6 +13,8 @@ use Magento\Framework\Exception\LocalizedException;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
 use ReadyData\Import\Model\Cache\StoreWebsiteMap;
+use ReadyData\Import\Model\Data\CategoryStoreValues;
+use ReadyData\Import\Model\Data\ProductStoreValues;
 
 /**
  * Scope resolution: the two forms a caller may name a store view in, and the
@@ -114,5 +116,31 @@ class StoreWebsiteMapTest extends TestCase
         self::assertTrue($this->map->hasStoreId(0));
         self::assertTrue($this->map->hasStoreId(3));
         self::assertFalse($this->map->hasStoreId(99));
+    }
+
+    /**
+     * One wording for both endpoints: a caller reading a product result and a
+     * category result should not have to learn two ways of being told the same
+     * thing.
+     */
+    public function testAnUnresolvableScopeIsNamedByWhicheverFormThePayloadUsed(): void
+    {
+        self::assertSame(
+            'store view ID 99',
+            $this->map->describeScope((new ProductStoreValues())->setStoreId(99))
+        );
+        self::assertSame(
+            'store view "nope"',
+            $this->map->describeScope((new CategoryStoreValues())->setStoreViewCode('nope'))
+        );
+        // ID wins over code, exactly as resolution does.
+        self::assertSame(
+            'store view ID 3',
+            $this->map->describeScope((new ProductStoreValues())->setStoreId(3)->setStoreViewCode('fr_fr'))
+        );
+        self::assertSame(
+            'a block naming no store view',
+            $this->map->describeScope(new CategoryStoreValues())
+        );
     }
 }

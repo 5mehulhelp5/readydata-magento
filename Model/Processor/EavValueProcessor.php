@@ -7,7 +7,8 @@ declare(strict_types=1);
 namespace ReadyData\Import\Model\Processor;
 
 use ReadyData\Import\Api\Data\ProductInterface;
-use ReadyData\Import\Api\Data\ProductStoreValuesInterface;
+use ReadyData\Import\Api\Data\ProductValuesInterface;
+use ReadyData\Import\Api\Data\ScopeResultInterface;
 use ReadyData\Import\Model\BatchContext;
 use ReadyData\Import\Model\Cache\AttributeMetadataCache;
 use ReadyData\Import\Model\Cache\StoreWebsiteMap;
@@ -118,25 +119,36 @@ class EavValueProcessor implements ProcessorInterface
                 $block->getStoreViewCode()
             );
             if ($storeId === null) {
-                $context->addMessage(
+                // Its own result row, not a product-level message: the payload
+                // named a scope, so the caller gets one row per block to match
+                // its payload against — the same as the category endpoint.
+                $context->registerUnresolvedScope(
                     $sku,
+                    ScopeResultInterface::REASON_UNKNOWN_STORE,
                     sprintf(
                         'Store values for %s were skipped: no such store view.',
-                        $this->describeScope($block)
+                        $this->storeWebsiteMap->describeScope($block)
                     )
                 );
                 continue;
             }
 
-            $values = $this->collectScopeValues($block);
+            // No url_key generation, unlike the base pass: a generated key is
+            // the product's identity on the storefront, not a per-store
+            // translation, and generating one here would invent a different slug
+            // per store view.
+            $values = $this->collectFirstClassValues($block);
             $clear = $this->normalizeClearCodes($block->getClearAttributes());
 
             if (isset($scopes[$storeId])) {
+                // Tagged through tag(), not with $storeId directly: a block
+                // naming the request's own scope merges into the base pass,
+                // which has no result row of its own to carry the warning.
                 $context->addMessage(
                     $sku,
                     'This scope was addressed more than once in the payload; the values were merged, the'
                     . ' later block winning per attribute.',
-                    $storeId
+                    $this->tag($scopes[$storeId], $storeId)
                 );
                 $scopes[$storeId]['values'] = array_merge($scopes[$storeId]['values'], $values);
                 $scopes[$storeId]['clear'] = array_values(
@@ -211,7 +223,7 @@ class EavValueProcessor implements ProcessorInterface
                 // Recorded per store row rather than per scope: a website-scoped
                 // attribute fans out, and a new product's default-scope fallback
                 // means the base pass can write two rows from one value.
-                if ($meta['attribute_code'] === 'url_key') {
+                if ($meta['attribute_code'] === ProductInterface::URL_KEY) {
                     $urlKeys[$sku][$storeId] = (string)$prepared;
                 }
             }
@@ -328,19 +340,6 @@ class EavValueProcessor implements ProcessorInterface
         return $scope['is_base'] ? null : $scopeStoreId;
     }
 
-    /** How an unresolvable scope block is named back to the caller. */
-    private function describeScope(ProductStoreValuesInterface $block): string
-    {
-        if ($block->getStoreId() !== null) {
-            return sprintf('store view ID %d', $block->getStoreId());
-        }
-        if ((string)$block->getStoreViewCode() !== '') {
-            return sprintf('store view "%s"', $block->getStoreViewCode());
-        }
-
-        return 'a block naming no store view';
-    }
-
     /**
      * @param string[]|null $codes
      * @return string[]
@@ -372,67 +371,53 @@ class EavValueProcessor implements ProcessorInterface
     }
 
     /**
-     * The same flattening for one `store_values` block. Deliberately without
-     * the url_key generation {@see collectValues()} does: a generated key is
-     * the product's identity on the storefront, not a per-store translation,
-     * and generating one here would invent a different slug per store view.
+     * Flatten the value-bearing fields plus custom attributes into
+     * code => raw value.
+     *
+     * One pass for the product itself and for each of its `store_values` blocks:
+     * they carry the same fields ({@see ProductValuesInterface}), and the field
+     * list is the one place they could have drifted.
      *
      * @return array<string, string|int|float>
      */
-    private function collectScopeValues(ProductStoreValuesInterface $block): array
+    private function collectFirstClassValues(ProductValuesInterface $values): array
     {
-        $values = array_filter(
+        $flat = array_filter(
             [
-                'name' => $block->getName(),
-                'price' => $block->getPrice(),
-                'status' => $block->getStatus(),
-                'visibility' => $block->getVisibility(),
-                'weight' => $block->getWeight(),
-                'url_key' => $block->getUrlKey(),
+                ProductInterface::NAME => $values->getName(),
+                ProductInterface::PRICE => $values->getPrice(),
+                ProductInterface::STATUS => $values->getStatus(),
+                ProductInterface::VISIBILITY => $values->getVisibility(),
+                ProductInterface::WEIGHT => $values->getWeight(),
+                ProductInterface::URL_KEY => $values->getUrlKey(),
             ],
             static fn ($value): bool => $value !== null
         );
 
-        foreach ($block->getCustomAttributes() ?? [] as $customAttribute) {
+        foreach ($values->getCustomAttributes() ?? [] as $customAttribute) {
             if ($customAttribute->getValue() !== null) {
-                $values[$customAttribute->getAttributeCode()] = $customAttribute->getValue();
+                $flat[$customAttribute->getAttributeCode()] = $customAttribute->getValue();
             }
         }
 
-        return $values;
+        return $flat;
     }
 
     /**
-     * Flatten first-class fields + custom attributes into code => raw value.
+     * The product's own values, at the request's scope.
      *
      * @return array<string, string|int|float>
      */
     private function collectValues(BatchContext $context, ProductInterface $product): array
     {
-        $values = array_filter(
-            [
-                'name' => $product->getName(),
-                'price' => $product->getPrice(),
-                'status' => $product->getStatus(),
-                'visibility' => $product->getVisibility(),
-                'weight' => $product->getWeight(),
-                'url_key' => $product->getUrlKey(),
-            ],
-            static fn ($value): bool => $value !== null
-        );
-
-        foreach ($product->getCustomAttributes() ?? [] as $customAttribute) {
-            if ($customAttribute->getValue() !== null) {
-                $values[$customAttribute->getAttributeCode()] = $customAttribute->getValue();
-            }
-        }
+        $values = $this->collectFirstClassValues($product);
 
         // Generate a url_key for new products that have none.
-        if (!isset($values['url_key'])
+        if (!isset($values[ProductInterface::URL_KEY])
             && !$context->isExisting($product->getSku())
             && $product->getName() !== null
         ) {
-            $values['url_key'] = $this->urlKeyGenerator->generate($product->getName());
+            $values[ProductInterface::URL_KEY] = $this->urlKeyGenerator->generate($product->getName());
         }
 
         return $values;
@@ -444,7 +429,7 @@ class EavValueProcessor implements ProcessorInterface
      */
     private function prepareValue(array $meta, string $value): string|int|float|null
     {
-        if (!in_array($meta['attribute_code'], ['status', 'visibility'], true)) {
+        if (!in_array($meta['attribute_code'], AttributeProcessor::STATIC_SOURCE_SELECT_CODES, true)) {
             if ($meta['frontend_input'] === 'select') {
                 return $this->attributeOption->getOptionId($meta['attribute_id'], $value);
             }

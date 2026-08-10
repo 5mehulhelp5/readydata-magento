@@ -10,17 +10,17 @@ use ReadyData\Import\Api\Data\CategoryStoreResultInterface;
 
 class CategoryStoreResult implements CategoryStoreResultInterface
 {
-    private int $storeId = 0;
+    private ?int $storeId = null;
     private string $status = self::STATUS_SKIPPED;
     private ?string $reason = null;
     private array $messages = [];
 
-    public function getStoreId(): int
+    public function getStoreId(): ?int
     {
         return $this->storeId;
     }
 
-    public function setStoreId(int $storeId): CategoryStoreResultInterface
+    public function setStoreId(?int $storeId): CategoryStoreResultInterface
     {
         $this->storeId = $storeId;
         return $this;

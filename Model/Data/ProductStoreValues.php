@@ -26,7 +26,7 @@ class ProductStoreValues implements ProductStoreValuesInterface
         return $this->storeId;
     }
 
-    public function setStoreId(int $storeId): ProductStoreValuesInterface
+    public function setStoreId(?int $storeId): ProductStoreValuesInterface
     {
         $this->storeId = $storeId;
         return $this;
@@ -37,7 +37,7 @@ class ProductStoreValues implements ProductStoreValuesInterface
         return $this->storeViewCode;
     }
 
-    public function setStoreViewCode(string $storeViewCode): ProductStoreValuesInterface
+    public function setStoreViewCode(?string $storeViewCode): ProductStoreValuesInterface
     {
         $this->storeViewCode = $storeViewCode;
         return $this;

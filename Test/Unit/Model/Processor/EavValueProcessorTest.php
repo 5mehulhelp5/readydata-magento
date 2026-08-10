@@ -6,8 +6,10 @@ declare(strict_types=1);
 
 namespace ReadyData\Import\Test\Unit\Model\Processor;
 
+use Magento\Framework\App\ResourceConnection;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
+use ReadyData\Import\Api\Data\ScopedValuesInterface;
 use ReadyData\Import\Api\Data\StoreResultInterface;
 use ReadyData\Import\Model\BatchContext;
 use ReadyData\Import\Model\Cache\AttributeMetadataCache;
@@ -128,6 +130,13 @@ class EavValueProcessorTest extends TestCase
                 $storeId !== null => in_array($storeId, [0, 2, 3, 4, 5], true) ? $storeId : null,
                 default => ['de_de' => 3, 'fr_fr' => 5][$code] ?? null,
             }
+        );
+
+        // describeScope() is pure formatting, so the real one is used rather
+        // than a second copy of its wording living in this fixture.
+        $formatter = new StoreWebsiteMap($this->createMock(ResourceConnection::class));
+        $this->storeWebsiteMap->method('describeScope')->willReturnCallback(
+            static fn (ScopedValuesInterface $block): string => $formatter->describeScope($block)
         );
 
         $this->processor = new EavValueProcessor(
@@ -547,7 +556,14 @@ class EavValueProcessorTest extends TestCase
             ]]],
             $this->upserts
         );
-        self::assertStringContainsString('addressed more than once', $context->getMessages('SKU-1')[0]);
+        // On the product, not on a scope: the block merged into the base pass,
+        // which has no store_results row of its own, so a scope-tagged warning
+        // would reach no response field at all.
+        self::assertSame([], $context->getScopeResults('SKU-1'));
+        self::assertStringContainsString(
+            'addressed more than once',
+            $context->getScopeMessages('SKU-1', null)[0]
+        );
     }
 
     public function testTwoBlocksForTheSameStoreMergeWithTheLastWinning(): void
@@ -615,8 +631,9 @@ class EavValueProcessorTest extends TestCase
 
         $this->processor->process($context);
 
-        self::assertSame([3], $context->getScopeStoreIds('SKU-1'));
-        self::assertSame(StoreResultInterface::STATUS_WRITTEN, $context->getScopeStatus('SKU-1', 3));
+        $scopes = $context->getScopeResults('SKU-1');
+        self::assertSame(3, $scopes[0]['store_id']);
+        self::assertSame(StoreResultInterface::STATUS_UPDATED, $scopes[0]['status']);
     }
 
     public function testAScopeWhoseEveryValueWasRefusedReportsAsSkipped(): void
@@ -627,9 +644,10 @@ class EavValueProcessorTest extends TestCase
 
         $this->processor->process($context);
 
-        self::assertSame([3], $context->getScopeStoreIds('SKU-1'));
-        self::assertSame(StoreResultInterface::STATUS_SKIPPED, $context->getScopeStatus('SKU-1', 3));
-        self::assertCount(1, $context->getScopeMessages('SKU-1', 3));
+        $scopes = $context->getScopeResults('SKU-1');
+        self::assertSame(3, $scopes[0]['store_id']);
+        self::assertSame(StoreResultInterface::STATUS_SKIPPED, $scopes[0]['status']);
+        self::assertCount(1, $scopes[0]['messages']);
     }
 
     public function testAClearAloneCountsAsWritten(): void
@@ -640,19 +658,32 @@ class EavValueProcessorTest extends TestCase
 
         $this->processor->process($context);
 
-        self::assertSame(StoreResultInterface::STATUS_WRITTEN, $context->getScopeStatus('SKU-1', 3));
+        self::assertSame(
+            StoreResultInterface::STATUS_UPDATED,
+            $context->getScopeResults('SKU-1')[0]['status']
+        );
     }
 
-    public function testAnUnresolvableScopeIsNotRegisteredAtAll(): void
+    public function testAnUnresolvableScopeStillReportsItsOwnRow(): void
     {
-        // There is no store ID to report it under; the message stays on the
-        // product, which is where the caller will look for it.
+        // One row per block the payload sent, so the caller can match them up.
+        // There is no store ID to report it under — 0 would name the default
+        // scope, which this list never covers.
         $context = $this->createContext([], storeValues: [$this->block(99, ['store_note' => 'lost'])]);
 
         $this->processor->process($context);
 
-        self::assertSame([], $context->getScopeStoreIds('SKU-1'));
-        self::assertCount(1, $context->getScopeMessages('SKU-1', null));
+        self::assertSame(
+            [[
+                'store_id' => null,
+                'status' => StoreResultInterface::STATUS_SKIPPED,
+                'reason' => StoreResultInterface::REASON_UNKNOWN_STORE,
+                'messages' => ['Store values for store view ID 99 were skipped: no such store view.'],
+            ]],
+            $context->getScopeResults('SKU-1')
+        );
+        // ... and not on the product as well, so nothing is reported twice.
+        self::assertSame([], $context->getScopeMessages('SKU-1', null));
     }
 
     public function testTheRequestScopeIsNeverRegisteredAsAScopedResult(): void
@@ -667,7 +698,7 @@ class EavValueProcessorTest extends TestCase
 
         $this->processor->process($context);
 
-        self::assertSame([], $context->getScopeStoreIds('SKU-1'));
+        self::assertSame([], $context->getScopeResults('SKU-1'));
     }
 
     /**

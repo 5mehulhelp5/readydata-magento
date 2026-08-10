@@ -38,7 +38,6 @@ use ReadyData\Import\Model\ResourceModel\AttributeOption;
 class AttributeSyncService
 {
     private const LOCK_NAME = 'readydata_attribute_sync';
-    private const LOCK_TIMEOUT_SEC = 10;
 
     private const OPTION_INPUTS = ['select', 'multiselect'];
 
@@ -86,7 +85,7 @@ class AttributeSyncService
             return $this->buildResponse($received, $this->disabledResults($attributes), $startedAt);
         }
 
-        if (!$this->lockManager->lock(self::LOCK_NAME, self::LOCK_TIMEOUT_SEC)) {
+        if (!$this->lockManager->lock(self::LOCK_NAME, ImportLocks::TIMEOUT_SEC)) {
             throw new LocalizedException(__('Another attribute sync is already running. Try again later.'));
         }
 

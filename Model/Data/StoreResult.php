@@ -10,18 +10,30 @@ use ReadyData\Import\Api\Data\StoreResultInterface;
 
 class StoreResult implements StoreResultInterface
 {
-    private int $storeId = 0;
+    private ?int $storeId = null;
     private string $status = self::STATUS_ERROR;
+    private ?string $reason = null;
     private array $messages = [];
 
-    public function getStoreId(): int
+    public function getStoreId(): ?int
     {
         return $this->storeId;
     }
 
-    public function setStoreId(int $storeId): StoreResultInterface
+    public function setStoreId(?int $storeId): StoreResultInterface
     {
         $this->storeId = $storeId;
+        return $this;
+    }
+
+    public function getReason(): ?string
+    {
+        return $this->reason;
+    }
+
+    public function setReason(?string $reason): StoreResultInterface
+    {
+        $this->reason = $reason;
         return $this;
     }
 

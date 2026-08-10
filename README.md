@@ -522,9 +522,11 @@ product does not abort the request.
       "status": "created",                        // the product, at store_id above
       "messages": [],
       "store_results": [
-        {"store_id": 3, "status": "written", "messages": []},
-        {"store_id": 5, "status": "skipped",
-         "messages": ["Attribute \"special_price\" is global and has no store dimension; …"]}
+        {"store_id": 3, "status": "updated", "reason": null, "messages": []},
+        {"store_id": 5, "status": "skipped", "reason": null,
+         "messages": ["Attribute \"special_price\" is global and has no store dimension; …"]},
+        {"store_id": null, "status": "skipped", "reason": "unknown_store",
+         "messages": ["Store values for store view ID 99 were skipped: no such store view."]}
       ]
     }
   ]
@@ -536,25 +538,32 @@ are about. A caller cannot infer it — `/rest/V1/...` resolves against the
 default store view rather than the admin scope, and only `settings` overrides
 that — so it is echoed back rather than assumed.
 
-`store_results` holds **one entry per resolved `store_values` block**, in
-payload order. The request's own scope is deliberately not repeated there: the
-product result already is that scope's outcome, so a caller recording one
-history row per (product, scope) reads the product result plus this list with
-nothing described twice. The field is absent for a payload that named no
-scopes.
+`store_results` holds **one entry per `store_values` block**, in payload order,
+so a caller can match rows to the blocks it sent. The request's own scope is
+deliberately not repeated there: the product result already is that scope's
+outcome, so a caller recording one history row per (product, scope) reads the
+product result plus this list with nothing described twice. The field is absent
+for a payload that named no scopes.
 
-A scope's `status` is one of:
+The rows use the **same four fields and the same status vocabulary as the
+category endpoint** (`ScopeResultInterface`), so one mapping serves both:
 
 | Status | Meaning |
 | --- | --- |
-| `written` | Values or clears were applied in this scope. A clear alone counts — the scope applied a removal. |
-| `skipped` | The scope resolved but nothing was applied: every value it carried was refused (the messages say why), or the block named a scope and carried nothing. |
+| `updated` | Values or clears were applied in this scope. A clear alone counts — the scope applied a removal. |
+| `unchanged` | The scope resolved and nothing differed. Never reported here: product values are upserted rather than compared. The category endpoint does report it. |
+| `skipped` | Nothing was applied. `reason` and the messages say why: every value the block carried was refused, the block named a scope and carried nothing, or its store view does not exist. |
 | `error` | The product failed, so nothing survives in any of its scopes — a batch is one transaction. Never about the scope alone. |
 
+`store_id` is `null` when the block never resolved to a store view at all, with
+`reason: "unknown_store"`. It is never `0`: the default scope is the one scope
+this list never covers, so reporting 0 would name the wrong thing. A block that
+*deliberately* names store 0 — legal here, when `settings` names a store view and
+the block carries the fallback values — is merged into the product's own pass and
+reported by the product's top-level result instead.
+
 A message belongs to exactly one result: raised while writing a block, it is on
-that block's entry; otherwise on the product's. A block whose store view could
-not be resolved has no scope to report under, so it stays a product-level
-message.
+that block's entry; otherwise on the product's.
 
 The counters count **products, not product-scopes**: a product created with
 three localized value sets is one `created`.
@@ -562,30 +571,55 @@ three localized value sets is one `created`.
 ### Concurrency
 
 Overlapping imports are rejected with `Another import is already running.` —
-but only when the payload can perform an **unkeyed read-then-create**: look for
-a row, not find it, insert it, where the database has no unique key to catch a
-second request doing the same thing at the same moment. There are two such
-sequences, and the lock exists for both:
+but only when the payload can reach an **unkeyed read-then-create**: look for a
+row, not find it, insert it, where the database has no unique key to catch a
+second request doing the same thing at the same moment. There are four such
+sequences, and the lock exists for all of them:
 
+- **product rows.** `catalog_product_entity.sku` carries a plain index, **not** a
+  unique key — Magento enforces SKU uniqueness in PHP. Two concurrent runs naming
+  the same new SKU both miss the read and both insert, leaving two rows for one
+  SKU, each with its own EAV, gallery and stock satellites.
 - **categories.** Missing path segments are created on demand, and nothing is
   unique on `(parent_id, name)` or on a category `url_key`. Two concurrent runs
   both miss and both insert, leaving a duplicate sibling — which then makes that
   path permanently ambiguous — or a `url_rewrite` unique-key violation that
   fails whichever request loses. The category endpoint takes the same lock, so
   the two serialize against each other too.
-- **attribute options.** With *Auto-Create Missing Attribute Options* on,
-  missing select/multiselect options are created. `eav_attribute_option_value`
-  is unique on `(store_id, option_id)`, **not** on the label, so two concurrent
-  runs writing the same new option label both insert and the attribute ends up
-  with two options of the same name.
+- **media gallery rows.** `catalog_product_entity_media_gallery` has no key on
+  `(attribute_id, value)`, and its `value_id` is an autoincrement, so a fresh row
+  cannot be re-selected by its own data at all. Two concurrent runs carrying the
+  same file for one product both insert it and the image is listed twice.
+- **attribute options.** With *Auto-Create Missing Attribute Options* on, missing
+  select/multiselect options are created. `eav_attribute_option` has no key on the
+  label, so two concurrent runs writing the same new option label both insert and
+  the attribute ends up with two options of the same name.
 
-A payload that can reach neither runs **lock-free**, concurrently with anything
-else — a price or stock update, say, or a store-value pass carrying no custom
-attributes. The two tests are deliberately conservative: any `categories` field
-at all (including `[]`), and any `custom_attributes` while option auto-creation
-is on (whether on the product or in a `store_values` block). Erring towards
-taking the lock costs a serialized request; erring the other way costs a
-duplicate category or attribute option, and neither is cheap to undo.
+Deciding this costs **one indexed query**: the SKUs in the payload are looked up
+before the lock, because nothing in the payload itself reveals whether a product
+row has to be created. A payload whose SKUs all exist and that carries no
+`categories`, no `media` and no `custom_attributes` (with option auto-creation on)
+runs **lock-free**, concurrently with anything else — a price or stock refresh,
+typically, which is the case the fast path is for.
+
+The remaining tests are deliberately conservative: any `categories` field at all
+(including `[]`), any `media` field at all (`[]` means "remove everything", which
+is still work), and any `custom_attributes` while option auto-creation is on.
+`store_values` blocks are **not** consulted — their custom attributes only ever
+resolve option labels they did not create. Erring towards taking the lock costs a
+serialized request; erring the other way costs a duplicate product, category,
+image or attribute option, and none of those is cheap to undo.
+
+Two races the lock does **not** cover, both documented rather than closed:
+
+- the attribute endpoint seeds options under its own `readydata_attribute_sync`
+  lock, so a product import running concurrently with an attribute sync can still
+  duplicate one option label;
+- `url_rewrite` is unique on `(request_path, store_id)`, so concurrent lock-free
+  requests cannot duplicate a rewrite — but they read the conflict set before
+  writing, which makes the `error` and `append` conflict strategies unreliable
+  under concurrency and can leave the loser's request path pointing at the other
+  product.
 
 ## Attribute definitions
 
@@ -1176,6 +1210,9 @@ transaction** — a half-localized category is worse than an unlocalized one, so
 failure anywhere takes the whole entry with it. Each reports its own row in
 `store_results`:
 
+The rows use the **same four fields and the same status vocabulary as the
+product endpoint** (`ScopeResultInterface`), so one mapping serves both:
+
 | Status | Meaning |
 | --- | --- |
 | `updated` | Values in this scope differed and were written. |
@@ -1187,6 +1224,11 @@ The request's own scope is not repeated in `store_results`: the category's
 top-level result is that scope's outcome, and `root_category_id` on the result
 says which tree it landed in. A caller recording one history row per (category,
 scope) reads the entry plus its blocks with nothing described twice.
+
+There is one row per block, in payload order, so rows and blocks stay in step.
+`store_id` is `null` on a block that never resolved to a store view — including
+one that named the default scope, since 0 would name the scope this list never
+covers.
 
 Per-block refusals, none of which costs the category or its other scopes:
 
@@ -1209,9 +1251,9 @@ Category sync takes the **same lock as the product import** (rejecting with
 `Another import is already running.`), because both mutate the category tree and
 there is no unique key on `(parent_id, name)` to fall back on — two concurrent
 runs would resolve the same missing path, both miss, and both insert. This
-endpoint takes it on every request; the product endpoint takes it only when its
-payload can reach a read-then-create (see "Concurrency" under the product
-endpoint).
+endpoint takes it on **every** request, since every request to it is a category
+write; the product endpoint takes it only when its payload can reach one of the
+four unkeyed read-then-creates (see "Concurrency" under the product endpoint).
 
 Each category is processed in its own transaction and reported independently.
 That transaction is what makes a **move** atomic: `changeParent()` re-paths the
