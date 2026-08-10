@@ -36,7 +36,17 @@ class BatchContext
     private array $failedSkus = [];
 
     /**
-     * @var array<string, string[]> SKU => messages (errors and warnings)
+     * Messages (errors and warnings) per SKU, each tagged with the store scope
+     * it belongs to — null for the product as a whole, a store ID for one of
+     * its scoped value sets.
+     *
+     * Kept structured rather than as flat strings because a scoped message
+     * belongs to that scope's outcome, not to the product's: the response
+     * flattens them for now (see {@see getMessages()}), but per-scope results
+     * need them apart, and re-deriving the scope from a prefixed string later
+     * would be parsing our own output back.
+     *
+     * @var array<string, array<int, array{store_id: int|null, text: string}>>
      */
     private array $messages = [];
 
@@ -160,19 +170,45 @@ class BatchContext
     }
 
     /**
-     * Record a non-fatal message (warning) for a product.
+     * Record a non-fatal message (warning) for a product, optionally against
+     * one of its store scopes.
      */
-    public function addMessage(string|int $sku, string $message): void
+    public function addMessage(string|int $sku, string $message, ?int $storeId = null): void
     {
-        $this->messages[$sku][] = $message;
+        $this->messages[$sku][] = ['store_id' => $storeId, 'text' => $message];
     }
 
     /**
+     * Every message for a product, scoped ones prefixed with the store they
+     * belong to so the flat response still says where each one came from.
+     *
      * @return string[]
      */
     public function getMessages(string|int $sku): array
     {
-        return $this->messages[$sku] ?? [];
+        return array_map(
+            static fn (array $message): string => $message['store_id'] === null
+                ? $message['text']
+                : sprintf('[store %d] %s', $message['store_id'], $message['text']),
+            $this->messages[$sku] ?? []
+        );
+    }
+
+    /**
+     * Messages recorded against one store scope, untagged. `null` selects the
+     * product's own (unscoped) messages.
+     *
+     * @return string[]
+     */
+    public function getScopeMessages(string|int $sku, ?int $storeId): array
+    {
+        return array_values(array_map(
+            static fn (array $message): string => $message['text'],
+            array_filter(
+                $this->messages[$sku] ?? [],
+                static fn (array $message): bool => $message['store_id'] === $storeId
+            )
+        ));
     }
 
     /**

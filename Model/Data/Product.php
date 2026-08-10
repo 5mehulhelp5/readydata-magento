@@ -27,6 +27,7 @@ class Product implements ProductInterface
     private ?StockDataInterface $stock = null;
     private ?array $customAttributes = null;
     private ?array $clearAttributes = null;
+    private ?array $storeValues = null;
     private ?ConfigurableDataInterface $configurable = null;
     private ?ProductLinksInterface $links = null;
     private ?array $media = null;
@@ -183,6 +184,17 @@ class Product implements ProductInterface
     public function setClearAttributes(array $clearAttributes): ProductInterface
     {
         $this->clearAttributes = $clearAttributes;
+        return $this;
+    }
+
+    public function getStoreValues(): ?array
+    {
+        return $this->storeValues;
+    }
+
+    public function setStoreValues(array $storeValues): ProductInterface
+    {
+        $this->storeValues = $storeValues;
         return $this;
     }
 

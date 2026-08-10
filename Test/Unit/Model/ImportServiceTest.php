@@ -204,7 +204,7 @@ class ImportServiceTest extends TestCase
         );
 
         $storeWebsiteMap = $this->createMock(StoreWebsiteMap::class);
-        $storeWebsiteMap->method('resolveStoreId')->willReturn(0);
+        $storeWebsiteMap->method('resolveScopeStoreId')->willReturn(0);
 
         $responseFactory = $this->createMock(ImportResponseInterfaceFactory::class);
         $responseFactory->method('create')->willReturnCallback(static fn (): ImportResponse => new ImportResponse());

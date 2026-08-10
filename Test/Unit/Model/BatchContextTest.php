@@ -61,6 +61,22 @@ class BatchContextTest extends TestCase
         self::assertSame([10], $context->getValidEntityIds());
     }
 
+    /**
+     * A scoped message says which store view it came from in the flat list, and
+     * stays separable for callers that report per scope.
+     */
+    public function testScopedMessagesArePrefixedFlatAndSeparablePerScope(): void
+    {
+        $context = $this->createContext();
+        $context->addMessage('A', 'product-wide');
+        $context->addMessage('A', 'scoped', 3);
+
+        self::assertSame(['product-wide', '[store 3] scoped'], $context->getMessages('A'));
+        self::assertSame(['product-wide'], $context->getScopeMessages('A', null));
+        self::assertSame(['scoped'], $context->getScopeMessages('A', 3));
+        self::assertSame([], $context->getScopeMessages('A', 4));
+    }
+
     public function testDataBagRoundTrip(): void
     {
         $context = $this->createContext();

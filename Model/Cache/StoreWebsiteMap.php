@@ -46,6 +46,55 @@ class StoreWebsiteMap
         return $storeId;
     }
 
+    /**
+     * Resolve a scope given either form, ID first — a caller that holds the ID
+     * should not have to translate it back into a code for us to translate it
+     * forward again. Neither given means the default scope.
+     *
+     * @throws LocalizedException on an unknown ID or code
+     */
+    public function resolveScopeStoreId(?int $storeId, ?string $storeViewCode): int
+    {
+        if ($storeId === null) {
+            return $this->resolveStoreId($storeViewCode);
+        }
+        if (!$this->hasStoreId($storeId)) {
+            throw new LocalizedException(__('Unknown store view ID %1.', $storeId));
+        }
+
+        return $storeId;
+    }
+
+    /**
+     * Like {@see resolveScopeStoreId()} but answers null instead of throwing,
+     * for scopes that arrive per payload item: one unresolvable store view
+     * there is that item's problem to report, not the whole request's to fail
+     * on.
+     */
+    public function findScopeStoreId(?int $storeId, ?string $storeViewCode): ?int
+    {
+        if ($storeId !== null) {
+            return $this->hasStoreId($storeId) ? $storeId : null;
+        }
+        if ($storeViewCode === null || $storeViewCode === '') {
+            return null;
+        }
+        if ($storeViewCode === 'admin') {
+            return 0;
+        }
+
+        return $this->getStoreMap()[$storeViewCode] ?? null;
+    }
+
+    /**
+     * Whether the ID addresses a real scope. 0 is the admin scope: not a store
+     * view, but a scope values can be written in, which is what callers ask.
+     */
+    public function hasStoreId(int $storeId): bool
+    {
+        return $storeId === 0 || in_array($storeId, $this->getStoreMap(), true);
+    }
+
     public function getWebsiteId(string $websiteCode): ?int
     {
         return $this->getWebsiteMap()[$websiteCode] ?? null;

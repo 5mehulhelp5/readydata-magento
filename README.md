@@ -53,7 +53,13 @@ Authorization: Bearer <integration token>   (ACL: ReadyData_Import::import)
         {"attribute_code": "color", "value": "Red"},
         {"attribute_code": "description", "value": "<p>Long text</p>"}
       ],
-      "clear_attributes": ["special_label"]
+      "clear_attributes": ["special_label"],
+      "store_values": [
+        {"store_id": 3, "name": "Winterjacke",
+         "custom_attributes": [{"attribute_code": "description", "value": "<p>Langer Text</p>"}]},
+        {"store_view_code": "fr_fr", "name": "Veste d'hiver",
+         "clear_attributes": ["special_label"]}
+      ]
     }
   ],
   "settings": {"store_view_code": "default", "continue_on_error": true}
@@ -63,17 +69,62 @@ Authorization: Bearer <integration token>   (ACL: ReadyData_Import::import)
 ### Attribute value scoping
 
 Values are written in the scope each attribute is configured with, keyed off
-the request's `store_view_code` (absent/`admin` = default scope):
+the scope being addressed (absent/`admin` = default scope):
 
 - **Global** (`is_global = 1`): always written at store 0, whatever the
-  request scope.
+  scope.
 - **Website** (`is_global = 2`): written to **every store view of the
-  website** containing the request's store view (including inactive views),
+  website** containing the addressed store view (including inactive views),
   mirroring core Magento's website-scope emulation. At the default scope,
   only the store-0 row is written.
-- **Store view** (`is_global = 0`): written at the request's store view only.
+- **Store view** (`is_global = 0`): written at the addressed store view only.
 
 New products additionally get a store-0 fallback row for non-global values.
+
+The request's own scope comes from `settings.store_view_code`, or from
+`settings.store_id` for callers that already hold the ID — the ID wins when
+both are given, and one no store view has fails the request exactly as an
+unknown code does.
+
+### Store-scoped values
+
+`settings` names **one** scope. A product's `store_values` names any number
+more, so a single request can carry the product's default-scope identity and
+every localized value set it has, instead of one request per store view.
+
+Each block addresses its store view by `store_id` or `store_view_code` (the ID
+wins) and carries what the product itself carries at the default scope: the
+value-bearing fields `name`, `price`, `status`, `visibility`, `weight`, plus
+`custom_attributes` and `clear_attributes`. Everything with no store dimension
+— `websites`, `categories`, `links`, `media`, `stock`, `tier_prices`, the
+attribute set and the product type — stays on the product and is written once.
+
+The scope a block names only decides which store view is being *addressed*.
+What that means per attribute is still the table above: a website-scoped
+attribute in a block naming `de_de` fans out across that store's website, and
+`settings` may name the default scope while a block writes at store 3.
+
+Guards, each a per-product message (prefixed `[store N]`) and never fatal:
+
+- **Global attributes are refused in a block**, not written. Having no store
+  dimension, the value would land at store 0 and overwrite the product's own
+  default-scope value from inside a block that named one store view. Send them
+  on the product.
+- **`url_key` is refused in a block.** The storefront URL comes from
+  `url_rewrite`, and those rows are still generated from the default-scope key,
+  so a scoped key would be stored and never used.
+- **An unknown store view skips that block only** — one bad scope does not cost
+  the product its other scopes, or its default-scope write.
+- **A block naming the request's own scope merges into it**, the block winning
+  per attribute; two blocks naming the same store view merge the same way, so
+  the last one wins. Merging rather than writing twice keeps the result
+  independent of statement ordering.
+
+A block never generates the store-0 fallback row a new product gets: the
+default scope is what the product itself carries, and copying a translation
+into it would make one store view's text the value every other store view
+inherits. It also never generates a `url_key` — a generated slug is the
+product's identity on the storefront, not a per-store translation.
 
 ### Clearing attribute values
 
@@ -82,15 +133,20 @@ safe for sparse feeds. To actually remove a stored value, list the attribute
 code in `clear_attributes`. A clear DELETEs the EAV value rows in the same
 scope a write would target (see "Attribute value scoping"): global attributes
 at the default scope, website-scoped attributes across all store views of the
-request store's website, store-scoped attributes at the request's
-`store_view_code` (a cleared store row falls back to the default value, like
-"Use Default" in the admin).
+addressed store's website, store-scoped attributes at the addressed store view
+(a cleared store row falls back to the default value, like "Use Default" in the
+admin).
+
+A `store_values` block has its own `clear_attributes`, evaluated against that
+block's scope — which is how one store view drops an override and goes back to
+inheriting the default while its neighbours keep theirs.
 
 Guards (each a per-product warning in `results[].messages`, never fatal):
 unknown and static attributes are skipped; required attributes cannot be
 cleared at the default scope; when the same attribute is both written and
-cleared, the write wins. Clearing `url_key` does not remove existing URL
-rewrites.
+cleared **in the same scope**, the write wins. A clear in a block is subject to
+the same refusals a write there is (global attributes, `url_key`). Clearing
+`url_key` does not remove existing URL rewrites.
 
 ### Category assignments
 

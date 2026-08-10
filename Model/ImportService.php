@@ -94,7 +94,10 @@ class ImportService
 
         $batchSize = $settings?->getBatchSize() ?: $this->config->getBatchSize();
         $continueOnError = $settings?->getContinueOnError() ?? $this->config->isContinueOnError();
-        $storeId = $this->storeWebsiteMap->resolveStoreId($settings?->getStoreViewCode());
+        $storeId = $this->storeWebsiteMap->resolveScopeStoreId(
+            $settings?->getStoreId(),
+            $settings?->getStoreViewCode()
+        );
 
         if (!$this->lockManager->lock(self::TREE_WRITE_LOCK_NAME, self::LOCK_TIMEOUT_SEC)) {
             throw new LocalizedException(__('Another import is already running. Try again later.'));

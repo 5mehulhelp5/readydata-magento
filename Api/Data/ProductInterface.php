@@ -30,6 +30,7 @@ interface ProductInterface
     public const STOCK = 'stock';
     public const CUSTOM_ATTRIBUTES = 'custom_attributes';
     public const CLEAR_ATTRIBUTES = 'clear_attributes';
+    public const STORE_VALUES = 'store_values';
     public const CONFIGURABLE = 'configurable';
     public const LINKS = 'links';
     public const MEDIA = 'media';
@@ -218,6 +219,38 @@ interface ProductInterface
      * @return $this
      */
     public function setClearAttributes(array $clearAttributes): self;
+
+    /**
+     * Additional store views to write this product's attribute values in,
+     * alongside the request's own scope — so one request can carry a product's
+     * default-scope identity and every localized value set it has.
+     *
+     * Each block names its store view and carries the same kind of payload the
+     * product itself does: the value-bearing first-class fields, plus
+     * custom_attributes and clear_attributes for that scope. Everything with no
+     * store dimension (websites, categories, links, media, stock, tier prices,
+     * the attribute set and the product type) stays on the product and is
+     * written once.
+     *
+     * A block naming the request's own scope is merged into it, with the
+     * block's values winning; two blocks naming the same store view merge the
+     * same way, so the last one wins. A block naming an unknown store view is
+     * skipped with a per-product message and costs the product nothing else.
+     *
+     * Unlike the product's own values, a scoped block never generates a
+     * fallback default-scope row for a new product: the default scope is what
+     * the product itself carries, and copying a translation into it would make
+     * one store view's text the value every other store view falls back to.
+     *
+     * @return \ReadyData\Import\Api\Data\ProductStoreValuesInterface[]|null
+     */
+    public function getStoreValues(): ?array;
+
+    /**
+     * @param \ReadyData\Import\Api\Data\ProductStoreValuesInterface[] $storeValues
+     * @return $this
+     */
+    public function setStoreValues(array $storeValues): self;
 
     /**
      * Configurable-product structure. Set on a "configurable" parent to

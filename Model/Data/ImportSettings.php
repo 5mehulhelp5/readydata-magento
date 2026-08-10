@@ -11,6 +11,7 @@ use ReadyData\Import\Api\Data\ImportSettingsInterface;
 class ImportSettings implements ImportSettingsInterface
 {
     private ?string $storeViewCode = null;
+    private ?int $storeId = null;
     private ?bool $continueOnError = null;
     private ?int $batchSize = null;
 
@@ -22,6 +23,17 @@ class ImportSettings implements ImportSettingsInterface
     public function setStoreViewCode(string $storeViewCode): ImportSettingsInterface
     {
         $this->storeViewCode = $storeViewCode;
+        return $this;
+    }
+
+    public function getStoreId(): ?int
+    {
+        return $this->storeId;
+    }
+
+    public function setStoreId(int $storeId): ImportSettingsInterface
+    {
+        $this->storeId = $storeId;
         return $this;
     }
 

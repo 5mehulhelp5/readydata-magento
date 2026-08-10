@@ -8,6 +8,8 @@
                 type="ReadyData\Import\Model\Data\Product"/>
     <preference for="ReadyData\Import\Api\Data\CustomAttributeInterface"
                 type="ReadyData\Import\Model\Data\CustomAttribute"/>
+    <preference for="ReadyData\Import\Api\Data\ProductStoreValuesInterface"
+                type="ReadyData\Import\Model\Data\ProductStoreValues"/>
     <preference for="ReadyData\Import\Api\Data\StockDataInterface"
                 type="ReadyData\Import\Model\Data\StockData"/>
     <preference for="ReadyData\Import\Api\Data\ConfigurableDataInterface"

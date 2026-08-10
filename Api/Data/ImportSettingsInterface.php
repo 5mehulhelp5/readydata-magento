@@ -15,6 +15,7 @@ namespace ReadyData\Import\Api\Data;
 interface ImportSettingsInterface
 {
     public const STORE_VIEW_CODE = 'store_view_code';
+    public const STORE_ID = 'store_id';
     public const CONTINUE_ON_ERROR = 'continue_on_error';
     public const BATCH_SIZE = 'batch_size';
 
@@ -30,6 +31,23 @@ interface ImportSettingsInterface
      * @return $this
      */
     public function setStoreViewCode(string $storeViewCode): self;
+
+    /**
+     * Store view ID for store-scoped attribute values, for callers that
+     * already hold the ID and should not have to translate it back into a
+     * code. Wins over store_view_code when both are given; 0 is the admin
+     * (default) scope. An ID no store view has fails the request, exactly as
+     * an unknown code does.
+     *
+     * @return int|null
+     */
+    public function getStoreId(): ?int;
+
+    /**
+     * @param int $storeId
+     * @return $this
+     */
+    public function setStoreId(int $storeId): self;
 
     /**
      * @return bool|null
