@@ -744,6 +744,14 @@ Authorization: Bearer <integration token>   (ACL: ReadyData_Import::categories)
     {
       "path": "Default Category/Men/Clearance",
       "delete": 1
+    },
+    {
+      "path": "Default Category/Men/Hats",
+      "store_values": [
+        {"store_id": 3, "name": "H\u00fcte",
+         "custom_attributes": [{"attribute_code": "description", "value": "<p>Alle H\u00fcte</p>"}]},
+        {"store_view_code": "fr_fr", "name": "Chapeaux", "clear_attributes": ["meta_keywords"]}
+      ]
     }
   ],
   "settings": {"store_view_code": "default", "continue_on_error": true}
@@ -752,9 +760,10 @@ Authorization: Bearer <integration token>   (ACL: ReadyData_Import::categories)
 
 Response: summary counters (`received`, `created`, `updated`, `unchanged`,
 `deleted`, `skipped`, `failed`, `elapsed_ms`) plus a per-category `results` array with the
-resolved `path`, the `entity_id`, a `status`, a machine-readable `reason` and
-`messages`. Errors are per category; a failing category does not abort the
-request. Every entry gets exactly one result row, rejected ones included; the
+resolved `path`, the `entity_id`, the `root_category_id` of the tree it landed
+in, a `status`, a machine-readable `reason`, `messages`, and — when the entry
+named scopes beyond the request's own — `store_results`. Errors are per
+category; a failing category does not abort the request. Every entry gets exactly one result row, rejected ones included; the
 only case where `results` is shorter than `received` is a payload that sends the
 same category twice, which collapses to one entry with the last one winning.
 
@@ -945,8 +954,20 @@ dimension), `move_disabled`, `parent_not_found` / `unknown_root` /
 `ambiguous_path` for a destination that does not resolve, `move_into_descendant`
 for a destination that is the category itself or inside its own subtree,
 `root_in_use` when the category is some store group's `root_category_id` —
-demoting that would leave the storefront pointing at a non-root — and the two
-destination-collision refusals below.
+demoting that would leave the storefront pointing at a non-root — `cross_root_move`
+(below), and the two destination-collision refusals below that.
+
+**A move between root categories needs its own switch.** The two roots are two
+different catalogs, so a destination under a different root takes the category,
+its whole descendant subtree and their product assignments off one storefront
+and onto another. Core performs it without complaint, and nothing else here
+catches it: the descendant check only looks downwards, and `root_in_use` only
+fires for a store group's own root. Refused as `cross_root_move` unless
+**Allow Moves Between Root Categories**
+(`readydata_import/categories/allow_cross_root_move`, default **off**) is on —
+which is separate from **Allow Category Moves**, so enabling ordinary
+reparenting does not quietly enable this. A move within one root tree is
+unaffected.
 
 **The destination must have room for it.** A move whose new parent already holds
 a category with the same name is `destination_name_taken`; one that would collide
@@ -1073,6 +1094,62 @@ store view, not the admin scope, so the store the values land in comes from the
 URL unless the endpoint overrides it — which it does, from `store_view_code`.
 Keeping `/rest/all/V1/...` is still the safe habit.
 
+#### Several scopes in one request
+
+`settings` names **one** scope. A category's `store_values` names any number
+more, so a single request can carry its structure and every localized value set
+it has instead of one request per store view:
+
+```jsonc
+{
+  "path": "Default Category/Men/Hats",
+  "is_active": 1,
+  "store_values": [
+    {"store_id": 3, "name": "Hüte"},
+    {"store_view_code": "fr_fr", "name": "Chapeaux", "clear_attributes": ["meta_keywords"]}
+  ]
+}
+```
+
+A block carries only what has a store dimension — `name`, `url_key`,
+`is_active`, `include_in_menu`, `is_anchor`, `custom_attributes`,
+`clear_attributes`. The structural fields are not on the block at all, which is
+the `store_scope_structural_change` rule moved out of a runtime refusal and into
+the payload's shape: `position`, `parent_path`, `delete` and the rest stay on
+the category and are written once.
+
+Blocks run **after** the category's own write and **inside the same
+transaction** — a half-localized category is worse than an unlocalized one, so a
+failure anywhere takes the whole entry with it. Each reports its own row in
+`store_results`:
+
+| Status | Meaning |
+| --- | --- |
+| `updated` | Values in this scope differed and were written. |
+| `unchanged` | Nothing differed — no save at all, so a replay in this scope is free. |
+| `skipped` | Nothing was attempted; `reason` says why. |
+| `error` | The category's own write failed, so nothing survives in any of its scopes. |
+
+The request's own scope is not repeated in `store_results`: the category's
+top-level result is that scope's outcome, and `root_category_id` on the result
+says which tree it landed in. A caller recording one history row per (category,
+scope) reads the entry plus its blocks with nothing described twice.
+
+Per-block refusals, none of which costs the category or its other scopes:
+
+- `unknown_store` — no such store view;
+- `wrong_store_root` — that store view's storefront shows a different root, so
+  the write would succeed and be invisible there;
+- `invalid_definition` — the block names the default scope (which the category
+  itself writes, and which a block would otherwise overwrite for every store
+  view that inherits it), or a second block names a store view an earlier one
+  already claimed. Two blocks for one store view are refused rather than
+  written in order: which of them wins is not something a caller should have to
+  reason about.
+
+A category that was itself skipped or errored reports **no** `store_results` at
+all — there is nothing to localize, and its own `reason` is the whole story.
+
 ### Concurrency & indexing
 
 Category sync takes the **same lock as the product import** (rejecting with
@@ -1159,7 +1236,7 @@ endpoint is a no-op that reports every attribute as `skipped`/`disabled`. There
 is intentionally no attribute-shape config here — scope, flags and placement are
 supplied per attribute by the caller (the system of record).
 
-The **Categories** group has three switches, all default **off**, plus one
+The **Categories** group has four switches, all default **off**, plus one
 setting that belongs to the *product* endpoint:
 
 | Setting | Path | Notes |
@@ -1167,6 +1244,7 @@ setting that belongs to the *product* endpoint:
 | Enable Category Sync | `readydata_import/categories/enabled` | The kill switch for the whole `POST /V1/readydata/categories` endpoint. When off it is a no-op that reports every category as `skipped`/`disabled` without taking a lock or writing anything. |
 | Allow Category Moves | `readydata_import/categories/allow_move` | Gates reparenting. When off, an entry naming a destination is `skipped`/`move_disabled` and nothing is written. |
 | Allow Category Deletion | `readydata_import/categories/allow_delete` | Gates `delete: 1`. When off, every delete entry is `skipped`/`delete_disabled` before anything is even resolved. |
+| Allow Moves Between Root Categories | `readydata_import/categories/allow_cross_root_move` | Gates a move whose destination is under a *different* root. Separate from Allow Category Moves, because the two roots are two different catalogs — see "Moving a category". Refused as `cross_root_move` when off. |
 | Product Category Replacement Reaches | `readydata_import/categories/replace_scope` | Default `all_roots`. How far the **product** payload's `categories` field reaches when it replaces assignments — see "How far the replace reaches". **Not** gated on the switch above: it governs the product endpoint, which has nothing to do with whether category sync is enabled. |
 
 The endpoint is off by default because creating and renaming categories reshapes

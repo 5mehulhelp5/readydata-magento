@@ -50,6 +50,7 @@ class Config
     private const XML_PATH_CATEGORIES_ALLOW_MOVE = 'readydata_import/categories/allow_move';
     private const XML_PATH_CATEGORIES_ALLOW_DELETE = 'readydata_import/categories/allow_delete';
     private const XML_PATH_CATEGORIES_REPLACE_SCOPE = 'readydata_import/categories/replace_scope';
+    private const XML_PATH_CATEGORIES_ALLOW_CROSS_ROOT_MOVE = 'readydata_import/categories/allow_cross_root_move';
     private const XML_PATH_MEDIA_ENABLED = 'readydata_import/media/enabled';
     private const XML_PATH_MEDIA_DOWNLOAD_TIMEOUT = 'readydata_import/media/download_timeout';
     private const XML_PATH_MEDIA_DOWNLOAD_CONCURRENCY = 'readydata_import/media/download_concurrency';
@@ -180,6 +181,19 @@ class Config
     public function isCategoryDeleteAllowed(): bool
     {
         return $this->scopeConfig->isSetFlag(self::XML_PATH_CATEGORIES_ALLOW_DELETE);
+    }
+
+    /**
+     * Whether a move may cross from one root category's tree into another's.
+     * Off by default and separate from {@see isCategoryMoveAllowed()}: an
+     * ordinary move rearranges one catalog, while this one takes a category,
+     * its whole subtree and their product assignments out of one storefront and
+     * into another. The two roots are two different catalogs, and no amount of
+     * "the payload said so" makes that a routine reparenting.
+     */
+    public function isCrossRootMoveAllowed(): bool
+    {
+        return $this->scopeConfig->isSetFlag(self::XML_PATH_CATEGORIES_ALLOW_CROSS_ROOT_MOVE);
     }
 
     /**

@@ -185,7 +185,7 @@ class CategoryWriterTest extends TestCase
         $definition = (new CategoryDefinition())->setIsActive(1)->setIncludeInMenu(1);
         $messages = [];
 
-        self::assertFalse($this->writer->update(self::CATEGORY_ID, 'Shirts', $definition, 0, $messages));
+        self::assertFalse($this->writer->update(self::CATEGORY_ID, 'Shirts', $definition, null, 0, $messages));
     }
 
     public function testIntAndStringValuesCompareLooselyAgainstStoredEavValues(): void
@@ -199,7 +199,7 @@ class CategoryWriterTest extends TestCase
         $definition = (new CategoryDefinition())->setIsAnchor(1)->setPosition(5);
         $messages = [];
 
-        self::assertFalse($this->writer->update(self::CATEGORY_ID, 'Shirts', $definition, 0, $messages));
+        self::assertFalse($this->writer->update(self::CATEGORY_ID, 'Shirts', $definition, null, 0, $messages));
     }
 
     public function testRenameDerivesUrlKeyAndKeepsRedirectHistory(): void
@@ -218,7 +218,7 @@ class CategoryWriterTest extends TestCase
         $definition = new CategoryDefinition();
         $messages = [];
 
-        self::assertTrue($this->writer->update(self::CATEGORY_ID, 'Tops', $definition, 0, $messages));
+        self::assertTrue($this->writer->update(self::CATEGORY_ID, 'Tops', $definition, null, 0, $messages));
         self::assertSame('Tops', $saved['name']);
         // Without this the category would keep the "shirts" URL forever.
         self::assertSame('tops', $saved['url_key']);
@@ -240,7 +240,7 @@ class CategoryWriterTest extends TestCase
         $definition = (new CategoryDefinition())->setUrlKey('mens-tops');
         $messages = [];
 
-        $this->writer->update(self::CATEGORY_ID, 'Tops', $definition, 0, $messages);
+        $this->writer->update(self::CATEGORY_ID, 'Tops', $definition, null, 0, $messages);
 
         self::assertSame('mens-tops', $saved['url_key']);
     }
@@ -259,7 +259,7 @@ class CategoryWriterTest extends TestCase
             });
 
         $messages = [];
-        $this->writer->update(self::CATEGORY_ID, 'Tops', new CategoryDefinition(), 0, $messages);
+        $this->writer->update(self::CATEGORY_ID, 'Tops', new CategoryDefinition(), null, 0, $messages);
 
         self::assertFalse($saved['save_rewrites_history']);
     }
@@ -289,7 +289,7 @@ class CategoryWriterTest extends TestCase
         ]);
         $messages = [];
 
-        self::assertTrue($this->writer->update(self::CATEGORY_ID, 'Shirts', $definition, 1, $messages));
+        self::assertTrue($this->writer->update(self::CATEGORY_ID, 'Shirts', $definition, null, 1, $messages));
         self::assertSame($sparse, $saved, 'A fully loaded object would materialize a store override row'
             . ' for every scoped attribute, not just the one the caller sent.');
 
@@ -312,7 +312,7 @@ class CategoryWriterTest extends TestCase
         $definition = (new CategoryDefinition())->setClearAttributes(['meta_title']);
         $messages = [];
 
-        self::assertTrue($this->writer->update(self::CATEGORY_ID, 'Shirts', $definition, 1, $messages));
+        self::assertTrue($this->writer->update(self::CATEGORY_ID, 'Shirts', $definition, null, 1, $messages));
         // save() re-fetches the memoized loaded instance, so the null has to be
         // there; the sparse object would drop it.
         self::assertNull($loaded->getData('meta_title'));
@@ -328,7 +328,7 @@ class CategoryWriterTest extends TestCase
         $definition = (new CategoryDefinition())->setClearAttributes(['meta_title']);
         $messages = [];
 
-        self::assertFalse($this->writer->update(self::CATEGORY_ID, 'Shirts', $definition, 0, $messages));
+        self::assertFalse($this->writer->update(self::CATEGORY_ID, 'Shirts', $definition, null, 0, $messages));
     }
 
     public function testClearingAtStoreScopeWithNoStoreOverrideIsNotAChange(): void
@@ -345,7 +345,7 @@ class CategoryWriterTest extends TestCase
         $definition = (new CategoryDefinition())->setClearAttributes(['meta_title']);
         $messages = [];
 
-        self::assertFalse($this->writer->update(self::CATEGORY_ID, 'Shirts', $definition, 1, $messages));
+        self::assertFalse($this->writer->update(self::CATEGORY_ID, 'Shirts', $definition, null, 1, $messages));
         self::assertSame('default meta', $loaded->getData('meta_title'));
     }
 
@@ -895,7 +895,7 @@ class CategoryWriterTest extends TestCase
             ]);
         $messages = [];
 
-        self::assertFalse($this->writer->update(self::CATEGORY_ID, 'Shirts', $definition, 0, $messages));
+        self::assertFalse($this->writer->update(self::CATEGORY_ID, 'Shirts', $definition, null, 0, $messages));
         self::assertStringContainsString('duplicates a first-class field', $messages[0]);
     }
 }

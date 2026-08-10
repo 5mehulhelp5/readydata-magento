@@ -15,9 +15,11 @@ interface CategorySyncResultInterface
 {
     public const PATH = 'path';
     public const ENTITY_ID = 'entity_id';
+    public const ROOT_CATEGORY_ID = 'root_category_id';
     public const STATUS = 'status';
     public const REASON = 'reason';
     public const MESSAGES = 'messages';
+    public const STORE_RESULTS = 'store_results';
 
     public const STATUS_CREATED = 'created';
     public const STATUS_UPDATED = 'updated';
@@ -70,6 +72,16 @@ interface CategorySyncResultInterface
      */
     public const REASON_ALREADY_ABSENT = 'already_absent';
     public const REASON_STORE_SCOPE_STRUCTURAL_CHANGE = 'store_scope_structural_change';
+    /**
+     * A move whose destination sits under a different root category. The two
+     * roots are two different catalogs, so the move takes the category, its
+     * whole subtree and their product assignments out of one storefront and
+     * into another — an outcome large enough to need its own config switch
+     * rather than riding along with ordinary reparenting.
+     */
+    public const REASON_CROSS_ROOT_MOVE = 'cross_root_move';
+    /** A store_values block naming a store view that does not exist. */
+    public const REASON_UNKNOWN_STORE = 'unknown_store';
     public const REASON_STALE_PARENT_PATH = 'stale_parent_path';
     public const REASON_PROTECTED_ATTRIBUTE = 'protected_attribute';
     public const REASON_ABORTED = 'aborted';
@@ -139,4 +151,34 @@ interface CategorySyncResultInterface
      * @return $this
      */
     public function setMessages(array $messages): self;
+
+    /**
+     * The root category of the tree this entry resolved into — the other half
+     * of its scope, and the half a path cannot state when two roots share a
+     * name. Null when the entry never resolved to a tree.
+     *
+     * @return int|null
+     */
+    public function getRootCategoryId(): ?int;
+
+    /**
+     * @param int|null $rootCategoryId
+     * @return $this
+     */
+    public function setRootCategoryId(?int $rootCategoryId): self;
+
+    /**
+     * One entry per store scope this category's payload named beyond the
+     * request's own — that is, per `store_values` block. Null when the payload
+     * named none, which is every payload that predates `store_values`.
+     *
+     * @return \ReadyData\Import\Api\Data\CategoryStoreResultInterface[]|null
+     */
+    public function getStoreResults(): ?array;
+
+    /**
+     * @param \ReadyData\Import\Api\Data\CategoryStoreResultInterface[] $storeResults
+     * @return $this
+     */
+    public function setStoreResults(array $storeResults): self;
 }

@@ -71,6 +71,14 @@
                         <field id="enabled">1</field>
                     </depends>
                 </field>
+                <field id="allow_cross_root_move" translate="label comment" type="select" sortOrder="35" showInDefault="1">
+                    <label>Allow Moves Between Root Categories</label>
+                    <comment>Allow a move whose destination is under a different root category. Off by default even when moves are enabled: the two roots are two different catalogs, so the move takes the category, its whole subtree and their product assignments out of one storefront and into another. Refused as "cross_root_move" when off.</comment>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                    <depends>
+                        <field id="allow_move">1</field>
+                    </depends>
+                </field>
                 <!-- Deliberately NOT dependent on "enabled": this governs the product
                      endpoint's "categories" field, not the category sync endpoint. -->
                 <field id="replace_scope" translate="label comment" type="select" sortOrder="40" showInDefault="1">

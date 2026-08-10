@@ -13,6 +13,8 @@ use Magento\Framework\Exception\LocalizedException;
 use Magento\Framework\Lock\LockManagerInterface;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
+use ReadyData\Import\Api\Data\CategoryStoreResultInterface;
+use ReadyData\Import\Api\Data\CategoryStoreResultInterfaceFactory;
 use ReadyData\Import\Api\Data\CategorySyncResponseInterfaceFactory;
 use ReadyData\Import\Api\Data\CategorySyncResultInterface;
 use ReadyData\Import\Api\Data\CategorySyncResultInterfaceFactory;
@@ -25,6 +27,8 @@ use ReadyData\Import\Model\CategorySyncService;
 use ReadyData\Import\Model\CategoryValidator;
 use ReadyData\Import\Model\Config;
 use ReadyData\Import\Model\Data\CategoryDefinition;
+use ReadyData\Import\Model\Data\CategoryStoreResult;
+use ReadyData\Import\Model\Data\CategoryStoreValues;
 use ReadyData\Import\Model\Data\CategorySyncResponse;
 use ReadyData\Import\Model\Data\ImportSettings;
 use ReadyData\Import\Model\Data\CategorySyncResult;
@@ -64,6 +68,14 @@ class CategorySyncServiceTest extends TestCase
     private int $storeRootId = self::ROOT_ID;
 
     /**
+     * Per-store-view root override, for store_values blocks pointed at a view
+     * whose storefront shows another tree.
+     *
+     * @var array<int, int>
+     */
+    private array $storeRoots = [];
+
+    /**
      * Level-1 roots as the resource model would report them. Mutable so a test
      * can add an ambiguous name, a second tree, or a root created mid-request.
      *
@@ -92,7 +104,16 @@ class CategorySyncServiceTest extends TestCase
 
         $storeWebsiteMap = $this->createMock(StoreWebsiteMap::class);
         $storeWebsiteMap->method('resolveStoreId')->willReturnCallback(fn (): int => $this->storeId);
-        $storeWebsiteMap->method('getRootCategoryId')->willReturnCallback(fn (): int => $this->storeRootId);
+        // Keyed by store ID so a store_values block can name a view whose
+        // storefront shows a different root than the request's own scope.
+        $storeWebsiteMap->method('getRootCategoryId')
+            ->willReturnCallback(fn (int $storeId): int => $this->storeRoots[$storeId] ?? $this->storeRootId);
+        $storeWebsiteMap->method('findScopeStoreId')->willReturnCallback(
+            fn (?int $storeId, ?string $code): ?int => match (true) {
+                $storeId !== null => in_array($storeId, [0, 1, 2, 3], true) ? $storeId : null,
+                default => ['de_de' => 1][$code] ?? null,
+            }
+        );
 
         $this->resourceConnection = $resourceConnection;
         $this->storeWebsiteMap = $storeWebsiteMap;
@@ -112,6 +133,9 @@ class CategorySyncServiceTest extends TestCase
         $responseFactory = $this->createMock(CategorySyncResponseInterfaceFactory::class);
         $responseFactory->method('create')
             ->willReturnCallback(static fn (): CategorySyncResponse => new CategorySyncResponse());
+        $storeResultFactory = $this->createMock(CategoryStoreResultInterfaceFactory::class);
+        $storeResultFactory->method('create')
+            ->willReturnCallback(static fn (): CategoryStoreResult => new CategoryStoreResult());
 
         return new CategorySyncService(
             $config ?? $this->config,
@@ -125,6 +149,7 @@ class CategorySyncServiceTest extends TestCase
             $this->invalidationHandler,
             $responseFactory,
             $resultFactory,
+            $storeResultFactory,
             $this->createMock(Logger::class)
         );
     }
@@ -138,7 +163,8 @@ class CategorySyncServiceTest extends TestCase
         bool $categorySyncEnabled = true,
         bool $continueOnError = true,
         bool $allowMove = true,
-        bool $allowDelete = true
+        bool $allowDelete = true,
+        bool $allowCrossRootMove = false
     ): Config&MockObject {
         $config = $this->createMock(Config::class);
         $config->method('isEnabled')->willReturn(true);
@@ -146,6 +172,7 @@ class CategorySyncServiceTest extends TestCase
         $config->method('isContinueOnError')->willReturn($continueOnError);
         $config->method('isCategoryMoveAllowed')->willReturn($allowMove);
         $config->method('isCategoryDeleteAllowed')->willReturn($allowDelete);
+        $config->method('isCrossRootMoveAllowed')->willReturn($allowCrossRootMove);
 
         return $config;
     }
@@ -309,7 +336,7 @@ class CategorySyncServiceTest extends TestCase
         $this->categoryResource->method('getChildIdsByParentIds')
             ->willReturn([CategoryModel::TREE_ROOT_ID => ['Default Category' => [self::ROOT_ID]]]);
         $this->writer->expects(self::once())->method('update')
-            ->with(self::ROOT_ID, 'Default Category', self::anything(), 0)
+            ->with(self::ROOT_ID, 'Default Category', self::anything(), null, 0)
             ->willReturn(true);
         $this->writer->expects(self::never())->method('create');
 
@@ -330,7 +357,7 @@ class CategorySyncServiceTest extends TestCase
             ],
         ]);
         $this->writer->expects(self::once())->method('update')
-            ->with(self::ROOT_ID, 'Main Catalog', self::anything(), 0)
+            ->with(self::ROOT_ID, 'Main Catalog', self::anything(), null, 0)
             ->willReturn(true);
         // A root lives only in the resolver's root map — no path cache entry
         // covers it — so forget() cannot reach it.
@@ -593,7 +620,7 @@ class CategorySyncServiceTest extends TestCase
         $this->categoryResource->method('getChildIdsByParentIds')
             ->willReturn([self::ROOT_ID => ['Men' => [self::MEN_ID]]]);
         $this->writer->expects(self::once())->method('update')
-            ->with(self::MEN_ID, 'Men', self::anything(), 1)
+            ->with(self::MEN_ID, 'Men', self::anything(), null, 1)
             ->willReturn(true);
 
         $response = $this->service->sync([$this->definition('Default Category/Men')->setIsActive(0)]);
@@ -904,7 +931,7 @@ class CategorySyncServiceTest extends TestCase
         ]);
 
         $this->writer->expects(self::once())->method('update')
-            ->with(self::MEN_ID, null, self::anything(), 0)
+            ->with(self::MEN_ID, null, self::anything(), null, 0)
             ->willReturn(false);
 
         $definition = $this->definition('Default Category/Men')
@@ -1312,6 +1339,215 @@ class CategorySyncServiceTest extends TestCase
         $result = $response->getResults()[0];
         self::assertSame(CategorySyncResultInterface::REASON_MOVE_DISABLED, $result->getReason());
         self::assertSame(self::SHIRTS_ID, $result->getEntityId());
+    }
+
+    public function testAStoreValuesBlockWritesInItsOwnScope(): void
+    {
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([self::ROOT_ID => ['Men' => [self::MEN_ID]]]);
+        $writes = [];
+        $this->writer->method('update')->willReturnCallback(
+            function (int $id, ?string $name, $values, ?int $position, int $storeId) use (&$writes): bool {
+                $writes[] = [$storeId, $name];
+                return true;
+            }
+        );
+
+        $definition = $this->definition('Default Category/Men')
+            ->setStoreValues([(new CategoryStoreValues())->setStoreId(1)->setName('Herren')]);
+        $response = $this->service->sync([$definition]);
+
+        // Default scope first — a block cannot be written before the values it
+        // falls back to exist.
+        self::assertSame([[0, 'Men'], [1, 'Herren']], $writes);
+
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::STATUS_UPDATED, $result->getStatus());
+        self::assertSame(self::ROOT_ID, $result->getRootCategoryId());
+        $storeResults = $result->getStoreResults();
+        self::assertCount(1, $storeResults);
+        self::assertSame(1, $storeResults[0]->getStoreId());
+        self::assertSame(CategoryStoreResultInterface::STATUS_UPDATED, $storeResults[0]->getStatus());
+    }
+
+    public function testAScopeWhereNothingDifferedIsUnchangedRatherThanSkipped(): void
+    {
+        // The property that makes a replayed payload free has to survive per
+        // scope, or a re-run looks like it did nothing rather than nothing new.
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([self::ROOT_ID => ['Men' => [self::MEN_ID]]]);
+        $this->writer->method('update')->willReturn(false);
+
+        $definition = $this->definition('Default Category/Men')
+            ->setStoreValues([(new CategoryStoreValues())->setStoreId(1)->setName('Herren')]);
+        $response = $this->service->sync([$definition]);
+
+        $storeResults = $response->getResults()[0]->getStoreResults();
+        self::assertSame(CategoryStoreResultInterface::STATUS_UNCHANGED, $storeResults[0]->getStatus());
+        self::assertNull($storeResults[0]->getReason());
+    }
+
+    public function testAnUnknownStoreViewCostsThatBlockAndNothingElse(): void
+    {
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([self::ROOT_ID => ['Men' => [self::MEN_ID]]]);
+        $this->writer->method('update')->willReturn(true);
+
+        $definition = $this->definition('Default Category/Men')->setStoreValues([
+            (new CategoryStoreValues())->setStoreId(99)->setName('Nowhere'),
+            (new CategoryStoreValues())->setStoreId(1)->setName('Herren'),
+        ]);
+        $response = $this->service->sync([$definition]);
+
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::STATUS_UPDATED, $result->getStatus());
+        $storeResults = $result->getStoreResults();
+        self::assertSame(CategorySyncResultInterface::REASON_UNKNOWN_STORE, $storeResults[0]->getReason());
+        self::assertSame(CategoryStoreResultInterface::STATUS_UPDATED, $storeResults[1]->getStatus());
+    }
+
+    public function testABlockNamingTheDefaultScopeIsRefused(): void
+    {
+        // Accepting it would let a block overwrite the value every other store
+        // view falls back to.
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([self::ROOT_ID => ['Men' => [self::MEN_ID]]]);
+        $this->writer->method('update')->willReturn(true);
+
+        $definition = $this->definition('Default Category/Men')
+            ->setStoreValues([(new CategoryStoreValues())->setStoreId(0)->setName('Nope')]);
+        $response = $this->service->sync([$definition]);
+
+        $storeResults = $response->getResults()[0]->getStoreResults();
+        self::assertSame(CategorySyncResultInterface::REASON_INVALID_DEFINITION, $storeResults[0]->getReason());
+        self::assertStringContainsString('cannot name the default scope', $storeResults[0]->getMessages()[0]);
+    }
+
+    public function testASecondBlockForOneStoreViewIsRefusedRatherThanSilentlyLosing(): void
+    {
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([self::ROOT_ID => ['Men' => [self::MEN_ID]]]);
+        $this->writer->method('update')->willReturn(true);
+
+        $definition = $this->definition('Default Category/Men')->setStoreValues([
+            (new CategoryStoreValues())->setStoreId(1)->setName('Herren'),
+            (new CategoryStoreValues())->setStoreId(1)->setName('Männer'),
+        ]);
+        $response = $this->service->sync([$definition]);
+
+        $storeResults = $response->getResults()[0]->getStoreResults();
+        self::assertSame(CategoryStoreResultInterface::STATUS_UPDATED, $storeResults[0]->getStatus());
+        self::assertSame(CategorySyncResultInterface::REASON_INVALID_DEFINITION, $storeResults[1]->getReason());
+        self::assertStringContainsString('merge them', $storeResults[1]->getMessages()[0]);
+    }
+
+    public function testABlockPointedAtAStoreShowingAnotherTreeIsRefused(): void
+    {
+        // The write would succeed and be invisible on the storefront the block
+        // named — the same reasoning wrong_store_root applies to a request.
+        $this->storeRoots = [1 => self::OUTDOOR_ID];
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([self::ROOT_ID => ['Men' => [self::MEN_ID]]]);
+        $this->writer->expects(self::once())->method('update')->willReturn(true);
+
+        $definition = $this->definition('Default Category/Men')
+            ->setStoreValues([(new CategoryStoreValues())->setStoreId(1)->setName('Herren')]);
+        $response = $this->service->sync([$definition]);
+
+        $storeResults = $response->getResults()[0]->getStoreResults();
+        self::assertSame(CategorySyncResultInterface::REASON_WRONG_STORE_ROOT, $storeResults[0]->getReason());
+    }
+
+    public function testACategoryThatWasSkippedReportsNoScopesAtAll(): void
+    {
+        // There is nothing to localize and no scope to report against; the
+        // entry's own reason is the whole story.
+        $this->rootIds = ['Default Category' => [self::ROOT_ID, 8]];
+        $this->writer->expects(self::never())->method('update');
+
+        $definition = $this->definition('Default Category/Men')
+            ->setStoreValues([(new CategoryStoreValues())->setStoreId(1)->setName('Herren')]);
+        $response = $this->service->sync([$definition]);
+
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::REASON_AMBIGUOUS_PATH, $result->getReason());
+        self::assertNull($result->getStoreResults());
+    }
+
+    public function testAPayloadWithoutStoreValuesReportsNoStoreResults(): void
+    {
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([self::ROOT_ID => ['Men' => [self::MEN_ID]]]);
+        $this->writer->method('update')->willReturn(true);
+
+        $response = $this->service->sync([$this->definition('Default Category/Men')]);
+
+        self::assertNull($response->getResults()[0]->getStoreResults());
+    }
+
+    /**
+     * The two roots are two different catalogs, so this takes the category, its
+     * subtree and their product assignments off one storefront and onto
+     * another. Core's move performs it without complaint, and no other guard
+     * here catches it: the descendant check only looks downwards, and
+     * root_in_use only fires for a store group's own root.
+     */
+    public function testAMoveIntoAnotherRootTreeIsRefusedByDefault(): void
+    {
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+            self::TENTS_ID => self::row(self::TENTS_ID, self::OUTDOOR_ID, 2, '1/7/12'),
+        ]);
+        $this->writer->expects(self::never())->method('move');
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setName('Shirts')
+            ->setParentCategoryId(self::TENTS_ID);
+        $response = $this->service->sync([$definition]);
+
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::REASON_CROSS_ROOT_MOVE, $result->getReason());
+        self::assertStringContainsString('different catalogs', $result->getMessages()[0]);
+        self::assertSame(self::SHIRTS_ID, $result->getEntityId());
+    }
+
+    public function testAMoveIntoAnotherRootTreeIsAllowedWhenSwitchedOn(): void
+    {
+        $service = $this->buildService($this->configMock(allowCrossRootMove: true));
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+            self::TENTS_ID => self::row(self::TENTS_ID, self::OUTDOOR_ID, 2, '1/7/12'),
+        ]);
+        $this->writer->expects(self::once())->method('move')->with(self::SHIRTS_ID, self::TENTS_ID);
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setName('Shirts')
+            ->setParentCategoryId(self::TENTS_ID);
+        $response = $service->sync([$definition]);
+
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::STATUS_UPDATED, $result->getStatus());
+        // The result reports the tree it ended up in, not the one it left.
+        self::assertSame(self::OUTDOOR_ID, $result->getRootCategoryId());
+    }
+
+    public function testAMoveInsideOneRootTreeIsUnaffected(): void
+    {
+        $this->stubExistingRows([
+            self::SHIRTS_ID => self::row(self::SHIRTS_ID, self::MEN_ID, 3, '1/2/10/11'),
+            self::WOMEN_ID => self::row(self::WOMEN_ID, self::ROOT_ID, 2, '1/2/20'),
+        ]);
+        $this->writer->expects(self::once())->method('move')->with(self::SHIRTS_ID, self::WOMEN_ID);
+
+        $definition = (new CategoryDefinition())
+            ->setCategoryId(self::SHIRTS_ID)
+            ->setName('Shirts')
+            ->setParentCategoryId(self::WOMEN_ID);
+        $response = $this->service->sync([$definition]);
+
+        self::assertNull($response->getResults()[0]->getReason());
     }
 
     public function testMovingAStoreGroupRootIsRefused(): void

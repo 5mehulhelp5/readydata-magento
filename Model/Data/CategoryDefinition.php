@@ -25,6 +25,7 @@ class CategoryDefinition implements CategoryDefinitionInterface
     private ?array $clearAttributes = null;
     private ?int $delete = null;
     private ?int $deleteChildren = null;
+    private ?array $storeValues = null;
 
     public function getPath(): ?string
     {
@@ -188,6 +189,17 @@ class CategoryDefinition implements CategoryDefinitionInterface
     public function setDeleteChildren(?int $deleteChildren): CategoryDefinitionInterface
     {
         $this->deleteChildren = $deleteChildren;
+        return $this;
+    }
+
+    public function getStoreValues(): ?array
+    {
+        return $this->storeValues;
+    }
+
+    public function setStoreValues(?array $storeValues): CategoryDefinitionInterface
+    {
+        $this->storeValues = $storeValues;
         return $this;
     }
 }

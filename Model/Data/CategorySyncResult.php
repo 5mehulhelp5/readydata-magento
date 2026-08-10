@@ -15,6 +15,8 @@ class CategorySyncResult implements CategorySyncResultInterface
     private string $status = self::STATUS_ERROR;
     private ?string $reason = null;
     private array $messages = [];
+    private ?int $rootCategoryId = null;
+    private ?array $storeResults = null;
 
     public function getPath(): string
     {
@@ -68,6 +70,28 @@ class CategorySyncResult implements CategorySyncResultInterface
     public function setMessages(array $messages): CategorySyncResultInterface
     {
         $this->messages = $messages;
+        return $this;
+    }
+
+    public function getRootCategoryId(): ?int
+    {
+        return $this->rootCategoryId;
+    }
+
+    public function setRootCategoryId(?int $rootCategoryId): CategorySyncResultInterface
+    {
+        $this->rootCategoryId = $rootCategoryId;
+        return $this;
+    }
+
+    public function getStoreResults(): ?array
+    {
+        return $this->storeResults;
+    }
+
+    public function setStoreResults(array $storeResults): CategorySyncResultInterface
+    {
+        $this->storeResults = $storeResults;
         return $this;
     }
 }

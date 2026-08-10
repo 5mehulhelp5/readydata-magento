@@ -12,6 +12,9 @@ use Magento\Framework\DB\Adapter\AdapterInterface;
 use Magento\Framework\Exception\LocalizedException;
 use Magento\Framework\Lock\LockManagerInterface;
 use ReadyData\Import\Api\Data\CategoryDefinitionInterface;
+use ReadyData\Import\Api\Data\CategoryStoreResultInterface;
+use ReadyData\Import\Api\Data\CategoryStoreResultInterfaceFactory;
+use ReadyData\Import\Api\Data\CategoryStoreValuesInterface;
 use ReadyData\Import\Api\Data\CategorySyncResponseInterface;
 use ReadyData\Import\Api\Data\CategorySyncResponseInterfaceFactory;
 use ReadyData\Import\Api\Data\CategorySyncResultInterface;
@@ -71,6 +74,7 @@ class CategorySyncService
         private readonly CategoryInvalidationHandler $invalidationHandler,
         private readonly CategorySyncResponseInterfaceFactory $responseFactory,
         private readonly CategorySyncResultInterfaceFactory $resultFactory,
+        private readonly CategoryStoreResultInterfaceFactory $storeResultFactory,
         private readonly Logger $logger
     ) {
     }
@@ -162,7 +166,10 @@ class CategorySyncService
                             $storeRootId,
                             &$state
                         ): CategorySyncResultInterface {
-                            return $this->processOne(
+                            // Inside the same transaction as the category's own
+                            // write: a half-localized category is worse than
+                            // one that is not localized at all.
+                            return $this->applyStoreValues($entry, $this->processOne(
                                 $entry,
                                 $parents,
                                 $destinations,
@@ -170,7 +177,7 @@ class CategorySyncService
                                 $storeId,
                                 $storeRootId,
                                 $state
-                            );
+                            ));
                         }
                     );
 
@@ -437,6 +444,7 @@ class CategorySyncService
                 $categoryId,
                 $name,
                 $storeId,
+                $this->rootIdOfPath($row['path']),
                 // Re-read from the row, which applyMove() has updated: a move to
                 // or from level 1 changes whether this is a root, and
                 // applyUpdate() uses that to decide whether a rename has to
@@ -550,7 +558,7 @@ class CategorySyncService
                 CategorySyncResultInterface::STATUS_CREATED,
                 null,
                 $messages
-            )->setEntityId($entityId);
+            )->setEntityId($entityId)->setRootCategoryId($isRoot ? $entityId : $entryRootId);
         }
 
         $refusal = $this->refusePositionAtStoreScope($entry, $storeId, $matchedId);
@@ -572,10 +580,170 @@ class CategorySyncService
             (int)$matchedId,
             $leafName,
             $storeId,
+            $isRoot ? (int)$matchedId : $entryRootId,
             $isRoot,
             $messages,
             $state
         );
+    }
+
+    /**
+     * Write the entry's `store_values` blocks, after its own write and inside
+     * the same transaction — a half-localized category is worse than one that
+     * is not localized at all.
+     *
+     * Runs only when the category itself was created, updated or left
+     * unchanged. When it was skipped or errored there is nothing to localize
+     * and no scope to report against, so the result carries no `store_results`
+     * at all and its own reason is the whole story.
+     *
+     * @param array{definition: ?CategoryDefinitionInterface, ...} $entry
+     */
+    private function applyStoreValues(
+        array $entry,
+        CategorySyncResultInterface $result
+    ): CategorySyncResultInterface {
+        $blocks = $entry['definition']?->getStoreValues() ?? [];
+        $entityId = $result->getEntityId();
+        $written = in_array(
+            $result->getStatus(),
+            [
+                CategorySyncResultInterface::STATUS_CREATED,
+                CategorySyncResultInterface::STATUS_UPDATED,
+                CategorySyncResultInterface::STATUS_UNCHANGED,
+            ],
+            true
+        );
+        if ($blocks === [] || $entityId === null || !$written) {
+            return $result;
+        }
+
+        $storeResults = [];
+        $claimed = [];
+        foreach ($blocks as $block) {
+            if (!$block instanceof CategoryStoreValuesInterface) {
+                $storeResults[] = $this->storeSkip(
+                    0,
+                    CategorySyncResultInterface::REASON_INVALID_DEFINITION,
+                    'Entry is not a store values block.'
+                );
+                continue;
+            }
+
+            $storeId = $this->storeWebsiteMap->findScopeStoreId(
+                $block->getStoreId(),
+                $block->getStoreViewCode()
+            );
+            if ($storeId === null) {
+                $storeResults[] = $this->storeSkip(
+                    0,
+                    CategorySyncResultInterface::REASON_UNKNOWN_STORE,
+                    sprintf('No such store view: %s.', self::describeScope($block))
+                );
+                continue;
+            }
+            if ($storeId === 0) {
+                $storeResults[] = $this->storeSkip(
+                    0,
+                    CategorySyncResultInterface::REASON_INVALID_DEFINITION,
+                    'A store_values block cannot name the default scope; the category itself writes it.'
+                );
+                continue;
+            }
+            if (isset($claimed[$storeId])) {
+                // Refused rather than written second: two blocks for one store
+                // view means one of them silently loses, and which one is not
+                // something the caller should have to reason about.
+                $storeResults[] = $this->storeSkip(
+                    $storeId,
+                    CategorySyncResultInterface::REASON_INVALID_DEFINITION,
+                    'An earlier store_values block already names this store view; merge them.'
+                );
+                continue;
+            }
+            $claimed[$storeId] = true;
+
+            $refusal = $this->refuseForeignStoreRoot($storeId, $result->getRootCategoryId());
+            if ($refusal !== null) {
+                $storeResults[] = $refusal;
+                continue;
+            }
+
+            // No rename bookkeeping and no sibling-conflict check: path
+            // resolution matches store-0 names throughout this module, so a
+            // store-scoped name is invisible to it — see applyUpdate() and
+            // CategoryWriter::findSiblingConflict().
+            $messages = [];
+            $changed = $this->writer->update($entityId, $block->getName(), $block, null, $storeId, $messages);
+
+            $storeResults[] = $this->storeResultFactory->create()
+                ->setStoreId($storeId)
+                ->setStatus(
+                    $changed
+                        ? CategoryStoreResultInterface::STATUS_UPDATED
+                        : CategoryStoreResultInterface::STATUS_UNCHANGED
+                )
+                ->setMessages($messages);
+        }
+
+        return $result->setStoreResults($storeResults);
+    }
+
+    /**
+     * Whether the named store view actually shows this category's tree. A write
+     * outside it would succeed and be invisible on the storefront the block
+     * named — the same reasoning `wrong_store_root` applies to a store-scoped
+     * request, now per block.
+     */
+    private function refuseForeignStoreRoot(int $storeId, ?int $rootId): ?CategoryStoreResultInterface
+    {
+        try {
+            $storeRootId = $this->storeWebsiteMap->getRootCategoryId($storeId);
+        } catch (LocalizedException $e) {
+            // Request-level for a store-scoped request, but here it costs this
+            // one block and nothing else.
+            return $this->storeSkip(
+                $storeId,
+                CategorySyncResultInterface::REASON_WRONG_STORE_ROOT,
+                $e->getMessage()
+            );
+        }
+
+        if ($rootId === null || $rootId === $storeRootId) {
+            return null;
+        }
+
+        return $this->storeSkip(
+            $storeId,
+            CategorySyncResultInterface::REASON_WRONG_STORE_ROOT,
+            sprintf(
+                'The category belongs to root category %d, but this store view shows root category %d.',
+                $rootId,
+                $storeRootId
+            )
+        );
+    }
+
+    private function storeSkip(int $storeId, string $reason, string $message): CategoryStoreResultInterface
+    {
+        return $this->storeResultFactory->create()
+            ->setStoreId($storeId)
+            ->setStatus(CategoryStoreResultInterface::STATUS_SKIPPED)
+            ->setReason($reason)
+            ->setMessages([$message]);
+    }
+
+    /** How an unresolvable store_values block is named back to the caller. */
+    private static function describeScope(CategoryStoreValuesInterface $block): string
+    {
+        if ($block->getStoreId() !== null) {
+            return sprintf('ID %d', $block->getStoreId());
+        }
+        if ((string)$block->getStoreViewCode() !== '') {
+            return sprintf('"%s"', $block->getStoreViewCode());
+        }
+
+        return 'a block naming none';
     }
 
     /**
@@ -741,6 +909,33 @@ class CategorySyncService
         if (isset($state['movedSubtrees'][$categoryId])) {
             return $this->staleAfterMove($entry, $categoryId);
         }
+
+        // Two roots are two different catalogs. A move across that boundary
+        // takes the category, everything beneath it and their product
+        // assignments off one storefront and onto another — which core's move
+        // performs without complaint, and which no other guard here catches:
+        // the descendant check only looks downwards, and root_in_use only fires
+        // for a store group's own root.
+        $fromRootId = $this->rootIdOfPath($row['path']);
+        $toRootId = $this->rootIdOfPath($destinationRow['path']);
+        if ($fromRootId !== null
+            && $toRootId !== null
+            && $fromRootId !== $toRootId
+            && !$this->config->isCrossRootMoveAllowed()
+        ) {
+            return $this->skip(
+                $entry,
+                CategorySyncResultInterface::REASON_CROSS_ROOT_MOVE,
+                sprintf(
+                    'The category is in root category %d but destination parent %d is in root category %d;'
+                    . ' the two are different catalogs. Enable moves between root categories to allow it.',
+                    $fromRootId,
+                    $newParentId,
+                    $toRootId
+                ),
+                $categoryId
+            );
+        }
         // The destination may already hold a category of this name or slug. Left
         // to the write, the name case succeeds and quietly makes the path
         // ambiguous forever, and the slug case throws from deep inside the save.
@@ -782,9 +977,12 @@ class CategorySyncService
         if ($entry['segments'] !== []) {
             $state['renamedPaths'][PathParser::buildKey($entry['segments'])] = true;
         }
-        // The row the caller goes on to update now sits somewhere else.
+        // The row the caller goes on to update now sits somewhere else. The
+        // path is re-derived too, not just parent_id/level: the root is read
+        // off it, and a permitted cross-root move changes which root that is.
         $row['parent_id'] = $newParentId;
         $row['level'] = $destinationRow['level'] + 1;
+        $row['path'] = $destinationRow['path'] . '/' . $categoryId;
         $moved = true;
 
         return null;
@@ -901,12 +1099,20 @@ class CategorySyncService
         int $entityId,
         ?string $name,
         int $storeId,
+        ?int $rootId,
         bool $isRoot,
         array $messages,
         array &$state,
         bool $moved = false
     ): CategorySyncResultInterface {
-        $changed = $this->writer->update($entityId, $name, $entry['definition'], $storeId, $messages);
+        $changed = $this->writer->update(
+            $entityId,
+            $name,
+            $entry['definition'],
+            $entry['definition']->getPosition(),
+            $storeId,
+            $messages
+        );
 
         // Only a DEFAULT-scope rename invalidates a path. Path resolution
         // matches store-0 names throughout this module, so a store-scoped
@@ -944,7 +1150,7 @@ class CategorySyncService
                 : CategorySyncResultInterface::STATUS_UNCHANGED,
             null,
             $messages
-        )->setEntityId($entityId);
+        )->setEntityId($entityId)->setRootCategoryId($rootId);
     }
 
     /**

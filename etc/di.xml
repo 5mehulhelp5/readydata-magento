@@ -50,6 +50,10 @@
                 type="ReadyData\Import\Model\CategorySync"/>
     <preference for="ReadyData\Import\Api\Data\CategoryDefinitionInterface"
                 type="ReadyData\Import\Model\Data\CategoryDefinition"/>
+    <preference for="ReadyData\Import\Api\Data\CategoryStoreValuesInterface"
+                type="ReadyData\Import\Model\Data\CategoryStoreValues"/>
+    <preference for="ReadyData\Import\Api\Data\CategoryStoreResultInterface"
+                type="ReadyData\Import\Model\Data\CategoryStoreResult"/>
     <preference for="ReadyData\Import\Api\Data\CategorySyncResultInterface"
                 type="ReadyData\Import\Model\Data\CategorySyncResult"/>
     <preference for="ReadyData\Import\Api\Data\CategorySyncResponseInterface"

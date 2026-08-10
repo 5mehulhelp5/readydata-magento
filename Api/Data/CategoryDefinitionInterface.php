@@ -24,7 +24,7 @@ namespace ReadyData\Import\Api\Data;
  *
  * @api
  */
-interface CategoryDefinitionInterface
+interface CategoryDefinitionInterface extends CategoryValuesInterface
 {
     public const PATH = 'path';
     public const CATEGORY_ID = 'category_id';
@@ -41,6 +41,7 @@ interface CategoryDefinitionInterface
     public const CLEAR_ATTRIBUTES = 'clear_attributes';
     public const DELETE = 'delete';
     public const DELETE_CHILDREN = 'delete_children';
+    public const STORE_VALUES = 'store_values';
 
     /**
      * Full path from a level-1 root name, e.g. "Default Category/Men/Shirts".
@@ -132,74 +133,6 @@ interface CategoryDefinitionInterface
     public function setParentCategoryId(?int $parentCategoryId): self;
 
     /**
-     * Category name. Omitted means the last segment of the path.
-     *
-     * @return string|null
-     */
-    public function getName(): ?string;
-
-    /**
-     * @param string|null $name
-     * @return $this
-     */
-    public function setName(?string $name): self;
-
-    /**
-     * URL key. Omitted means it is derived from the name on create and on
-     * rename, and left untouched otherwise — Magento only auto-derives a
-     * url_key when the stored one is empty, so a rename would keep the old
-     * slug forever if this were never set.
-     *
-     * @return string|null
-     */
-    public function getUrlKey(): ?string;
-
-    /**
-     * @param string|null $urlKey
-     * @return $this
-     */
-    public function setUrlKey(?string $urlKey): self;
-
-    /**
-     * 0 or 1. Defaults to 1 on create; omitted means unchanged on update.
-     *
-     * @return int|null
-     */
-    public function getIsActive(): ?int;
-
-    /**
-     * @param int|null $isActive
-     * @return $this
-     */
-    public function setIsActive(?int $isActive): self;
-
-    /**
-     * 0 or 1. Defaults to 1 on create; omitted means unchanged on update.
-     *
-     * @return int|null
-     */
-    public function getIncludeInMenu(): ?int;
-
-    /**
-     * @param int|null $includeInMenu
-     * @return $this
-     */
-    public function setIncludeInMenu(?int $includeInMenu): self;
-
-    /**
-     * 0 or 1. Omitted means unchanged (the attribute default applies on create).
-     *
-     * @return int|null
-     */
-    public function getIsAnchor(): ?int;
-
-    /**
-     * @param int|null $isAnchor
-     * @return $this
-     */
-    public function setIsAnchor(?int $isAnchor): self;
-
-    /**
      * Raw sibling position. Siblings are never re-sequenced to make room.
      *
      * @return int|null
@@ -211,38 +144,6 @@ interface CategoryDefinitionInterface
      * @return $this
      */
     public function setPosition(?int $position): self;
-
-    /**
-     * Any other category attribute: description, meta_title, display_mode,
-     * available_sort_by (comma-joined), landing_page, page_layout and so on.
-     *
-     * Values are written verbatim — there is no option-label resolution here,
-     * so a select attribute needs its option ID rather than its label.
-     *
-     * @return \ReadyData\Import\Api\Data\CustomAttributeInterface[]|null
-     */
-    public function getCustomAttributes(): ?array;
-
-    /**
-     * @param \ReadyData\Import\Api\Data\CustomAttributeInterface[]|null $customAttributes
-     * @return $this
-     */
-    public function setCustomAttributes(?array $customAttributes): self;
-
-    /**
-     * Attribute codes to revert to their default value. At store scope this
-     * drops the store override; at default scope it removes the value.
-     * Structural and required attributes cannot be cleared.
-     *
-     * @return string[]|null
-     */
-    public function getClearAttributes(): ?array;
-
-    /**
-     * @param string[]|null $clearAttributes
-     * @return $this
-     */
-    public function setClearAttributes(?array $clearAttributes): self;
 
     /**
      * 0 or 1. Remove this category instead of reconciling it. Cannot be combined
@@ -279,4 +180,30 @@ interface CategoryDefinitionInterface
      * @return $this
      */
     public function setDeleteChildren(?int $deleteChildren): self;
+
+    /**
+     * Additional store views to write this category's values in, alongside the
+     * request's own scope — so one request can carry the category's structure
+     * and every localized value set it has.
+     *
+     * Each block names its store view and carries only what has a store
+     * dimension ({@see CategoryValuesInterface}). Everything structural stays
+     * on the category itself and is written once, at the request's scope: where
+     * it sits, what identifies it, its `position`, and whether it is deleted.
+     *
+     * The blocks run after the category itself, in one transaction with it: a
+     * half-localized category is worse than an unlocalized one. A block is
+     * skipped, with its own result row, when its store view does not exist or
+     * does not show this category's root tree — and never at the cost of the
+     * category's own write or of its other scopes.
+     *
+     * @return \ReadyData\Import\Api\Data\CategoryStoreValuesInterface[]|null
+     */
+    public function getStoreValues(): ?array;
+
+    /**
+     * @param \ReadyData\Import\Api\Data\CategoryStoreValuesInterface[]|null $storeValues
+     * @return $this
+     */
+    public function setStoreValues(?array $storeValues): self;
 }

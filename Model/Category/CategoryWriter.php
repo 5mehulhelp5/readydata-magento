@@ -11,6 +11,7 @@ use Magento\Catalog\Model\Category as CategoryModel;
 use Magento\Catalog\Model\CategoryFactory;
 use Magento\Store\Model\StoreManagerInterface;
 use ReadyData\Import\Api\Data\CategoryDefinitionInterface;
+use ReadyData\Import\Api\Data\CategoryValuesInterface;
 use ReadyData\Import\Model\ResourceModel\Category as CategoryResource;
 use ReadyData\Import\Model\ResourceModel\UrlRewrite as UrlRewriteResource;
 
@@ -81,7 +82,11 @@ class CategoryWriter
         CategoryDefinitionInterface $definition,
         array &$messages
     ): int {
-        return $this->createAtDefaultScope($parentId, $name, $this->collectDesired($definition, $name, $messages));
+        return $this->createAtDefaultScope(
+            $parentId,
+            $name,
+            $this->collectDesired($definition, $name, $definition->getPosition(), $messages)
+        );
     }
 
     /**
@@ -138,12 +143,13 @@ class CategoryWriter
     public function update(
         int $entityId,
         ?string $name,
-        CategoryDefinitionInterface $definition,
+        CategoryValuesInterface $values,
+        ?int $position,
         int $storeId,
         array &$messages
     ): bool {
-        $desired = $this->collectDesired($definition, $name, $messages);
-        $clears = $this->collectClears($definition);
+        $desired = $this->collectDesired($values, $name, $position, $messages);
+        $clears = $this->collectClears($values);
 
         return $this->withStore($storeId, function () use ($entityId, $storeId, $desired, $clears): bool {
             $loaded = $this->categoryRepository->get($entityId, $storeId);
@@ -234,7 +240,7 @@ class CategoryWriter
         bool $moved
     ): ?array {
         $ignoredMessages = [];
-        $desired = $this->collectDesired($definition, $name, $ignoredMessages);
+        $desired = $this->collectDesired($definition, $name, null, $ignoredMessages);
 
         return $this->withStore(0, function () use ($entityId, $parentId, $desired, $moved): ?array {
             $loaded = $this->categoryRepository->get($entityId, 0);
@@ -296,7 +302,7 @@ class CategoryWriter
         CategoryDefinitionInterface $definition
     ): ?array {
         $ignoredMessages = [];
-        $desired = $this->collectDesired($definition, $name, $ignoredMessages);
+        $desired = $this->collectDesired($definition, $name, null, $ignoredMessages);
 
         // Inside the same store emulation the create itself runs in, so the slug
         // predicted here is byte-for-byte the one that would be written.
@@ -464,8 +470,9 @@ class CategoryWriter
      * @return array<string, mixed>
      */
     private function collectDesired(
-        CategoryDefinitionInterface $definition,
+        CategoryValuesInterface $values,
         ?string $name,
+        ?int $position,
         array &$messages
     ): array {
         $desired = [];
@@ -473,16 +480,18 @@ class CategoryWriter
         if ($name !== null && $name !== '') {
             $desired['name'] = $name;
         }
-        $urlKey = $definition->getUrlKey();
+        $urlKey = $values->getUrlKey();
         if ($urlKey !== null && trim($urlKey) !== '') {
             $desired['url_key'] = trim($urlKey);
         }
         foreach (
             [
-                'is_active' => $definition->getIsActive(),
-                'include_in_menu' => $definition->getIncludeInMenu(),
-                'is_anchor' => $definition->getIsAnchor(),
-                'position' => $definition->getPosition(),
+                'is_active' => $values->getIsActive(),
+                'include_in_menu' => $values->getIncludeInMenu(),
+                'is_anchor' => $values->getIsAnchor(),
+                // Not on CategoryValuesInterface: position is a column shared by
+                // every store view, so a store-scoped write passes null here.
+                'position' => $position,
             ] as $code => $value
         ) {
             if ($value !== null) {
@@ -490,7 +499,7 @@ class CategoryWriter
             }
         }
 
-        foreach ($definition->getCustomAttributes() ?? [] as $attribute) {
+        foreach ($values->getCustomAttributes() ?? [] as $attribute) {
             $code = trim($attribute->getAttributeCode());
             if ($code === '') {
                 continue;
@@ -511,10 +520,10 @@ class CategoryWriter
     /**
      * @return string[] attribute codes to revert to their default value
      */
-    private function collectClears(CategoryDefinitionInterface $definition): array
+    private function collectClears(CategoryValuesInterface $values): array
     {
         $clears = [];
-        foreach ($definition->getClearAttributes() ?? [] as $code) {
+        foreach ($values->getClearAttributes() ?? [] as $code) {
             $code = trim((string)$code);
             if ($code !== '') {
                 $clears[$code] = true;
