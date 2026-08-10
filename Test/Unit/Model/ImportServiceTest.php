@@ -21,9 +21,11 @@ use ReadyData\Import\Model\BatchContext;
 use ReadyData\Import\Model\BatchContextFactory;
 use ReadyData\Import\Model\Cache\StoreWebsiteMap;
 use ReadyData\Import\Model\Config;
+use ReadyData\Import\Model\Data\CustomAttribute;
 use ReadyData\Import\Model\Data\ImportResponse;
 use ReadyData\Import\Model\Data\ImportResult;
 use ReadyData\Import\Model\Data\Product;
+use ReadyData\Import\Model\Data\ProductStoreValues;
 use ReadyData\Import\Model\Data\StoreResult;
 use ReadyData\Import\Model\Event\ImportEventDispatcher;
 use ReadyData\Import\Model\ImportService;
@@ -146,7 +148,10 @@ class ImportServiceTest extends TestCase
 
         $this->connection->expects(self::never())->method('beginTransaction');
 
-        $response = $this->serviceWith([$this->preparable(710)])->import([$this->product('P1')]);
+        // Carries categories, so this payload actually takes the lock — the
+        // probe has nothing to say about one that never held it.
+        $response = $this->serviceWith([$this->preparable(710)])
+            ->import([$this->product('P1')->setCategories(['Default Category/Men'])]);
 
         self::assertSame(1, $response->getFailed());
         self::assertStringContainsString(
@@ -166,6 +171,78 @@ class ImportServiceTest extends TestCase
         $this->lockManager->expects(self::never())->method('isLocked');
 
         $this->serviceWith([$processor])->import([$this->product('P1')]);
+    }
+
+    /**
+     * The lock serializes every import against every other one, and against the
+     * category endpoint. A payload that can reach neither read-then-create has
+     * nothing to serialize against and should not pay for it.
+     */
+    public function testAPayloadThatCanCreateNothingUnkeyedRunsWithoutTheLock(): void
+    {
+        $this->lockManager->expects(self::never())->method('lock');
+        $this->lockManager->expects(self::never())->method('unlock');
+
+        $this->serviceWith([])->import([$this->product('P1')->setPrice(9.99)]);
+    }
+
+    public function testACategoriesFieldTakesTheLock(): void
+    {
+        // Presence is the test, not whether any entry turns out to need
+        // creating — knowing that means resolving the tree, which is the work
+        // the lock protects.
+        $this->lockManager->expects(self::once())->method('lock')->willReturn(true);
+        $this->lockManager->expects(self::once())->method('unlock');
+
+        $this->serviceWith([])->import([$this->product('P1')->setCategories([])]);
+    }
+
+    /**
+     * eav_attribute_option_value is unique on (store_id, option_id), never on
+     * the label, so two concurrent imports writing the same new option label
+     * both miss and both insert.
+     */
+    public function testCustomAttributesTakeTheLockWhenOptionAutoCreationIsOn(): void
+    {
+        $this->lockManager->expects(self::once())->method('lock')->willReturn(true);
+
+        $product = $this->product('P1')->setCustomAttributes([
+            (new CustomAttribute())->setAttributeCode('color')->setValue('Red'),
+        ]);
+        $this->serviceWith([], createMissingOptions: true)->import([$product]);
+    }
+
+    public function testCustomAttributesRunLockFreeWhenOptionAutoCreationIsOff(): void
+    {
+        // Nothing can be created, so nothing can race.
+        $this->lockManager->expects(self::never())->method('lock');
+
+        $product = $this->product('P1')->setCustomAttributes([
+            (new CustomAttribute())->setAttributeCode('color')->setValue('Red'),
+        ]);
+        $this->serviceWith([], createMissingOptions: false)->import([$product]);
+    }
+
+    public function testCustomAttributesInsideAStoreValuesBlockAlsoTakeTheLock(): void
+    {
+        // A scoped block reaches the same option auto-creation the product's
+        // own custom attributes do.
+        $this->lockManager->expects(self::once())->method('lock')->willReturn(true);
+
+        $product = $this->product('P1')->setStoreValues([
+            (new ProductStoreValues())->setStoreId(3)->setCustomAttributes([
+                (new CustomAttribute())->setAttributeCode('color')->setValue('Rot'),
+            ]),
+        ]);
+        $this->serviceWith([], createMissingOptions: true)->import([$product]);
+    }
+
+    public function testALockFreePayloadStillProbesTheConnectionButNotTheLock(): void
+    {
+        $this->connection->expects(self::once())->method('fetchOne');
+        $this->lockManager->expects(self::never())->method('isLocked');
+
+        $this->serviceWith([$this->preparable(710)])->import([$this->product('P1')]);
     }
 
     /**
@@ -320,12 +397,16 @@ class ImportServiceTest extends TestCase
     /**
      * @param ProcessorInterface[] $processors
      */
-    private function serviceWith(array $processors, int $storeId = 0): ImportService
-    {
+    private function serviceWith(
+        array $processors,
+        int $storeId = 0,
+        bool $createMissingOptions = false
+    ): ImportService {
         $config = $this->createMock(Config::class);
         $config->method('isEnabled')->willReturn(true);
         $config->method('getBatchSize')->willReturn(500);
         $config->method('isContinueOnError')->willReturn(true);
+        $config->method('isCreateMissingOptions')->willReturn($createMissingOptions);
 
         $resourceConnection = $this->createMock(ResourceConnection::class);
         $resourceConnection->method('getConnection')->willReturn($this->connection);

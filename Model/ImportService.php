@@ -32,17 +32,30 @@ use ReadyData\Import\Model\Processor\ProcessorInterface;
 class ImportService
 {
     /**
-     * Held by every endpoint that mutates the category tree.
+     * Held by every request that can perform an **unkeyed read-then-create**:
+     * look for a row, not find it, insert it — where the database has no unique
+     * key to catch a second request doing the same thing at the same time.
      *
-     * The product import creates categories on demand (see
-     * CategoryPathResolver), and so does the category sync endpoint. There is
-     * no unique key on (parent_id, name) or on a category url_key, so two
-     * concurrent runs resolve the same missing path, both miss, and both
-     * insert — leaving a duplicate sibling, or a url_rewrite unique-key
-     * violation that fails whichever request loses. One lock for both is the
-     * only thing that makes the read-then-create sequence safe.
+     * There are two such sequences, and the lock exists for both:
+     *
+     * - **categories.** The product import creates them on demand (see
+     *   CategoryPathResolver) and so does the category sync endpoint. Nothing
+     *   is unique on (parent_id, name) or on a category url_key, so two
+     *   concurrent runs both miss and both insert — leaving a duplicate sibling,
+     *   or a url_rewrite unique-key violation that fails whichever request
+     *   loses.
+     * - **attribute options.** With option auto-creation on, AttributeProcessor
+     *   creates missing select/multiselect options. `eav_attribute_option_value`
+     *   is unique on (store_id, option_id), NOT on the label, so two concurrent
+     *   runs writing a product with the same new option label both miss and both
+     *   insert, and the attribute ends up with two options of the same name.
+     *
+     * A request that can do neither does not take the lock at all — see
+     * {@see needsWriteLock()}. The name is deliberately generic: it is one lock
+     * for both races, and the value is unchanged from when it guarded only the
+     * tree.
      */
-    public const TREE_WRITE_LOCK_NAME = 'readydata_product_import';
+    public const WRITE_LOCK_NAME = 'readydata_product_import';
 
     private const LOCK_TIMEOUT_SEC = 10;
 
@@ -102,7 +115,8 @@ class ImportService
             $settings?->getStoreViewCode()
         );
 
-        if (!$this->lockManager->lock(self::TREE_WRITE_LOCK_NAME, self::LOCK_TIMEOUT_SEC)) {
+        $needsLock = $this->needsWriteLock($products);
+        if ($needsLock && !$this->lockManager->lock(self::WRITE_LOCK_NAME, self::LOCK_TIMEOUT_SEC)) {
             throw new LocalizedException(__('Another import is already running. Try again later.'));
         }
 
@@ -119,7 +133,7 @@ class ImportService
                 ]);
                 $contexts[] = $context;
 
-                if (!$this->processBatch($context, $batchNumber) && !$continueOnError) {
+                if (!$this->processBatch($context, $batchNumber, $needsLock) && !$continueOnError) {
                     break;
                 }
             }
@@ -138,7 +152,9 @@ class ImportService
             $this->invalidationHandler->execute($affectedIds, $affectedCategoryIds);
         } finally {
             $this->importState->leave();
-            $this->lockManager->unlock(self::TREE_WRITE_LOCK_NAME);
+            if ($needsLock) {
+                $this->lockManager->unlock(self::WRITE_LOCK_NAME);
+            }
         }
 
         $response = $this->buildResponse($received, $contexts, $storeId, $startedAt);
@@ -159,9 +175,9 @@ class ImportService
      *
      * @return bool true when the batch committed
      */
-    private function processBatch(BatchContext $context, int $batchNumber): bool
+    private function processBatch(BatchContext $context, int $batchNumber, bool $holdsLock): bool
     {
-        if (!$this->prepareBatch($context, $batchNumber)) {
+        if (!$this->prepareBatch($context, $batchNumber, $holdsLock)) {
             return false;
         }
 
@@ -206,7 +222,7 @@ class ImportService
      *
      * @return bool true when the batch may proceed to its transaction
      */
-    private function prepareBatch(BatchContext $context, int $batchNumber): bool
+    private function prepareBatch(BatchContext $context, int $batchNumber, bool $holdsLock): bool
     {
         $preparables = array_filter(
             $this->processors,
@@ -221,7 +237,7 @@ class ImportService
                 /** @var PreparableInterface $processor */
                 $processor->prepare($context);
             }
-            $this->assertConnectionAlive();
+            $this->assertConnectionAlive($holdsLock);
 
             return true;
         } catch (\Throwable $e) {
@@ -240,17 +256,70 @@ class ImportService
      * this very connection, so a silent reconnect would release it and let a
      * second import run concurrently. Probe both before committing to the batch.
      *
+     * The lock half only applies when this request took one: a payload that can
+     * create nothing unkeyed never held it, and asserting a lock we never
+     * acquired would fail every such batch.
+     *
      * @throws \RuntimeException when the connection or the lock was lost
      */
-    private function assertConnectionAlive(): void
+    private function assertConnectionAlive(bool $holdsLock): void
     {
         $this->resourceConnection->getConnection()->fetchOne('SELECT 1');
 
-        if (!$this->lockManager->isLocked(self::TREE_WRITE_LOCK_NAME)) {
+        if ($holdsLock && !$this->lockManager->isLocked(self::WRITE_LOCK_NAME)) {
             throw new \RuntimeException(
                 'the import lock was lost during preparation, most likely with the database connection'
             );
         }
+    }
+
+    /**
+     * Whether this payload can perform either of the unkeyed read-then-create
+     * sequences {@see WRITE_LOCK_NAME} exists for. A payload that can do
+     * neither runs lock-free, concurrently with anything else.
+     *
+     * Both tests are deliberately **conservative** — they ask what the payload
+     * *could* reach, not what it would turn out to do:
+     *
+     * - a `categories` field is the only way into CategoryPathResolver, and
+     *   whether any of its entries turns out to need creating is not knowable
+     *   without resolving the tree, which is the work the lock is protecting;
+     * - a custom attribute value is the only way into option auto-creation, and
+     *   telling a `select` from a text attribute needs the metadata cache the
+     *   pipeline warms later. `status` and `visibility` are selects too, but
+     *   AttributeProcessor skips them, and they are first-class fields here
+     *   rather than custom attributes.
+     *
+     * Erring towards taking the lock costs a serialized request; erring the
+     * other way costs a duplicate category or a duplicate attribute option, and
+     * neither is cheap to undo.
+     *
+     * @param ProductInterface[] $products
+     */
+    private function needsWriteLock(array $products): bool
+    {
+        foreach ($products as $product) {
+            if ($product->getCategories() !== null) {
+                return true;
+            }
+        }
+
+        if (!$this->config->isCreateMissingOptions()) {
+            return false;
+        }
+
+        foreach ($products as $product) {
+            if ($product->getCustomAttributes()) {
+                return true;
+            }
+            foreach ($product->getStoreValues() ?? [] as $storeValues) {
+                if ($storeValues->getCustomAttributes()) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     /**

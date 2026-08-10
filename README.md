@@ -549,6 +549,34 @@ message.
 The counters count **products, not product-scopes**: a product created with
 three localized value sets is one `created`.
 
+### Concurrency
+
+Overlapping imports are rejected with `Another import is already running.` —
+but only when the payload can perform an **unkeyed read-then-create**: look for
+a row, not find it, insert it, where the database has no unique key to catch a
+second request doing the same thing at the same moment. There are two such
+sequences, and the lock exists for both:
+
+- **categories.** Missing path segments are created on demand, and nothing is
+  unique on `(parent_id, name)` or on a category `url_key`. Two concurrent runs
+  both miss and both insert, leaving a duplicate sibling — which then makes that
+  path permanently ambiguous — or a `url_rewrite` unique-key violation that
+  fails whichever request loses. The category endpoint takes the same lock, so
+  the two serialize against each other too.
+- **attribute options.** With *Auto-Create Missing Attribute Options* on,
+  missing select/multiselect options are created. `eav_attribute_option_value`
+  is unique on `(store_id, option_id)`, **not** on the label, so two concurrent
+  runs writing the same new option label both insert and the attribute ends up
+  with two options of the same name.
+
+A payload that can reach neither runs **lock-free**, concurrently with anything
+else — a price or stock update, say, or a store-value pass carrying no custom
+attributes. The two tests are deliberately conservative: any `categories` field
+at all (including `[]`), and any `custom_attributes` while option auto-creation
+is on (whether on the product or in a `store_values` block). Erring towards
+taking the lock costs a serialized request; erring the other way costs a
+duplicate category or attribute option, and neither is cheap to undo.
+
 ## Attribute definitions
 
 A separate endpoint provisions the product attribute *definitions* a feed
@@ -1170,7 +1198,10 @@ all — there is nothing to localize, and its own `reason` is the whole story.
 Category sync takes the **same lock as the product import** (rejecting with
 `Another import is already running.`), because both mutate the category tree and
 there is no unique key on `(parent_id, name)` to fall back on — two concurrent
-runs would resolve the same missing path, both miss, and both insert.
+runs would resolve the same missing path, both miss, and both insert. This
+endpoint takes it on every request; the product endpoint takes it only when its
+payload can reach a read-then-create (see "Concurrency" under the product
+endpoint).
 
 Each category is processed in its own transaction and reported independently.
 That transaction is what makes a **move** atomic: `changeParent()` re-paths the
@@ -1236,7 +1267,8 @@ one per subtree per request (see "Moving a category").
 - Indexing: partial reindex of affected IDs (default), invalidate, or none.
   Indexers in "Update by Schedule" mode are left to mview (DB triggers pick
   up direct writes). FPC tags of touched products are cleaned.
-- Concurrency guard: a named lock rejects overlapping imports.
+- Concurrency guard: a named lock rejects overlapping imports — taken only when
+  the payload can create a category or an attribute option (see "Concurrency").
 - Logging to `var/log/readydata_import.log`.
 
 ## Configuration

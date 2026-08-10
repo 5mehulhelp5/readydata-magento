@@ -58,8 +58,12 @@ class CategorySyncService
      * the same non-transactional relative-update code, with no unique key on
      * (parent_id, name) to fall back on. Two lock names would let them run
      * concurrently and duplicate siblings.
+     *
+     * Taken unconditionally here — every request to this endpoint is a category
+     * write. The product import takes the same lock only when its payload can
+     * reach a read-then-create; see {@see ImportService::needsWriteLock()}.
      */
-    public const LOCK_NAME = ImportService::TREE_WRITE_LOCK_NAME;
+    public const LOCK_NAME = ImportService::WRITE_LOCK_NAME;
     private const LOCK_TIMEOUT_SEC = 10;
 
     public function __construct(
