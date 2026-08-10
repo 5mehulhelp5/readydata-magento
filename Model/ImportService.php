@@ -115,6 +115,7 @@ class ImportService
                 $context = $this->batchContextFactory->create([
                     'products' => $batch,
                     'storeId' => $storeId,
+                    'rootCategoryId' => $settings?->getRootCategoryId(),
                 ]);
                 $contexts[] = $context;
 

@@ -37,19 +37,24 @@ use ReadyData\Import\Model\ResourceModel\Category as CategoryResource;
 class CategoryPathResolver
 {
     /**
-     * @var array<string, int> normalized path cache key => entity_id
+     * Cached resolutions, keyed by ROOT first: two roots may share a name, and
+     * then "Outdoor Catalog/Men" names two different categories. A flat cache
+     * would serve the first root's ID to the second root's path — inside a
+     * single request, since that is this cache's whole lifetime.
+     *
+     * @var array<int, array<string, int>> root entity_id => path cache key => entity_id
      */
     private array $idByPath = [];
 
     /**
-     * @var array<string, true> cache keys created by this resolver
+     * @var array<int, array<string, true>> root entity_id => cache keys created by this resolver
      */
     private array $createdPaths = [];
 
     /**
-     * @var array<string, int>|null store-0 root name => entity_id
+     * @var array<string, int[]>|null store-0 root name => entity_id[], ascending
      */
-    private ?array $roots = null;
+    private ?array $rootIdsByName = null;
 
     public function __construct(
         private readonly CategoryResource $categoryResource,
@@ -67,13 +72,15 @@ class CategoryPathResolver
      * {@see createChain()} for why continuing is not safe.
      *
      * @param array<string, string[]> $paths cache key => trimmed segments
+     * @param int|null $pinnedRootId fixes the first segment to this root
+     *        instead of letting the name pick one; see {@see resolveRootId()}
      * @return array<string, array{id: ?int, message: ?string}> keyed like
      *         $paths; id is null when unresolved and message explains why
      * @throws LocalizedException when a category could not be created
      */
-    public function resolvePaths(array $paths): array
+    public function resolvePaths(array $paths, ?int $pinnedRootId = null): array
     {
-        return $this->walk($paths, true);
+        return $this->walk($paths, true, $pinnedRootId);
     }
 
     /**
@@ -86,12 +93,13 @@ class CategoryPathResolver
      * a category the caller never sees and never asked for.
      *
      * @param array<string, string[]> $paths cache key => trimmed segments
+     * @param int|null $pinnedRootId see {@see resolvePaths()}
      * @return array<string, int> cache key => entity_id, for resolvable paths only
      */
-    public function lookupPaths(array $paths): array
+    public function lookupPaths(array $paths, ?int $pinnedRootId = null): array
     {
         $resolved = [];
-        foreach ($this->walk($paths, false) as $key => $result) {
+        foreach ($this->walk($paths, false, $pinnedRootId) as $key => $result) {
             if ($result['id'] !== null) {
                 $resolved[$key] = $result['id'];
             }
@@ -111,7 +119,13 @@ class CategoryPathResolver
      */
     public function forget(string $cacheKey): void
     {
-        unset($this->idByPath[$cacheKey], $this->createdPaths[$cacheKey]);
+        // Under every root: the caller knows the path that changed meaning, not
+        // which tree it was resolved in, and forgetting one entry too many
+        // costs a re-query while forgetting one too few writes to the wrong
+        // category.
+        foreach (array_keys($this->idByPath) as $rootId) {
+            unset($this->idByPath[$rootId][$cacheKey], $this->createdPaths[$rootId][$cacheKey]);
+        }
     }
 
     /**
@@ -144,7 +158,7 @@ class CategoryPathResolver
      */
     public function forgetRoots(?string $renamedRootName = null): void
     {
-        $this->roots = null;
+        $this->rootIdsByName = null;
 
         if ($renamedRootName === null) {
             return;
@@ -153,9 +167,11 @@ class CategoryPathResolver
         // The escaped canonical form, so a root whose name contains "/" cannot
         // match a deeper path's prefix — same reasoning as prefixKey().
         $prefix = PathParser::buildKey([$renamedRootName]) . '/';
-        foreach (array_keys($this->idByPath) as $key) {
-            if (str_starts_with($key, $prefix)) {
-                unset($this->idByPath[$key], $this->createdPaths[$key]);
+        foreach ($this->idByPath as $rootId => $keys) {
+            foreach (array_keys($keys) as $key) {
+                if (str_starts_with($key, $prefix)) {
+                    unset($this->idByPath[$rootId][$key], $this->createdPaths[$rootId][$key]);
+                }
             }
         }
     }
@@ -163,9 +179,10 @@ class CategoryPathResolver
     /**
      * @param array<string, string[]> $paths cache key => trimmed segments
      * @param bool $create whether to create the missing tail of a stalled walk
+     * @param int|null $pinnedRootId fixes the first segment to this root
      * @return array<string, array{id: ?int, message: ?string}>
      */
-    private function walk(array $paths, bool $create): array
+    private function walk(array $paths, bool $create, ?int $pinnedRootId = null): array
     {
         $this->evictRolledBackCreations();
 
@@ -173,11 +190,6 @@ class CategoryPathResolver
         $walks = [];
 
         foreach ($paths as $key => $segments) {
-            if (isset($this->idByPath[$key])) {
-                $results[$key] = ['id' => $this->idByPath[$key], 'message' => null];
-                continue;
-            }
-
             if (count($segments) === 1) {
                 $results[$key] = [
                     'id' => null,
@@ -189,21 +201,29 @@ class CategoryPathResolver
                 continue;
             }
 
-            $rootId = $this->getRoots()[$segments[0]] ?? null;
-            if ($rootId === null) {
-                $results[$key] = [
-                    'id' => null,
-                    'message' => sprintf(
-                        'Unknown root category "%s" — root categories are not auto-created.',
-                        $segments[0]
-                    ),
-                ];
+            // The root has to be settled before the cache can be consulted:
+            // the same path key means different categories under different
+            // roots, so there is no root-agnostic answer to look up.
+            $root = $this->resolveRootId($segments[0], $pinnedRootId);
+            if ($root['id'] === null) {
+                $results[$key] = ['id' => null, 'message' => $root['message']];
+                continue;
+            }
+            $rootId = $root['id'];
+
+            if (isset($this->idByPath[$rootId][$key])) {
+                $results[$key] = ['id' => $this->idByPath[$rootId][$key], 'message' => null];
                 continue;
             }
 
             // depth = number of segments already resolved; parentId = ID of
             // the last resolved segment.
-            $walks[$key] = ['segments' => $segments, 'depth' => 1, 'parentId' => $rootId];
+            $walks[$key] = [
+                'segments' => $segments,
+                'depth' => 1,
+                'parentId' => $rootId,
+                'root_id' => $rootId,
+            ];
         }
 
         // Walk the existing tree level by level for all paths at once.
@@ -240,7 +260,7 @@ class CategoryPathResolver
                     continue;
                 }
 
-                $this->idByPath[$this->prefixKey($walk)] = $childId;
+                $this->idByPath[$walk['root_id']][$this->prefixKey($walk)] = $childId;
                 $walk['parentId'] = $childId;
                 $walk['depth']++;
 
@@ -285,18 +305,70 @@ class CategoryPathResolver
     /**
      * Advance a walk through prefixes already resolved in the cache.
      *
-     * @param array{segments: string[], depth: int, parentId: int} $walk
+     * @param array{segments: string[], depth: int, parentId: int, root_id: int} $walk
      */
     private function advanceThroughCache(array &$walk): void
     {
         while ($walk['depth'] < count($walk['segments'])) {
-            $cachedId = $this->idByPath[$this->prefixKey($walk)] ?? null;
+            $cachedId = $this->idByPath[$walk['root_id']][$this->prefixKey($walk)] ?? null;
             if ($cachedId === null) {
                 return;
             }
             $walk['parentId'] = $cachedId;
             $walk['depth']++;
         }
+    }
+
+    /**
+     * The root a path's first segment resolves to, honouring a pin.
+     *
+     * Without a pin this keeps the historical behaviour: the lowest entity ID
+     * among the roots sharing that name. That is a read's answer to an
+     * ambiguity, and it is why the pin exists — two roots with one name are two
+     * different catalogs, and picking the older one is a guess.
+     *
+     * With a pin the name must still match. A path saying one tree and a pin
+     * saying another is a contradiction, and silently following the pin would
+     * quietly file a subtree in the catalog the caller did not name.
+     *
+     * @return array{id: ?int, message: ?string}
+     */
+    private function resolveRootId(string $firstSegment, ?int $pinnedRootId): array
+    {
+        if ($pinnedRootId === null) {
+            $rootId = $this->getRoots()[$firstSegment] ?? null;
+
+            return $rootId === null
+                ? [
+                    'id' => null,
+                    'message' => sprintf(
+                        'Unknown root category "%s" — root categories are not auto-created.',
+                        $firstSegment
+                    ),
+                ]
+                : ['id' => $rootId, 'message' => null];
+        }
+
+        $pinnedName = $this->getRootNameById()[$pinnedRootId] ?? null;
+        if ($pinnedName === null) {
+            return [
+                'id' => null,
+                'message' => sprintf('Root category ID %d does not exist.', $pinnedRootId),
+            ];
+        }
+        if ($pinnedName !== $firstSegment) {
+            return [
+                'id' => null,
+                'message' => sprintf(
+                    'Path starts with root "%s" but root category ID %d is named "%s".',
+                    $firstSegment,
+                    $pinnedRootId,
+                    $pinnedName
+                ),
+            ];
+        }
+
+        return ['id' => $pinnedRootId, 'message' => null];
     }
 
     /**
@@ -310,21 +382,22 @@ class CategoryPathResolver
      * on that connection is not an option, so the failure has to reach the
      * caller's rollback handler while it can still report the actual reason.
      *
-     * @param array{segments: string[], depth: int, parentId: int} $walk
+     * @param array{segments: string[], depth: int, parentId: int, root_id: int} $walk
      * @return array{id: ?int, message: ?string}
      * @throws LocalizedException
      */
     private function createChain(array $walk): array
     {
         $parentId = $walk['parentId'];
+        $rootId = $walk['root_id'];
 
         for ($i = $walk['depth'], $count = count($walk['segments']); $i < $count; $i++) {
             $prefixKey = PathParser::buildKey(array_slice($walk['segments'], 0, $i + 1));
 
             // A chain created moments ago by another path may already cover
             // this prefix.
-            if (isset($this->idByPath[$prefixKey])) {
-                $parentId = $this->idByPath[$prefixKey];
+            if (isset($this->idByPath[$rootId][$prefixKey])) {
+                $parentId = $this->idByPath[$rootId][$prefixKey];
                 continue;
             }
 
@@ -345,8 +418,8 @@ class CategoryPathResolver
                 );
             }
 
-            $this->idByPath[$prefixKey] = $parentId;
-            $this->createdPaths[$prefixKey] = true;
+            $this->idByPath[$rootId][$prefixKey] = $parentId;
+            $this->createdPaths[$rootId][$prefixKey] = true;
         }
 
         return ['id' => $parentId, 'message' => null];
@@ -363,12 +436,26 @@ class CategoryPathResolver
             return;
         }
 
-        $createdIds = array_intersect_key($this->idByPath, $this->createdPaths);
-        $existing = $this->categoryResource->getExistingByIds(array_values($createdIds));
+        $createdIds = [];
+        foreach ($this->createdPaths as $rootId => $keys) {
+            foreach (array_intersect_key($this->idByPath[$rootId] ?? [], $keys) as $key => $id) {
+                $createdIds[$rootId][$key] = $id;
+            }
+        }
+        if (!$createdIds) {
+            return;
+        }
 
-        foreach ($createdIds as $key => $id) {
-            if (!isset($existing[$id])) {
-                unset($this->idByPath[$key], $this->createdPaths[$key]);
+        $existing = $this->categoryResource->getExistingByIds(
+            array_values(array_merge(...array_map('array_values', $createdIds)))
+        );
+
+        foreach ($createdIds as $rootId => $keys) {
+            foreach ($keys as $key => $id) {
+                if (isset($existing[$id])) {
+                    continue;
+                }
+                unset($this->idByPath[$rootId][$key], $this->createdPaths[$rootId][$key]);
                 $this->logger->info(sprintf(
                     'Auto-created category "%s" (ID %d) was rolled back with its batch; it will be re-created on demand.',
                     $key,
@@ -383,7 +470,7 @@ class CategoryPathResolver
      * canonical form, so segments containing "/" cannot collide with a
      * deeper path.
      *
-     * @param array{segments: string[], depth: int, parentId: int} $walk
+     * @param array{segments: string[], depth: int, parentId: int, root_id: int} $walk
      */
     private function prefixKey(array $walk): string
     {
@@ -391,13 +478,46 @@ class CategoryPathResolver
     }
 
     /**
+     * Root name => lowest entity_id, the answer a READ gives an ambiguous root
+     * name. A write should pin instead — see {@see resolveRootId()}.
+     *
      * @return array<string, int>
      */
     private function getRoots(): array
     {
+        return array_map(
+            static fn (array $ids): int => $ids[0],
+            $this->getRootIdsByName()
+        );
+    }
+
+    /**
+     * @return array<int, string> root entity_id => store-0 name
+     */
+    private function getRootNameById(): array
+    {
+        $names = [];
+        foreach ($this->getRootIdsByName() as $name => $ids) {
+            foreach ($ids as $id) {
+                $names[$id] = $name;
+            }
+        }
+
+        return $names;
+    }
+
+    /**
+     * @return array<string, int[]>
+     */
+    private function getRootIdsByName(): array
+    {
         // This resolver never creates a root, so a rollback of its own work
         // cannot make this stale. A caller that creates or renames one has to
         // say so through forgetRoots().
-        return $this->roots ??= $this->categoryResource->getRootCategories();
+        //
+        // Every candidate ID per name is kept, not just the lowest: a pin has
+        // to be checkable against the name it claims, and that answer is gone
+        // once duplicates are collapsed.
+        return $this->rootIdsByName ??= $this->categoryResource->getRootCategoryIds();
     }
 }

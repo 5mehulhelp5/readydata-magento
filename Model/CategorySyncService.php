@@ -83,7 +83,7 @@ class CategorySyncService
     {
         $startedAt = hrtime(true);
         $received = count($categories);
-        $entries = $this->prepareEntries($categories);
+        $entries = $this->prepareEntries($categories, $settings?->getRootCategoryId());
 
         if (!$entries) {
             throw new LocalizedException(__('The request contains no category definitions.'));
@@ -991,32 +991,13 @@ class CategorySyncService
             // which is fine for a read but not for a write, so the first
             // segment is resolved here with every candidate ID in hand.
             $roots ??= $this->categoryResource->getRootCategoryIds();
-            $rootIds = $roots[$segments[0]] ?? [];
-            if (count($rootIds) > 1) {
-                $parents[$entry['key']] = self::noParent(
-                    CategorySyncResultInterface::REASON_AMBIGUOUS_PATH,
-                    sprintf(
-                        '%d root categories are named "%s" (IDs %s); send category_id to address a category'
-                        . ' under one of them.',
-                        count($rootIds),
-                        $segments[0],
-                        implode(', ', $rootIds)
-                    )
-                );
-                continue;
-            }
-            if ($rootIds === []) {
-                $parents[$entry['key']] = self::noParent(
-                    CategorySyncResultInterface::REASON_UNKNOWN_ROOT,
-                    sprintf(
-                        'Unknown root category "%s" — send it as a single-segment path to create it.',
-                        $segments[0]
-                    )
-                );
+            $root = $this->pickRoot($segments[0], $entry['root_pin'], $roots);
+            if ($root['id'] === null) {
+                $parents[$entry['key']] = self::noParent($root['reason'], $root['message']);
                 continue;
             }
 
-            $rootId = $rootIds[0];
+            $rootId = $root['id'];
             if (count($segments) === 2) {
                 $parents[$entry['key']] = [
                     'id' => $rootId,
@@ -1029,7 +1010,10 @@ class CategorySyncService
 
             $parentSegments = array_slice($segments, 0, -1);
             $pathKey = PathParser::buildKey($parentSegments);
-            $deepPaths[$pathKey] = $parentSegments;
+            // Grouped by the root already picked for this entry, not by the
+            // path alone: under two same-named roots one path key means two
+            // categories, and the resolver has to be told which tree to walk.
+            $deepPaths[$rootId][$pathKey] = $parentSegments;
             $deepByEntryKey[$entry['key']] = ['path_key' => $pathKey, 'root_id' => $rootId];
         }
 
@@ -1038,9 +1022,12 @@ class CategorySyncService
             // category the caller did not ask for. A missing ancestor is the
             // caller's to send, and creating it silently would produce a
             // category with none of the properties they specified anywhere.
-            $resolved = $this->pathResolver->lookupPaths($deepPaths);
+            $resolved = [];
+            foreach ($deepPaths as $rootId => $paths) {
+                $resolved[$rootId] = $this->pathResolver->lookupPaths($paths, $rootId);
+            }
             foreach ($deepByEntryKey as $entryKey => $deep) {
-                $parentId = $resolved[$deep['path_key']] ?? null;
+                $parentId = $resolved[$deep['root_id']][$deep['path_key']] ?? null;
                 $parents[$entryKey] = [
                     'id' => $parentId,
                     'root_id' => $deep['root_id'],
@@ -1407,30 +1394,12 @@ class CategorySyncService
             // names are two distinct catalogs, and picking the lowest ID for a
             // write is exactly the guess this endpoint refuses to make.
             $roots ??= $this->categoryResource->getRootCategoryIds();
-            $rootIds = $roots[$segments[0]] ?? [];
-            if (count($rootIds) > 1) {
+            $root = $this->pickRoot($segments[0], $entry['root_pin'], $roots, true);
+            if ($root['id'] === null) {
                 $destinations[$entry['key']] = [
                     'id' => null,
-                    'reason' => CategorySyncResultInterface::REASON_AMBIGUOUS_PATH,
-                    'message' => sprintf(
-                        '%d root categories are named "%s" (IDs %s); send parent_category_id to pick the'
-                        . ' destination.',
-                        count($rootIds),
-                        $segments[0],
-                        implode(', ', $rootIds)
-                    ),
-                    'label' => $label,
-                ];
-                continue;
-            }
-            if ($rootIds === []) {
-                $destinations[$entry['key']] = [
-                    'id' => null,
-                    'reason' => CategorySyncResultInterface::REASON_UNKNOWN_ROOT,
-                    'message' => sprintf(
-                        'Unknown root category "%s" in the destination parent path.',
-                        $segments[0]
-                    ),
+                    'reason' => $root['reason'],
+                    'message' => $root['message'],
                     'label' => $label,
                 ];
                 continue;
@@ -1440,7 +1409,7 @@ class CategorySyncService
                 // A single-segment destination names a root: the category becomes
                 // one of that root's direct children.
                 $destinations[$entry['key']] = [
-                    'id' => $rootIds[0],
+                    'id' => $root['id'],
                     'reason' => null,
                     'message' => null,
                     'label' => $label,
@@ -1448,16 +1417,20 @@ class CategorySyncService
                 continue;
             }
 
-            $deepPaths[$label] = $segments;
-            $deepByEntryKey[$entry['key']] = $label;
+            $deepPaths[$root['id']][$label] = $segments;
+            $deepByEntryKey[$entry['key']] = ['label' => $label, 'root_id' => $root['id']];
         }
 
         if ($deepPaths) {
             // lookupPaths(), never resolvePaths(): a destination the caller
             // mistyped must be reported, not conjured into existence.
-            $resolved = $this->pathResolver->lookupPaths($deepPaths);
-            foreach ($deepByEntryKey as $entryKey => $label) {
-                $parentId = $resolved[$label] ?? null;
+            $resolved = [];
+            foreach ($deepPaths as $rootId => $paths) {
+                $resolved[$rootId] = $this->pathResolver->lookupPaths($paths, $rootId);
+            }
+            foreach ($deepByEntryKey as $entryKey => $deep) {
+                $label = $deep['label'];
+                $parentId = $resolved[$deep['root_id']][$label] ?? null;
                 $destinations[$entryKey] = [
                     'id' => $parentId,
                     'reason' => $parentId !== null
@@ -1472,6 +1445,88 @@ class CategorySyncService
         }
 
         return $destinations;
+    }
+
+    /**
+     * Which root a path's first segment names.
+     *
+     * Magento enforces no uniqueness on root names, and two roots sharing one
+     * are two different catalogs. A read elsewhere in this module settles that
+     * by taking the lowest entity ID; a write must not, so without a pin the
+     * ambiguity is refused outright. `root_category_id` — on the entry or on
+     * `settings` — is what makes such a path writable, and the only thing that
+     * can, since a first run has no `category_id` yet.
+     *
+     * A pin that contradicts the name is itself a refusal. Following it would
+     * file the category in a catalog the path did not name; refusing the name
+     * would ignore the more specific of the caller's two statements. Neither is
+     * a guess worth making on a subtree.
+     *
+     * @param array<string, int[]> $roots store-0 name => entity_id[]
+     * @param bool $forDestination phrases the refusals for a move's destination
+     * @return array{id: ?int, reason: ?string, message: ?string}
+     */
+    private function pickRoot(
+        string $firstSegment,
+        ?int $pinnedRootId,
+        array $roots,
+        bool $forDestination = false
+    ): array {
+        $rootIds = $roots[$firstSegment] ?? [];
+
+        if ($pinnedRootId !== null) {
+            if (!in_array($pinnedRootId, $rootIds, true)) {
+                $named = array_keys(array_filter(
+                    $roots,
+                    static fn (array $ids): bool => in_array($pinnedRootId, $ids, true)
+                ));
+
+                return [
+                    'id' => null,
+                    'reason' => CategorySyncResultInterface::REASON_UNKNOWN_ROOT,
+                    'message' => $named === []
+                        ? sprintf('root_category_id %d is not a root category.', $pinnedRootId)
+                        : sprintf(
+                            '%s starts with root "%s" but root_category_id %d is named "%s".',
+                            $forDestination ? 'The destination parent path' : 'The path',
+                            $firstSegment,
+                            $pinnedRootId,
+                            $named[0]
+                        ),
+                ];
+            }
+
+            return ['id' => $pinnedRootId, 'reason' => null, 'message' => null];
+        }
+
+        if (count($rootIds) > 1) {
+            return [
+                'id' => null,
+                'reason' => CategorySyncResultInterface::REASON_AMBIGUOUS_PATH,
+                'message' => sprintf(
+                    '%d root categories are named "%s" (IDs %s); send root_category_id to pick one, or'
+                    . ' %s.',
+                    count($rootIds),
+                    $firstSegment,
+                    implode(', ', $rootIds),
+                    $forDestination ? 'parent_category_id to name the destination' : 'category_id'
+                ),
+            ];
+        }
+        if ($rootIds === []) {
+            return [
+                'id' => null,
+                'reason' => CategorySyncResultInterface::REASON_UNKNOWN_ROOT,
+                'message' => $forDestination
+                    ? sprintf('Unknown root category "%s" in the destination parent path.', $firstSegment)
+                    : sprintf(
+                        'Unknown root category "%s" — send it as a single-segment path to create it.',
+                        $firstSegment
+                    ),
+            ];
+        }
+
+        return ['id' => $rootIds[0], 'reason' => null, 'message' => null];
     }
 
     /**
@@ -1496,10 +1551,11 @@ class CategorySyncService
      *     segments: string[],
      *     key: string,
      *     label: string,
+     *     root_pin: ?int,
      *     error: ?array{reason: string, message: string}
      * }>
      */
-    private function prepareEntries(array $categories): array
+    private function prepareEntries(array $categories, ?int $requestRootId): array
     {
         $entries = [];
         foreach ($categories as $index => $definition) {
@@ -1514,6 +1570,7 @@ class CategorySyncService
                     'segments' => [],
                     'key' => 'invalid:' . $position,
                     'label' => sprintf('#%d', $position),
+                    'root_pin' => null,
                     'error' => [
                         'reason' => CategorySyncResultInterface::REASON_INVALID_DEFINITION,
                         'message' => 'Entry is not a category definition.',
@@ -1556,6 +1613,10 @@ class CategorySyncService
                 // entries sharing a parents key would inherit each other's.
                 'key' => $key,
                 'label' => $this->labelFor($definition, $segments, $position),
+                // The entry's own pin wins over the request's: a payload that
+                // spans two root trees cannot name one root for all of it, and
+                // the entry is the more specific statement.
+                'root_pin' => $definition->getRootCategoryId() ?? $requestRootId,
                 'error' => $error,
             ];
         }

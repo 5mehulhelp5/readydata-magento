@@ -28,6 +28,7 @@ interface CategoryDefinitionInterface
 {
     public const PATH = 'path';
     public const CATEGORY_ID = 'category_id';
+    public const ROOT_CATEGORY_ID = 'root_category_id';
     public const PARENT_PATH = 'parent_path';
     public const PARENT_CATEGORY_ID = 'parent_category_id';
     public const NAME = 'name';
@@ -55,6 +56,26 @@ interface CategoryDefinitionInterface
      * @return $this
      */
     public function setPath(?string $path): self;
+
+    /**
+     * Pins this entry's `path` to one root category, overriding
+     * `settings.root_category_id` for this entry alone — for a payload that
+     * spans several root trees and cannot state one root for the whole request.
+     *
+     * See `settings.root_category_id` for what a pin does and why a path that
+     * contradicts it is refused rather than reparented. On a single-segment
+     * path the pin identifies the root itself, which is what lets a payload
+     * address one of two same-named roots before any `category_id` exists.
+     *
+     * @return int|null
+     */
+    public function getRootCategoryId(): ?int;
+
+    /**
+     * @param int|null $rootCategoryId
+     * @return $this
+     */
+    public function setRootCategoryId(?int $rootCategoryId): self;
 
     /**
      * Authoritative identity when present. Required to rename a category,

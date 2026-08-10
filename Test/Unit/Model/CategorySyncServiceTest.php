@@ -26,6 +26,7 @@ use ReadyData\Import\Model\CategoryValidator;
 use ReadyData\Import\Model\Config;
 use ReadyData\Import\Model\Data\CategoryDefinition;
 use ReadyData\Import\Model\Data\CategorySyncResponse;
+use ReadyData\Import\Model\Data\ImportSettings;
 use ReadyData\Import\Model\Data\CategorySyncResult;
 use ReadyData\Import\Model\Data\CustomAttribute;
 use ReadyData\Import\Model\Indexer\CategoryInvalidationHandler;
@@ -85,11 +86,6 @@ class CategorySyncServiceTest extends TestCase
         $this->categoryResource = $this->createMock(CategoryResource::class);
         $this->categoryResource->method('getRootCategoryIds')
             ->willReturnCallback(fn (): array => $this->rootIds);
-        $this->categoryResource->method('getRootCategories')
-            ->willReturnCallback(fn (): array => array_map(
-                static fn (array $ids): int => $ids[0],
-                $this->rootIds
-            ));
 
         $this->writer = $this->createMock(CategoryWriter::class);
         $this->invalidationHandler = $this->createMock(CategoryInvalidationHandler::class);
@@ -397,6 +393,85 @@ class CategorySyncServiceTest extends TestCase
         $result = $response->getResults()[0];
         self::assertSame(CategorySyncResultInterface::REASON_AMBIGUOUS_PATH, $result->getReason());
         self::assertStringContainsString('2, 8', $result->getMessages()[0]);
+    }
+
+    /**
+     * The pin is what makes an ambiguous root writable — and the only thing
+     * that can on a first run, before any category_id has been recorded.
+     */
+    public function testARequestPinMakesAnAmbiguousRootWritable(): void
+    {
+        $this->rootIds = ['Default Category' => [self::ROOT_ID, 8]];
+        $this->categoryResource->method('getChildrenByParentIds')->willReturn([]);
+        $this->writer->expects(self::once())->method('create')
+            ->with(8, 'Men', self::anything(), self::anything())
+            ->willReturn(77);
+
+        $response = $this->service->sync(
+            [$this->definition('Default Category/Men')],
+            (new ImportSettings())->setRootCategoryId(8)
+        );
+
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::STATUS_CREATED, $result->getStatus());
+        self::assertSame(77, $result->getEntityId());
+    }
+
+    public function testAnEntryPinOverridesTheRequestPin(): void
+    {
+        // A payload spanning two root trees cannot name one root for all of it.
+        $this->rootIds = ['Default Category' => [self::ROOT_ID, 8]];
+        $this->categoryResource->method('getChildrenByParentIds')->willReturn([]);
+        $this->writer->expects(self::once())->method('create')
+            ->with(self::ROOT_ID, 'Men', self::anything(), self::anything())
+            ->willReturn(77);
+
+        $entry = $this->definition('Default Category/Men')->setRootCategoryId(self::ROOT_ID);
+
+        $response = $this->service->sync([$entry], (new ImportSettings())->setRootCategoryId(8));
+
+        self::assertSame(CategorySyncResultInterface::STATUS_CREATED, $response->getResults()[0]->getStatus());
+    }
+
+    public function testAPinNamingADifferentRootThanThePathIsRefused(): void
+    {
+        $this->rootIds = ['Default Category' => [self::ROOT_ID], 'Outdoor Catalog' => [self::OUTDOOR_ID]];
+        $this->writer->expects(self::never())->method('create');
+
+        $response = $this->service->sync(
+            [$this->definition('Default Category/Men')],
+            (new ImportSettings())->setRootCategoryId(self::OUTDOOR_ID)
+        );
+
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::REASON_UNKNOWN_ROOT, $result->getReason());
+        self::assertStringContainsString('is named "Outdoor Catalog"', $result->getMessages()[0]);
+    }
+
+    public function testAPinThatIsNotARootAtAllIsRefused(): void
+    {
+        $this->writer->expects(self::never())->method('create');
+
+        $response = $this->service->sync(
+            [$this->definition('Default Category/Men')],
+            (new ImportSettings())->setRootCategoryId(4242)
+        );
+
+        $result = $response->getResults()[0];
+        self::assertSame(CategorySyncResultInterface::REASON_UNKNOWN_ROOT, $result->getReason());
+        self::assertStringContainsString('4242 is not a root category', $result->getMessages()[0]);
+    }
+
+    public function testTheAmbiguityRefusalNamesThePinAsTheWayOut(): void
+    {
+        $this->rootIds = ['Default Category' => [self::ROOT_ID, 8]];
+
+        $response = $this->service->sync([$this->definition('Default Category/Men')]);
+
+        self::assertStringContainsString(
+            'send root_category_id to pick one',
+            $response->getResults()[0]->getMessages()[0]
+        );
     }
 
     public function testRootCreatedInTheSameRequestIsVisibleToItsChildren(): void

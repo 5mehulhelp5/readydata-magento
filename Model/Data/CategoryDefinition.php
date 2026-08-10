@@ -12,6 +12,7 @@ class CategoryDefinition implements CategoryDefinitionInterface
 {
     private ?string $path = null;
     private ?int $categoryId = null;
+    private ?int $rootCategoryId = null;
     private ?string $parentPath = null;
     private ?int $parentCategoryId = null;
     private ?string $name = null;
@@ -44,6 +45,17 @@ class CategoryDefinition implements CategoryDefinitionInterface
     public function setCategoryId(?int $categoryId): CategoryDefinitionInterface
     {
         $this->categoryId = $categoryId;
+        return $this;
+    }
+
+    public function getRootCategoryId(): ?int
+    {
+        return $this->rootCategoryId;
+    }
+
+    public function setRootCategoryId(?int $rootCategoryId): CategoryDefinitionInterface
+    {
+        $this->rootCategoryId = $rootCategoryId;
         return $this;
     }
 

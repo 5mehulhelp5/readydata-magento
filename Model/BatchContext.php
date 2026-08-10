@@ -71,10 +71,13 @@ class BatchContext
     /**
      * @param ProductInterface[] $products
      * @param int $storeId target store scope for store-scoped values (0 = global)
+     * @param int|null $rootCategoryId root every category path is pinned to,
+     *        null to let the first segment's name pick one
      */
     public function __construct(
         array $products = [],
-        private readonly int $storeId = 0
+        private readonly int $storeId = 0,
+        private readonly ?int $rootCategoryId = null
     ) {
         foreach ($products as $product) {
             $this->products[$product->getSku()] = $product;
@@ -84,6 +87,15 @@ class BatchContext
     public function getStoreId(): int
     {
         return $this->storeId;
+    }
+
+    /**
+     * The root category every `categories` path in this batch resolves under,
+     * or null when the first segment's name picks one on its own.
+     */
+    public function getRootCategoryId(): ?int
+    {
+        return $this->rootCategoryId;
     }
 
     /**

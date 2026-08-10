@@ -16,6 +16,7 @@ interface ImportSettingsInterface
 {
     public const STORE_VIEW_CODE = 'store_view_code';
     public const STORE_ID = 'store_id';
+    public const ROOT_CATEGORY_ID = 'root_category_id';
     public const CONTINUE_ON_ERROR = 'continue_on_error';
     public const BATCH_SIZE = 'batch_size';
 
@@ -48,6 +49,33 @@ interface ImportSettingsInterface
      * @return $this
      */
     public function setStoreId(int $storeId): self;
+
+    /**
+     * Pins the first segment of every category path in this request to one
+     * root category, instead of letting the name pick it.
+     *
+     * Magento enforces no uniqueness on root names, and two roots sharing one
+     * are two different catalogs. Without a pin a read resolves such a name to
+     * the lowest entity ID — which silently lands the write in whichever tree
+     * happens to have been created first — and a write on the category
+     * endpoint refuses outright with `ambiguous_path`. Naming the root here
+     * resolves both, and it is the only way to disambiguate on a first run,
+     * before any `category_id` is known.
+     *
+     * A path whose first segment does not name the pinned root is refused
+     * rather than reparented: the two statements contradict each other, and
+     * guessing which one the caller meant is how a subtree ends up in the wrong
+     * catalog.
+     *
+     * @return int|null
+     */
+    public function getRootCategoryId(): ?int;
+
+    /**
+     * @param int $rootCategoryId
+     * @return $this
+     */
+    public function setRootCategoryId(int $rootCategoryId): self;
 
     /**
      * @return bool|null

@@ -406,6 +406,29 @@ class CategoryLinkProcessorTest extends TestCase
     }
 
     /**
+     * Without the pin reaching the resolver, a path under one of two same-named
+     * roots resolves to the lowest ID — assigning the product in the wrong
+     * catalog, with no error anywhere.
+     */
+    public function testTheRequestRootPinReachesThePathResolver(): void
+    {
+        $context = new BatchContext(
+            [(new Product())->setSku('SKU-1')->setCategories(['Shop/Men'])],
+            0,
+            29
+        );
+        $context->setEntityId('SKU-1', 10);
+
+        $this->pathResolver->expects(self::once())->method('resolvePaths')
+            ->with(['Shop/Men' => ['Shop', 'Men']], 29)
+            ->willReturn(['Shop/Men' => ['id' => 31, 'message' => null]]);
+        $this->pathResolver->method('validateIds')->willReturn([]);
+        $this->categoryLink->method('getAssignments')->willReturn([]);
+
+        $this->processor->process($context);
+    }
+
+    /**
      * Stubs getAncestry() from a flat category => root map, shaping the reply
      * the way the resource model does (level 1 = the root itself).
      *

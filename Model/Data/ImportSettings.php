@@ -12,6 +12,7 @@ class ImportSettings implements ImportSettingsInterface
 {
     private ?string $storeViewCode = null;
     private ?int $storeId = null;
+    private ?int $rootCategoryId = null;
     private ?bool $continueOnError = null;
     private ?int $batchSize = null;
 
@@ -34,6 +35,17 @@ class ImportSettings implements ImportSettingsInterface
     public function setStoreId(int $storeId): ImportSettingsInterface
     {
         $this->storeId = $storeId;
+        return $this;
+    }
+
+    public function getRootCategoryId(): ?int
+    {
+        return $this->rootCategoryId;
+    }
+
+    public function setRootCategoryId(int $rootCategoryId): ImportSettingsInterface
+    {
+        $this->rootCategoryId = $rootCategoryId;
         return $this;
     }
 

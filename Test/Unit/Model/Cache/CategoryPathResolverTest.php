@@ -26,7 +26,7 @@ class CategoryPathResolverTest extends TestCase
     protected function setUp(): void
     {
         $this->categoryResource = $this->createMock(CategoryResource::class);
-        $this->categoryResource->method('getRootCategories')->willReturn(['Default Category' => self::ROOT_ID]);
+        $this->categoryResource->method('getRootCategoryIds')->willReturn(['Default Category' => [self::ROOT_ID]]);
 
         $this->categoryWriter = $this->createMock(CategoryWriter::class);
 
@@ -125,6 +125,98 @@ class CategoryPathResolverTest extends TestCase
         $this->resolver->resolvePaths(['Default Category/Men' => ['Default Category', 'Men']]);
     }
 
+    /**
+     * Two roots may share a name, and then one path key means two different
+     * categories. A flat cache would serve the first root's ID to the second
+     * root's path — placing a subtree in the wrong catalog, which Magento does
+     * not cheaply undo.
+     */
+    public function testTwoRootsSharingANameKeepSeparateCaches(): void
+    {
+        $resolver = $this->twoRootResolver($calls);
+
+        $paths = ['Shop/Men' => ['Shop', 'Men']];
+        self::assertSame(['Shop/Men' => 10], $resolver->lookupPaths($paths, 2));
+        self::assertSame(['Shop/Men' => 20], $resolver->lookupPaths($paths, 3));
+        // Each root was walked once; neither answer came from the other's cache.
+        self::assertSame(2, $calls);
+
+        // And both are now cached independently.
+        self::assertSame(['Shop/Men' => 10], $resolver->lookupPaths($paths, 2));
+        self::assertSame(['Shop/Men' => 20], $resolver->lookupPaths($paths, 3));
+        self::assertSame(2, $calls);
+    }
+
+    public function testWithoutAPinAnAmbiguousRootNameStillTakesTheLowestId(): void
+    {
+        // The historical read behaviour, unchanged: a pin is what a caller uses
+        // to stop relying on it.
+        $resolver = $this->twoRootResolver($calls);
+
+        self::assertSame(['Shop/Men' => 10], $resolver->lookupPaths(['Shop/Men' => ['Shop', 'Men']]));
+    }
+
+    public function testAPinThatContradictsThePathIsRefused(): void
+    {
+        $this->categoryResource->method('getChildrenByParentIds')->willReturn([]);
+
+        $result = $this->resolver->resolvePaths(
+            ['Default Category/Men' => ['Default Category', 'Men']],
+            99
+        );
+
+        self::assertNull($result['Default Category/Men']['id']);
+        self::assertSame(
+            'Root category ID 99 does not exist.',
+            $result['Default Category/Men']['message']
+        );
+        $this->categoryWriter->expects(self::never())->method('createBare');
+    }
+
+    public function testAPinNamingADifferentRootIsRefusedRatherThanFollowed(): void
+    {
+        $resolver = $this->twoRootResolver($calls, ['Shop' => [2], 'Outdoor' => [3]]);
+
+        // Following the pin would file the category under "Outdoor" though the
+        // path said "Shop"; ignoring it would drop the more specific statement.
+        $result = $resolver->resolvePaths(['Shop/Men' => ['Shop', 'Men']], 3);
+
+        self::assertNull($result['Shop/Men']['id']);
+        self::assertSame(
+            'Path starts with root "Shop" but root category ID 3 is named "Outdoor".',
+            $result['Shop/Men']['message']
+        );
+    }
+
+    /**
+     * A resolver over two roots whose children are distinct, counting tree
+     * queries so a test can tell a cache hit from a walk.
+     *
+     * @param int|null $calls out-param: tree queries performed
+     * @param array<string, int[]>|null $roots defaults to two roots named "Shop"
+     */
+    private function twoRootResolver(?int &$calls, ?array $roots = null): CategoryPathResolver
+    {
+        $calls = 0;
+        $categoryResource = $this->createMock(CategoryResource::class);
+        $categoryResource->method('getRootCategoryIds')->willReturn($roots ?? ['Shop' => [2, 3]]);
+        $categoryResource->method('getChildrenByParentIds')
+            ->willReturnCallback(function (array $parentIds) use (&$calls): array {
+                $calls++;
+
+                return array_intersect_key(
+                    [2 => ['Men' => 10], 3 => ['Men' => 20]],
+                    array_flip($parentIds)
+                );
+            });
+
+        return new CategoryPathResolver(
+            $categoryResource,
+            $this->categoryWriter,
+            $this->createMock(Logger::class)
+        );
+    }
+
     public function testForgetDropsACachedPathSoItIsLookedUpAgain(): void
     {
         $calls = 0;
@@ -155,10 +247,10 @@ class CategoryPathResolverTest extends TestCase
         // cache entry covers a root for forget() to drop.
         $rootCalls = 0;
         $categoryResource = $this->createMock(CategoryResource::class);
-        $categoryResource->method('getRootCategories')
+        $categoryResource->method('getRootCategoryIds')
             ->willReturnCallback(function () use (&$rootCalls): array {
                 $rootCalls++;
-                return ['Default Category' => self::ROOT_ID];
+                return ['Default Category' => [self::ROOT_ID]];
             });
         $categoryResource->method('getChildrenByParentIds')
             ->willReturn([self::ROOT_ID => ['Men' => self::MEN_ID]]);

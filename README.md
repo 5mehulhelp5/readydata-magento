@@ -229,6 +229,30 @@ rather than silently narrowing the scope. A link whose category cannot be
 placed in a tree — deleted between the assignment read and the write — is kept:
 a link that cannot be shown to be in scope is not removed.
 
+#### Pinning the root a path resolves under
+
+Magento enforces no uniqueness on root names, so two roots can both be called
+`Shop` — and they are two different catalogs. A path's first segment then names
+both, and this module resolves that by taking the **lowest `entity_id`**: the
+assignment lands in whichever tree happened to be created first, with no error
+anywhere.
+
+`settings.root_category_id` settles it, for both endpoints:
+
+```jsonc
+{
+  "products": [{"sku": "ABC-123", "categories": ["Shop/Men/Shirts"]}],
+  "settings": {"root_category_id": 29}
+}
+```
+
+Every path in the request then resolves under root 29 and nothing else. A path
+whose first segment does not name that root is **refused, not reparented** —
+the two statements contradict each other, and guessing which one was meant is
+how a subtree ends up in the wrong catalog.
+
+Leave it out and nothing changes: a unique root name resolves as it always has.
+
 ### Related, up-sell & cross-sell links
 
 A `links` block declares the product's merchandising links, each type an
@@ -768,7 +792,9 @@ does carry it — the category itself was found.)
 Two sibling categories sharing a name make a path ambiguous. Reads elsewhere in
 this module resolve that by taking the lowest `entity_id`; a *write* refuses —
 the entry is `skipped` with `ambiguous_path` and the candidate IDs in its
-message. Send `category_id` to disambiguate.
+message. Send `category_id` to disambiguate. (For two *roots* sharing a name,
+`root_category_id` does it without needing an ID for the category itself — see
+"Ordering, parents and roots".)
 
 ### Ordering, parents and roots
 
@@ -804,9 +830,31 @@ which point Magento regenerates that store's rewrites itself.
 Magento enforces no uniqueness on root names, so two roots can share one. As with
 sibling categories, a *write* to such a name refuses with `ambiguous_path` and the
 candidate IDs — both as the target and as the first segment of a deeper path —
-because the two roots are two different catalogs. Send `category_id` to pick one.
+because the two roots are two different catalogs.
+
+**`root_category_id` picks one.** On `settings` it pins every path in the
+request; on an entry it pins that entry alone and wins over the request's, for a
+payload spanning several trees. It is the only disambiguator available on a
+first run, when no `category_id` has been recorded yet:
+
+```jsonc
+{
+  "categories": [
+    {"path": "Shop/Men", "root_category_id": 29},
+    {"path": "Outdoor/Tents", "root_category_id": 33}
+  ],
+  "settings": {"root_category_id": 29}
+}
+```
+
+A pin is checked against the name it claims: a path starting `Shop` under a pin
+naming a root called `Outdoor` is `unknown_root`, not a silent reparent. A pin
+that is not a root category at all is the same refusal. Sending `category_id`
+still works and still wins — it identifies the row outright.
+
 Reads elsewhere in the module (product-import path resolution) still take the
-lowest `entity_id`.
+lowest `entity_id` when no pin is given; the product endpoint accepts the same
+`settings.root_category_id` to stop relying on that.
 
 If an entry renames a category at default scope, any later entry in the same
 request whose path runs through the old name is `skipped` with
@@ -1264,7 +1312,9 @@ base for a step that should be registered but inert until it is written.
   plugins and observers DO run for them.
 - Duplicate sibling category names are ambiguous. Path resolution for a *read*
   (product→category assignment) picks the lowest entity_id, deterministically;
-  the category sync endpoint refuses to guess and reports `ambiguous_path`. It
+  the category sync endpoint refuses to guess and reports `ambiguous_path`. When
+  the duplicate is at the *root*, `settings.root_category_id` (both endpoints)
+  or a per-entry `root_category_id` (category endpoint) settles it outright. It
   also refuses to *create* the situation: a move or rename that would land a
   category on a sibling's name is `destination_name_taken`, because
   `catalog_category_entity` has no unique key on `(parent_id, name)` and the write

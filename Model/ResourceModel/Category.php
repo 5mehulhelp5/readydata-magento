@@ -41,24 +41,15 @@ class Category
     }
 
     /**
-     * Level-1 roots (children of the tree root): store-0 name => entity_id.
-     * On duplicate names the lowest entity_id wins, deterministically.
+     * Level-1 roots (children of the tree root): store-0 name => entity_id[].
      *
-     * @return array<string, int>
-     */
-    public function getRootCategories(): array
-    {
-        return array_map(
-            static fn (array $ids): int => $ids[0],
-            $this->getRootCategoryIds()
-        );
-    }
-
-    /**
-     * Like {@see getRootCategories()} but keeps EVERY id per name, for the same
-     * reason {@see getChildIdsByParentIds()} does: a read can take the lowest
+     * EVERY id per name is kept, for the same reason
+     * {@see getChildIdsByParentIds()} does: a read can take the lowest
      * entity_id, a write cannot — two roots sharing a name are two distinct
-     * catalogs, and core enforces no uniqueness on root names.
+     * catalogs, and core enforces no uniqueness on root names. Collapsing them
+     * here would throw away the only evidence that the name is ambiguous, and
+     * the only way to check a caller's `root_category_id` against the name it
+     * claims.
      *
      * @return array<string, int[]> store-0 name => entity_id[], ascending
      */

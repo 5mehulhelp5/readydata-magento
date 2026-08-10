@@ -104,7 +104,7 @@ class CategoryLinkProcessor implements ProcessorInterface
             return;
         }
 
-        $pathResults = $this->pathResolver->resolvePaths($uniquePaths);
+        $pathResults = $this->pathResolver->resolvePaths($uniquePaths, $context->getRootCategoryId());
         $validIds = $this->pathResolver->validateIds(array_keys($uniqueIds));
         $currentAssignments = $this->categoryLink->getAssignments(
             array_column($refsBySku, 'entity_id')
