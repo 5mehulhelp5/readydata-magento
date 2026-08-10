@@ -22,6 +22,9 @@ namespace ReadyData\Import\Api\Data;
  * categories, links, media, stock, tier prices) has no store dimension and
  * stays on the product itself.
  *
+ * A `url_key` here is a real store-scoped slug: that store view's rewrites are
+ * generated from it, and the others keep the default one.
+ *
  * @api
  */
 interface ProductStoreValuesInterface
@@ -132,16 +135,10 @@ interface ProductStoreValuesInterface
      * Additional EAV attribute values for this scope, as code/value pairs —
      * the same shape as the product's own custom_attributes.
      *
-     * Two attributes are refused here with a per-product message rather than
-     * written, because writing them would do something other than what the
-     * block says:
-     *
-     *  - **global attributes** (`is_global = 1`) have no store dimension, so
-     *    the value would land at the default scope and overwrite the product's
-     *    own default-scope value from inside a block that named one store view;
-     *  - **url_key**, because the storefront URL comes from `url_rewrite` and
-     *    those rows are still generated from the default-scope key — a
-     *    store-scoped key would be stored and then not used.
+     * **Global attributes** (`is_global = 1`) are refused here with a
+     * per-product message rather than written: they have no store dimension, so
+     * the value would land at the default scope and overwrite the product's own
+     * default-scope value from inside a block that named one store view.
      *
      * @return \ReadyData\Import\Api\Data\CustomAttributeInterface[]|null
      */

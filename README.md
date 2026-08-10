@@ -110,9 +110,6 @@ Guards, each a per-product message (prefixed `[store N]`) and never fatal:
   dimension, the value would land at store 0 and overwrite the product's own
   default-scope value from inside a block that named one store view. Send them
   on the product.
-- **`url_key` is refused in a block.** The storefront URL comes from
-  `url_rewrite`, and those rows are still generated from the default-scope key,
-  so a scoped key would be stored and never used.
 - **An unknown store view skips that block only** — one bad scope does not cost
   the product its other scopes, or its default-scope write.
 - **A block naming the request's own scope merges into it**, the block winning
@@ -123,8 +120,26 @@ Guards, each a per-product message (prefixed `[store N]`) and never fatal:
 A block never generates the store-0 fallback row a new product gets: the
 default scope is what the product itself carries, and copying a translation
 into it would make one store view's text the value every other store view
-inherits. It also never generates a `url_key` — a generated slug is the
-product's identity on the storefront, not a per-store translation.
+inherits. It also never *generates* a `url_key` — a generated slug is the
+product's identity on the storefront, not a per-store translation — though an
+explicit one is written and used (below).
+
+#### Store-scoped URL keys
+
+A `url_key` in a block is a real per-store slug: that store view's rewrites —
+canonical and category-path alike — are built from it, and every other store
+keeps the default one. The default-scope key is still what decides whether a
+product gets rewrites at all; a store override with nothing to override is not
+a slug.
+
+An override already in the database is honoured even when the payload does not
+mention it. Regenerating a store's rewrite from the default key would discard
+it — including one an earlier run of this module wrote, which would make a
+replay flip the storefront URL back and forth. The batch's own scoped key wins
+over the stored one, being the newer value.
+
+Conflict resolution, 301 history and the not-visible cleanup were already
+per store and are unchanged.
 
 ### Clearing attribute values
 
@@ -145,8 +160,8 @@ Guards (each a per-product warning in `results[].messages`, never fatal):
 unknown and static attributes are skipped; required attributes cannot be
 cleared at the default scope; when the same attribute is both written and
 cleared **in the same scope**, the write wins. A clear in a block is subject to
-the same refusals a write there is (global attributes, `url_key`). Clearing
-`url_key` does not remove existing URL rewrites.
+the same refusal a write there is (global attributes). Clearing `url_key` does
+not remove existing URL rewrites.
 
 ### Category assignments
 
@@ -1215,8 +1230,9 @@ one per subtree per request (see "Moving a category").
 - Stock: legacy `cataloginventory_stock_item` + MSI `inventory_source_item`
   when MSI is installed.
 - URL rewrites: generates `url_key` from the name when absent, regenerates
-  direct product rewrites per store, with a configurable conflict strategy
-  (append suffix / skip / error).
+  direct product rewrites per store — each from that store's own `url_key`
+  where it has one — with a configurable conflict strategy (append suffix /
+  skip / error).
 - Indexing: partial reindex of affected IDs (default), invalidate, or none.
   Indexers in "Update by Schedule" mode are left to mview (DB triggers pick
   up direct writes). FPC tags of touched products are cleaned.

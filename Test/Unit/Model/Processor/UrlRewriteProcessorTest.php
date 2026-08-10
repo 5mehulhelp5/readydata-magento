@@ -73,6 +73,16 @@ class UrlRewriteProcessorTest extends TestCase
         $this->categoryLink = $this->createMock(CategoryLink::class);
         $this->categoryPathRewriteBuilder = $this->createMock(CategoryPathRewriteBuilder::class);
 
+        $this->rebuildProcessor();
+    }
+
+    /**
+     * Rebuilds the processor from the current collaborators, so a test can swap
+     * one out first — a mock's stubs cannot be replaced once set, and the
+     * per-store tests need a different store list or EAV reader than setUp's.
+     */
+    private function rebuildProcessor(): void
+    {
         $this->processor = new UrlRewriteProcessor(
             $this->urlRewriteResource,
             $this->eavValue,
@@ -100,6 +110,118 @@ class UrlRewriteProcessorTest extends TestCase
         self::assertSame('shared-key-8816.html', $pathsByEntity[8816]);
         self::assertSame([], $context->getMessages('SKU-A'));
         self::assertStringContainsString('is taken in store 1', $context->getMessages('SKU-B')[0]);
+    }
+
+    /**
+     * The point of the whole phase: a store view that has its own slug resolves
+     * on it, while its neighbours keep the default one.
+     */
+    public function testEachStoreGetsARequestPathBuiltFromItsOwnUrlKey(): void
+    {
+        $this->storeWebsiteMap = $this->createMock(StoreWebsiteMap::class);
+        $this->storeWebsiteMap->method('getStoreIdsForWebsites')->willReturn([1, 2]);
+        $this->urlRewriteResource->method('isCategoryRewritesEnabled')->willReturn(false);
+        $this->rebuildProcessor();
+
+        $context = $this->createContext(['SKU-A' => 42], urlKey: 'white-shirt');
+        $context->set(EavValueProcessor::CONTEXT_URL_KEYS, [
+            'SKU-A' => [0 => 'white-shirt', 2 => 'weisses-hemd'],
+        ]);
+
+        $this->processor->process($context);
+
+        self::assertNotNull($this->replaced);
+        $pathsByStore = [];
+        foreach ($this->replaced['rows'] as $row) {
+            $pathsByStore[$row['store_id']] = $row['request_path'];
+        }
+        self::assertSame(['white-shirt.html', 'weisses-hemd.html'], [$pathsByStore[1], $pathsByStore[2]]);
+    }
+
+    /**
+     * A store override this batch did not write is still the slug that store
+     * resolves on. Regenerating its rewrite from the default key would discard
+     * the override — including one an earlier run of this module wrote, making
+     * a replay flip the storefront URL back and forth.
+     */
+    public function testAStoredStoreOverrideSurvivesADefaultScopeOnlyPayload(): void
+    {
+        $this->storeWebsiteMap = $this->createMock(StoreWebsiteMap::class);
+        $this->storeWebsiteMap->method('getStoreIdsForWebsites')->willReturn([1, 2]);
+        $this->urlRewriteResource->method('isCategoryRewritesEnabled')->willReturn(false);
+        $this->attributeMetadataCache->method('get')->willReturnCallback(
+            static fn (string $code): ?array => $code === 'url_key'
+                ? ['attribute_id' => 97, 'attribute_code' => 'url_key', 'backend_type' => 'varchar']
+                : null
+        );
+        $this->eavValue = $this->createMock(EavValue::class);
+        $this->eavValue->method('getValues')->willReturnCallback(
+            // Only store 2 carries an override; store 1 falls back to default.
+            static fn (string $type, int $attributeId, array $linkIds, int $storeId = 0): array =>
+                $storeId === 2 ? [77 => 'weisses-hemd'] : []
+        );
+        $this->rebuildProcessor();
+
+        $context = $this->createContext(['SKU-A' => 42], urlKey: 'white-shirt', linkIds: ['SKU-A' => 77]);
+
+        $this->processor->process($context);
+
+        self::assertNotNull($this->replaced);
+        $pathsByStore = [];
+        foreach ($this->replaced['rows'] as $row) {
+            $pathsByStore[$row['store_id']] = $row['request_path'];
+        }
+        self::assertSame(['white-shirt.html', 'weisses-hemd.html'], [$pathsByStore[1], $pathsByStore[2]]);
+    }
+
+    public function testTheBatchesOwnScopedKeyWinsOverTheStoredOne(): void
+    {
+        $this->storeWebsiteMap = $this->createMock(StoreWebsiteMap::class);
+        $this->storeWebsiteMap->method('getStoreIdsForWebsites')->willReturn([2]);
+        $this->urlRewriteResource->method('isCategoryRewritesEnabled')->willReturn(false);
+        $this->attributeMetadataCache->method('get')->willReturnCallback(
+            static fn (string $code): ?array => $code === 'url_key'
+                ? ['attribute_id' => 97, 'attribute_code' => 'url_key', 'backend_type' => 'varchar']
+                : null
+        );
+        $this->eavValue = $this->createMock(EavValue::class);
+        $this->eavValue->method('getValues')->willReturn([77 => 'stale-slug']);
+        $this->rebuildProcessor();
+
+        $context = $this->createContext(['SKU-A' => 42], urlKey: 'white-shirt', linkIds: ['SKU-A' => 77]);
+        $context->set(EavValueProcessor::CONTEXT_URL_KEYS, [
+            'SKU-A' => [0 => 'white-shirt', 2 => 'fresh-slug'],
+        ]);
+
+        $this->processor->process($context);
+
+        self::assertSame('fresh-slug.html', $this->replaced['rows'][0]['request_path']);
+    }
+
+    public function testCategoryPathRewritesUseTheStoresOwnUrlKey(): void
+    {
+        $this->storeWebsiteMap = $this->createMock(StoreWebsiteMap::class);
+        $this->storeWebsiteMap->method('getStoreIdsForWebsites')->willReturn([1, 2]);
+        $this->urlRewriteResource->method('isCategoryRewritesEnabled')->willReturn(true);
+        $this->categoryLink->method('getAssignments')->willReturn([42 => [5]]);
+        $seenKeys = [];
+        $this->categoryPathRewriteBuilder->method('build')->willReturnCallback(
+            function (array $assignments, array $urlKeyByEntity, int $storeId) use (&$seenKeys): array {
+                $seenKeys[$storeId] = $urlKeyByEntity[42] ?? null;
+
+                return [];
+            }
+        );
+        $this->rebuildProcessor();
+
+        $context = $this->createContext(['SKU-A' => 42], urlKey: 'white-shirt');
+        $context->set(EavValueProcessor::CONTEXT_URL_KEYS, [
+            'SKU-A' => [0 => 'white-shirt', 2 => 'weisses-hemd'],
+        ]);
+
+        $this->processor->process($context);
+
+        self::assertSame([1 => 'white-shirt', 2 => 'weisses-hemd'], $seenKeys);
     }
 
     public function testCanonicalOnlyWhenCategoryRewritesDisabled(): void
@@ -239,7 +361,7 @@ class UrlRewriteProcessorTest extends TestCase
         $websiteIds = [];
         foreach ($rows as $sku => [$entityId, $urlKey]) {
             $products[] = (new Product())->setSku((string)$sku);
-            $urlKeys[$sku] = $urlKey;
+            $urlKeys[$sku] = [0 => $urlKey];
             $websiteIds[$sku] = [1];
         }
 
@@ -264,7 +386,7 @@ class UrlRewriteProcessorTest extends TestCase
         $websiteIds = [];
         foreach ($entityIdsBySku as $sku => $entityId) {
             $products[] = (new Product())->setSku((string)$sku);
-            $urlKeys[$sku] = $urlKey;
+            $urlKeys[$sku] = [0 => $urlKey];
             $websiteIds[$sku] = [1];
         }
 

@@ -447,16 +447,48 @@ class EavValueProcessorTest extends TestCase
         );
     }
 
-    public function testUrlKeyInAScopedBlockIsRefused(): void
+    public function testAScopedUrlKeyIsWrittenAndPublishedUnderItsStore(): void
     {
-        $context = $this->createContext([], storeValues: [$this->block(3, ['url_key' => 'winterjacke'])]);
+        $context = $this->createContext(
+            ['url_key' => 'winter-jacket'],
+            storeValues: [$this->block(3, ['url_key' => 'winterjacke'])]
+        );
 
         $this->processor->process($context);
 
-        self::assertSame([], $this->upserts);
-        self::assertStringContainsString(
-            '[store 3] Attribute "url_key" cannot be set per store view',
-            $context->getMessages('SKU-1')[0]
+        self::assertSame(
+            [['varchar', [
+                ['entity_id' => 10, 'attribute_id' => 97, 'store_id' => 0, 'value' => 'winter-jacket'],
+                ['entity_id' => 10, 'attribute_id' => 97, 'store_id' => 3, 'value' => 'winterjacke'],
+            ]]],
+            $this->upserts
+        );
+        // Keyed by the store row each key landed in — UrlRewriteProcessor builds
+        // each store's request path from its own slug.
+        self::assertSame(
+            ['SKU-1' => [0 => 'winter-jacket', 3 => 'winterjacke']],
+            $context->get(EavValueProcessor::CONTEXT_URL_KEYS)
+        );
+        self::assertSame([], $context->getMessages('SKU-1'));
+    }
+
+    /**
+     * A website-scoped url_key would fan out; the published map has to record
+     * every row it actually wrote, not the scope that asked for it.
+     */
+    public function testTheUrlKeyMapRecordsEveryStoreRowTheValueLandedIn(): void
+    {
+        $this->storeWebsiteMap->method('getWebsiteStoreIds')->with(3)->willReturn([2, 3]);
+        $context = $this->createContext([], storeId: 3, existing: false);
+        $context->getProduct('SKU-1')?->setUrlKey('jacket');
+
+        $this->processor->process($context);
+
+        // Store-scoped attribute at request scope 3, plus the new-product
+        // default-scope fallback row.
+        self::assertSame(
+            ['SKU-1' => [3 => 'jacket', 0 => 'jacket']],
+            $context->get(EavValueProcessor::CONTEXT_URL_KEYS)
         );
     }
 

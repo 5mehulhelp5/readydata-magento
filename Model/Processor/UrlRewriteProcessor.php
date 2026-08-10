@@ -54,11 +54,13 @@ class UrlRewriteProcessor implements ProcessorInterface
         $strategy = $this->config->getUrlRewriteConflictStrategy();
 
         // sku => [store ids] for products with a url_key and a resolved entity.
+        // The DEFAULT-scope key is what decides whether a product has one at
+        // all: a store override with nothing to override is not a slug.
         $storeIdsBySku = [];
         $skuByEntity = [];
         foreach (array_keys($context->getValidProducts()) as $sku) {
             $entityId = $context->getEntityId($sku);
-            if (!isset($urlKeys[$sku]) || $urlKeys[$sku] === '' || $entityId === null) {
+            if (($urlKeys[$sku][0] ?? '') === '' || $entityId === null) {
                 continue;
             }
             $storeIdsBySku[$sku] = $this->storeWebsiteMap->getStoreIdsForWebsites($websiteIdsBySku[$sku] ?? []);
@@ -69,6 +71,9 @@ class UrlRewriteProcessor implements ProcessorInterface
         }
 
         $allStoreIds = array_values(array_unique(array_merge(...array_values($storeIdsBySku))));
+        // Only knowable once the stores are: a store override this batch did
+        // not write is still the slug that store's rewrite must be built from.
+        $urlKeys = $this->backfillScopedUrlKeys($context, $urlKeys, $allStoreIds);
         $visibility = $this->loadVisibility(array_values($linkIds), $allStoreIds);
 
         // Canonical candidates + per-store visible-entity sets + not-visible sets.
@@ -90,7 +95,8 @@ class UrlRewriteProcessor implements ProcessorInterface
                     'sku' => (string)$sku,
                     'entity_id' => $entityId,
                     'store_id' => $storeId,
-                    'request_path' => $urlKeys[$sku] . $this->urlRewriteResource->getProductUrlSuffix($storeId),
+                    'request_path' => self::urlKeyFor($urlKeys, (string)$sku, $storeId)
+                        . $this->urlRewriteResource->getProductUrlSuffix($storeId),
                     'target_path' => 'catalog/product/view/id/' . $entityId,
                     'metadata' => null,
                     'category_key' => self::CANONICAL_KEY,
@@ -181,7 +187,7 @@ class UrlRewriteProcessor implements ProcessorInterface
      * only. Uses the final assignments written by CategoryLinkProcessor.
      *
      * @param array<int, string> $skuByEntity
-     * @param array<string, string> $urlKeys sku => url_key
+     * @param array<string, array<int, string>> $urlKeys sku => store_id => url_key
      * @param array<int, array<int, true>> $visibleEntitiesByStore store => entity set
      * @return array<int, array<string, mixed>> flat candidate list
      */
@@ -204,18 +210,20 @@ class UrlRewriteProcessor implements ProcessorInterface
             return [];
         }
 
-        $urlKeyByEntity = [];
-        foreach ($skuByEntity as $entityId => $sku) {
-            if (isset($urlKeys[$sku]) && $urlKeys[$sku] !== '') {
-                $urlKeyByEntity[$entityId] = $urlKeys[$sku];
-            }
-        }
-
         $candidates = [];
         foreach ($enabledStores as $storeId) {
             $visibleAssignments = array_intersect_key($assignments, $visibleEntitiesByStore[$storeId]);
             if (!$visibleAssignments) {
                 continue;
+            }
+            // Rebuilt per store: the slug a category path is suffixed with is
+            // the one that store view resolves on, not the default one.
+            $urlKeyByEntity = [];
+            foreach ($skuByEntity as $entityId => $sku) {
+                $urlKey = self::urlKeyFor($urlKeys, $sku, $storeId);
+                if ($urlKey !== '') {
+                    $urlKeyByEntity[$entityId] = $urlKey;
+                }
             }
             $built = $this->categoryPathRewriteBuilder->build(
                 $visibleAssignments,
@@ -338,10 +346,25 @@ class UrlRewriteProcessor implements ProcessorInterface
     }
 
     /**
-     * url_keys written this batch (from EavValueProcessor), backfilled with
-     * the stored url_key for existing products the payload didn't touch.
+     * The slug a store view resolves this product on: its own override when it
+     * has one, the default-scope key otherwise — exactly how Magento reads a
+     * store-scoped EAV value.
      *
-     * @return array<string, string> sku => url_key
+     * @param array<string, array<int, string>> $urlKeys sku => store_id => url_key
+     */
+    private static function urlKeyFor(array $urlKeys, string $sku, int $storeId): string
+    {
+        $scoped = $urlKeys[$sku][$storeId] ?? '';
+
+        return $scoped !== '' ? $scoped : ($urlKeys[$sku][0] ?? '');
+    }
+
+    /**
+     * Default-scope url_keys written this batch (from EavValueProcessor),
+     * backfilled with the stored one for existing products the payload didn't
+     * touch.
+     *
+     * @return array<string, array<int, string>> sku => store_id => url_key
      */
     private function resolveUrlKeys(BatchContext $context): array
     {
@@ -350,7 +373,7 @@ class UrlRewriteProcessor implements ProcessorInterface
 
         $missingLinkIds = [];
         foreach ($context->getValidProducts() as $sku => $product) {
-            if (!isset($urlKeys[$sku]) && isset($linkIds[$sku])) {
+            if (!isset($urlKeys[$sku][0]) && isset($linkIds[$sku])) {
                 $missingLinkIds[$linkIds[$sku]] = $sku;
             }
         }
@@ -359,7 +382,58 @@ class UrlRewriteProcessor implements ProcessorInterface
             if ($meta !== null) {
                 $stored = $this->eavValue->getValues('varchar', $meta['attribute_id'], array_keys($missingLinkIds));
                 foreach ($stored as $linkId => $urlKey) {
-                    $urlKeys[$missingLinkIds[(int)$linkId]] = (string)$urlKey;
+                    $urlKeys[$missingLinkIds[(int)$linkId]][0] = (string)$urlKey;
+                }
+            }
+        }
+
+        return $urlKeys;
+    }
+
+    /**
+     * Fill in the STORE-scoped url_keys already in the database for the (sku,
+     * store) pairs this batch did not write.
+     *
+     * Without it a payload that sets only the default key would regenerate
+     * every store's rewrite from that key, silently discarding a store
+     * override — including one this module wrote on an earlier run, which would
+     * make a replay flip the storefront URL back and forth.
+     *
+     * @param array<string, array<int, string>> $urlKeys
+     * @param int[] $storeIds
+     * @return array<string, array<int, string>>
+     */
+    private function backfillScopedUrlKeys(BatchContext $context, array $urlKeys, array $storeIds): array
+    {
+        $linkIds = $context->get(EntityProcessor::CONTEXT_LINK_IDS, []);
+        $meta = $this->attributeMetadataCache->get('url_key');
+        $storeIds = array_values(array_filter($storeIds, static fn (int $storeId): bool => $storeId !== 0));
+        if ($meta === null || !$storeIds || !$linkIds) {
+            return $urlKeys;
+        }
+
+        $skuByLinkId = [];
+        foreach ($context->getValidProducts() as $sku => $product) {
+            if (isset($linkIds[$sku])) {
+                $skuByLinkId[$linkIds[$sku]] = (string)$sku;
+            }
+        }
+        if (!$skuByLinkId) {
+            return $urlKeys;
+        }
+
+        foreach ($storeIds as $storeId) {
+            $stored = $this->eavValue->getValues(
+                'varchar',
+                $meta['attribute_id'],
+                array_keys($skuByLinkId),
+                $storeId
+            );
+            foreach ($stored as $linkId => $urlKey) {
+                $sku = $skuByLinkId[(int)$linkId] ?? null;
+                // Never over the batch's own write: that is the newer value.
+                if ($sku !== null && !isset($urlKeys[$sku][$storeId]) && (string)$urlKey !== '') {
+                    $urlKeys[$sku][$storeId] = (string)$urlKey;
                 }
             }
         }

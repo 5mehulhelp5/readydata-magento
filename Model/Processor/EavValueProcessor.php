@@ -28,8 +28,9 @@ use ReadyData\Import\Model\UrlKeyGenerator;
  * being addressed, not which rows a website-scoped attribute fans out to.
  *
  * Publishes to the context data bag:
- *  - "url_keys": array<string sku, string> url_key written in this batch
- *    (provided or generated); consumed by UrlRewriteProcessor.
+ *  - "url_keys": array<string sku, array<int store_id, string>> every url_key
+ *    written in this batch, keyed by the store row it landed in (provided or
+ *    generated); consumed by UrlRewriteProcessor.
  */
 class EavValueProcessor implements ProcessorInterface
 {
@@ -64,10 +65,6 @@ class EavValueProcessor implements ProcessorInterface
             }
 
             foreach ($this->collectScopes($context, $product) as $storeId => $scope) {
-                if ($scope['is_base'] && isset($scope['values']['url_key'])) {
-                    $urlKeys[$sku] = (string)$scope['values']['url_key'];
-                }
-
                 $this->collectClearKeys($context, $product, $scope, $storeId, $linkId, $deleteKeysByType);
                 $this->collectValueRows(
                     $context,
@@ -76,7 +73,8 @@ class EavValueProcessor implements ProcessorInterface
                     $storeId,
                     $linkId,
                     $linkField,
-                    $rowsByType
+                    $rowsByType,
+                    $urlKeys
                 );
             }
         }
@@ -159,6 +157,7 @@ class EavValueProcessor implements ProcessorInterface
      *
      * @param array{values: array<string, string|int|float>, clear: string[], is_base: bool} $scope
      * @param array<string, array<int, array<string, mixed>>> $rowsByType
+     * @param array<string, array<int, string>> $urlKeys sku => store_id => url_key
      */
     private function collectValueRows(
         BatchContext $context,
@@ -167,7 +166,8 @@ class EavValueProcessor implements ProcessorInterface
         int $scopeStoreId,
         int $linkId,
         string $linkField,
-        array &$rowsByType
+        array &$rowsByType,
+        array &$urlKeys
     ): void {
         $tag = $this->tag($scope, $scopeStoreId);
 
@@ -208,6 +208,12 @@ class EavValueProcessor implements ProcessorInterface
                     'store_id' => $storeId,
                     'value' => $prepared,
                 ];
+                // Recorded per store row rather than per scope: a website-scoped
+                // attribute fans out, and a new product's default-scope fallback
+                // means the base pass can write two rows from one value.
+                if ($meta['attribute_code'] === 'url_key') {
+                    $urlKeys[$sku][$storeId] = (string)$prepared;
+                }
             }
             if ($tag !== null) {
                 $context->markScopeApplied($sku, $tag);
@@ -283,29 +289,14 @@ class EavValueProcessor implements ProcessorInterface
     /**
      * Whether an attribute may be addressed from a `store_values` block at all.
      *
-     * Both refusals exist because writing the value would do something other
-     * than what the block says, and both are reported rather than silent:
-     *
-     *  - a **global** attribute has no store dimension, so the value would land
-     *    at the default scope — overwriting the product's own default-scope
-     *    value from inside a block that named one store view;
-     *  - **url_key** would be stored and then not used: the storefront URL
-     *    comes from `url_rewrite`, and those rows are still generated from the
-     *    default-scope key (UrlRewriteProcessor), so the store view would keep
-     *    resolving on the default key while the EAV row said otherwise.
+     * The refusal exists because writing the value would do something other
+     * than what the block says, and it is reported rather than silent: a
+     * **global** attribute has no store dimension, so the value would land at
+     * the default scope — overwriting the product's own default-scope value
+     * from inside a block that named one store view.
      */
     private function isScopable(BatchContext $context, string $sku, int $scopeStoreId, array $meta): bool
     {
-        if ($meta['attribute_code'] === 'url_key') {
-            $context->addMessage(
-                $sku,
-                'Attribute "url_key" cannot be set per store view: the storefront URL is generated from the'
-                . ' default-scope key, so a scoped one would be stored and never used. Send it on the product.',
-                $scopeStoreId
-            );
-
-            return false;
-        }
         if ($meta['is_global'] === self::SCOPE_GLOBAL) {
             $context->addMessage(
                 $sku,
