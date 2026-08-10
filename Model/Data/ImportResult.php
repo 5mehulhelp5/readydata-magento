@@ -14,6 +14,7 @@ class ImportResult implements ImportResultInterface
     private ?int $entityId = null;
     private string $status = self::STATUS_ERROR;
     private array $messages = [];
+    private ?array $storeResults = null;
 
     public function getSku(): string
     {
@@ -56,6 +57,17 @@ class ImportResult implements ImportResultInterface
     public function setMessages(array $messages): ImportResultInterface
     {
         $this->messages = $messages;
+        return $this;
+    }
+
+    public function getStoreResults(): ?array
+    {
+        return $this->storeResults;
+    }
+
+    public function setStoreResults(array $storeResults): ImportResultInterface
+    {
+        $this->storeResults = $storeResults;
         return $this;
     }
 }

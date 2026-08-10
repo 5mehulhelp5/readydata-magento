@@ -8,6 +8,7 @@ namespace ReadyData\Import\Model;
 
 use ReadyData\Import\Api\Data\ImportResultInterface;
 use ReadyData\Import\Api\Data\ProductInterface;
+use ReadyData\Import\Api\Data\StoreResultInterface;
 
 /**
  * Shared, mutable state of a single import batch, passed through the
@@ -42,13 +43,25 @@ class BatchContext
      *
      * Kept structured rather than as flat strings because a scoped message
      * belongs to that scope's outcome, not to the product's: the response
-     * flattens them for now (see {@see getMessages()}), but per-scope results
-     * need them apart, and re-deriving the scope from a prefixed string later
-     * would be parsing our own output back.
+     * splits them by scope ({@see getScopeMessages()}), and re-deriving the
+     * scope from a prefixed string would be parsing our own output back.
      *
      * @var array<string, array<int, array{store_id: int|null, text: string}>>
      */
     private array $messages = [];
+
+    /**
+     * Store scopes a product carries BEYOND the request's own, and whether
+     * anything was actually written in each. The request's own scope is not in
+     * here — it is what the product's own status describes.
+     *
+     * Registered when the scope resolves rather than when it is written, so a
+     * scope whose every value was refused still reports itself (as skipped,
+     * carrying the refusals) instead of vanishing from the response.
+     *
+     * @var array<string, array<int, bool>> SKU => store ID => anything applied
+     */
+    private array $scopes = [];
 
     /**
      * @var array<string, mixed> free-form state shared between processors
@@ -179,8 +192,10 @@ class BatchContext
     }
 
     /**
-     * Every message for a product, scoped ones prefixed with the store they
-     * belong to so the flat response still says where each one came from.
+     * Every message for a product across all its scopes, scoped ones prefixed
+     * with the store they belong to. The combined view — the response reports
+     * per scope instead ({@see getScopeMessages()}), so this is for callers
+     * that want the lot in one list, and for reading a context back in tests.
      *
      * @return string[]
      */
@@ -209,6 +224,51 @@ class BatchContext
                 static fn (array $message): bool => $message['store_id'] === $storeId
             )
         ));
+    }
+
+    /**
+     * Note that the product carries values for this store scope, before
+     * anything has been written in it.
+     */
+    public function registerScope(string|int $sku, int $storeId): void
+    {
+        $this->scopes[$sku][$storeId] ??= false;
+    }
+
+    /**
+     * Note that something was actually written or cleared in a registered
+     * scope. A clear counts: the scope was applied, it just applied a removal.
+     */
+    public function markScopeApplied(string|int $sku, int $storeId): void
+    {
+        $this->scopes[$sku][$storeId] = true;
+    }
+
+    /**
+     * Store IDs the product carries scoped values for, in the order the
+     * payload named them.
+     *
+     * @return int[]
+     */
+    public function getScopeStoreIds(string|int $sku): array
+    {
+        return array_keys($this->scopes[$sku] ?? []);
+    }
+
+    /**
+     * Outcome of one scope in StoreResultInterface terms. A failed product
+     * fails every one of its scopes: the batch is one transaction, so nothing
+     * it wrote survives, in any scope.
+     */
+    public function getScopeStatus(string|int $sku, int $storeId): string
+    {
+        if ($this->isFailed($sku)) {
+            return StoreResultInterface::STATUS_ERROR;
+        }
+
+        return ($this->scopes[$sku][$storeId] ?? false)
+            ? StoreResultInterface::STATUS_WRITTEN
+            : StoreResultInterface::STATUS_SKIPPED;
     }
 
     /**

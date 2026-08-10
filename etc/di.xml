@@ -24,6 +24,8 @@
                 type="ReadyData\Import\Model\Data\ImportSettings"/>
     <preference for="ReadyData\Import\Api\Data\ImportResultInterface"
                 type="ReadyData\Import\Model\Data\ImportResult"/>
+    <preference for="ReadyData\Import\Api\Data\StoreResultInterface"
+                type="ReadyData\Import\Model\Data\StoreResult"/>
     <preference for="ReadyData\Import\Api\Data\ImportResponseInterface"
                 type="ReadyData\Import\Model\Data\ImportResponse"/>
 

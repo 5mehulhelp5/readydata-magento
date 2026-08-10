@@ -15,6 +15,8 @@ use ReadyData\Import\Api\Data\ImportResultInterface;
 use ReadyData\Import\Api\Data\ImportResultInterfaceFactory;
 use ReadyData\Import\Api\Data\ImportSettingsInterface;
 use ReadyData\Import\Api\Data\ProductInterface;
+use ReadyData\Import\Api\Data\StoreResultInterface;
+use ReadyData\Import\Api\Data\StoreResultInterfaceFactory;
 use ReadyData\Import\Logger\Logger;
 use ReadyData\Import\Model\Cache\StoreWebsiteMap;
 use ReadyData\Import\Model\Event\ImportEventDispatcher;
@@ -63,6 +65,7 @@ class ImportService
         private readonly ImportState $importState,
         private readonly ImportResponseInterfaceFactory $responseFactory,
         private readonly ImportResultInterfaceFactory $resultFactory,
+        private readonly StoreResultInterfaceFactory $storeResultFactory,
         private readonly Logger $logger,
         array $processors = []
     ) {
@@ -137,7 +140,7 @@ class ImportService
             $this->lockManager->unlock(self::TREE_WRITE_LOCK_NAME);
         }
 
-        $response = $this->buildResponse($received, $contexts, $startedAt);
+        $response = $this->buildResponse($received, $contexts, $storeId, $startedAt);
         $this->logger->info(sprintf(
             'Import finished: %d received, %d created, %d updated, %d failed in %d ms',
             $response->getReceived(),
@@ -271,10 +274,19 @@ class ImportService
     }
 
     /**
+     * The counters count PRODUCTS, not product-scopes: a product created with
+     * three localized value sets is one creation. Counting scopes would make
+     * every existing dashboard read four times too high the day a caller starts
+     * sending `store_values`.
+     *
      * @param BatchContext[] $contexts
      */
-    private function buildResponse(int $received, array $contexts, int $startedAt): ImportResponseInterface
-    {
+    private function buildResponse(
+        int $received,
+        array $contexts,
+        int $storeId,
+        int $startedAt
+    ): ImportResponseInterface {
         $results = [];
         $created = $updated = $failed = 0;
 
@@ -289,11 +301,17 @@ class ImportService
 
                 /** @var ImportResultInterface $result */
                 $result = $this->resultFactory->create();
+                // Only the product's own messages: a message raised writing one
+                // of its scopes rides that scope's result instead, so nothing is
+                // reported twice.
                 $result->setSku((string)$sku)
                     ->setStatus($status)
-                    ->setMessages($context->getMessages($sku));
+                    ->setMessages($context->getScopeMessages($sku, null));
                 if (($entityId = $context->getEntityId($sku)) !== null) {
                     $result->setEntityId($entityId);
+                }
+                if (($storeResults = $this->buildStoreResults($context, $sku)) !== []) {
+                    $result->setStoreResults($storeResults);
                 }
                 $results[] = $result;
             }
@@ -307,6 +325,29 @@ class ImportService
             ->setUpdated($updated)
             ->setFailed($failed)
             ->setElapsedMs((int)((hrtime(true) - $startedAt) / 1_000_000))
+            ->setStoreId($storeId)
             ->setResults($results);
+    }
+
+    /**
+     * One result per store scope the product's payload named beyond the
+     * request's own. Empty for a payload without `store_values`, which leaves
+     * the field off the response entirely.
+     *
+     * @return StoreResultInterface[]
+     */
+    private function buildStoreResults(BatchContext $context, string|int $sku): array
+    {
+        $storeResults = [];
+        foreach ($context->getScopeStoreIds($sku) as $scopeStoreId) {
+            /** @var StoreResultInterface $storeResult */
+            $storeResult = $this->storeResultFactory->create();
+            $storeResults[] = $storeResult
+                ->setStoreId($scopeStoreId)
+                ->setStatus($context->getScopeStatus($sku, $scopeStoreId))
+                ->setMessages($context->getScopeMessages($sku, $scopeStoreId));
+        }
+
+        return $storeResults;
     }
 }

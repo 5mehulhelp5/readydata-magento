@@ -18,6 +18,7 @@ interface ImportResponseInterface
     public const UPDATED = 'updated';
     public const FAILED = 'failed';
     public const ELAPSED_MS = 'elapsed_ms';
+    public const STORE_ID = 'store_id';
     public const RESULTS = 'results';
 
     /**
@@ -74,6 +75,24 @@ interface ImportResponseInterface
      * @return $this
      */
     public function setElapsedMs(int $elapsedMs): self;
+
+    /**
+     * The scope the request was actually run in, as the server resolved it
+     * from `settings` — 0 for the default scope. It is what every
+     * `results[].status` and every unscoped message is about, and it is what a
+     * caller attributing history rows needs, since `/rest/V1/...` resolves
+     * against the default store view rather than the admin scope and only
+     * `settings` overrides that.
+     *
+     * @return int
+     */
+    public function getStoreId(): int;
+
+    /**
+     * @param int $storeId
+     * @return $this
+     */
+    public function setStoreId(int $storeId): self;
 
     /**
      * @return \ReadyData\Import\Api\Data\ImportResultInterface[]

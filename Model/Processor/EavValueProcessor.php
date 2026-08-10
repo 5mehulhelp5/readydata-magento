@@ -147,6 +147,7 @@ class EavValueProcessor implements ProcessorInterface
                 continue;
             }
 
+            $context->registerScope($sku, $storeId);
             $scopes[$storeId] = ['values' => $values, 'clear' => $clear, 'is_base' => false];
         }
 
@@ -188,7 +189,7 @@ class EavValueProcessor implements ProcessorInterface
                 $context->addMessage(
                     $sku,
                     sprintf('Value "%s" for attribute "%s" could not be resolved; skipped.', $value, $code),
-                    $this->tag($scope, $scopeStoreId)
+                    $tag
                 );
                 continue;
             }
@@ -207,6 +208,9 @@ class EavValueProcessor implements ProcessorInterface
                     'store_id' => $storeId,
                     'value' => $prepared,
                 ];
+            }
+            if ($tag !== null) {
+                $context->markScopeApplied($sku, $tag);
             }
         }
     }
@@ -269,6 +273,9 @@ class EavValueProcessor implements ProcessorInterface
                     'attribute_id' => $meta['attribute_id'],
                     'store_id' => $storeId,
                 ];
+            }
+            if ($tag !== null) {
+                $context->markScopeApplied($sku, $tag);
             }
         }
     }

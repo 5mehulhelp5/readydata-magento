@@ -8,6 +8,7 @@ namespace ReadyData\Import\Test\Unit\Model\Processor;
 
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
+use ReadyData\Import\Api\Data\StoreResultInterface;
 use ReadyData\Import\Model\BatchContext;
 use ReadyData\Import\Model\Cache\AttributeMetadataCache;
 use ReadyData\Import\Model\Cache\StoreWebsiteMap;
@@ -571,6 +572,67 @@ class EavValueProcessorTest extends TestCase
         self::assertSame(['Unknown attribute "nonesuch" skipped.'], $context->getScopeMessages('SKU-1', null));
         self::assertCount(1, $context->getScopeMessages('SKU-1', 3));
         self::assertSame([], $context->getScopeMessages('SKU-1', 4));
+    }
+
+    public function testAScopeThatWroteSomethingReportsAsWritten(): void
+    {
+        $context = $this->createContext([], storeValues: [$this->block(3, ['store_note' => 'Hallo'])]);
+
+        $this->processor->process($context);
+
+        self::assertSame([3], $context->getScopeStoreIds('SKU-1'));
+        self::assertSame(StoreResultInterface::STATUS_WRITTEN, $context->getScopeStatus('SKU-1', 3));
+    }
+
+    public function testAScopeWhoseEveryValueWasRefusedReportsAsSkipped(): void
+    {
+        // Registered when it resolved, not when it was written — so a scope that
+        // ended up writing nothing still reports itself, carrying the refusal.
+        $context = $this->createContext([], storeValues: [$this->block(3, ['special_price' => '7.99'])]);
+
+        $this->processor->process($context);
+
+        self::assertSame([3], $context->getScopeStoreIds('SKU-1'));
+        self::assertSame(StoreResultInterface::STATUS_SKIPPED, $context->getScopeStatus('SKU-1', 3));
+        self::assertCount(1, $context->getScopeMessages('SKU-1', 3));
+    }
+
+    public function testAClearAloneCountsAsWritten(): void
+    {
+        $block = $this->block(3, []);
+        $block->setClearAttributes(['store_note']);
+        $context = $this->createContext([], storeValues: [$block]);
+
+        $this->processor->process($context);
+
+        self::assertSame(StoreResultInterface::STATUS_WRITTEN, $context->getScopeStatus('SKU-1', 3));
+    }
+
+    public function testAnUnresolvableScopeIsNotRegisteredAtAll(): void
+    {
+        // There is no store ID to report it under; the message stays on the
+        // product, which is where the caller will look for it.
+        $context = $this->createContext([], storeValues: [$this->block(99, ['store_note' => 'lost'])]);
+
+        $this->processor->process($context);
+
+        self::assertSame([], $context->getScopeStoreIds('SKU-1'));
+        self::assertCount(1, $context->getScopeMessages('SKU-1', null));
+    }
+
+    public function testTheRequestScopeIsNeverRegisteredAsAScopedResult(): void
+    {
+        // The base pass is what the product's own result describes; repeating it
+        // would have the caller record the same write twice.
+        $context = $this->createContext(
+            ['store_note' => 'from the product'],
+            storeId: 3,
+            storeValues: [$this->block(3, ['store_note' => 'from the block'])]
+        );
+
+        $this->processor->process($context);
+
+        self::assertSame([], $context->getScopeStoreIds('SKU-1'));
     }
 
     /**

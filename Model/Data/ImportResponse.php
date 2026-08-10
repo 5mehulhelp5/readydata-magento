@@ -15,7 +15,19 @@ class ImportResponse implements ImportResponseInterface
     private int $updated = 0;
     private int $failed = 0;
     private int $elapsedMs = 0;
+    private int $storeId = 0;
     private array $results = [];
+
+    public function getStoreId(): int
+    {
+        return $this->storeId;
+    }
+
+    public function setStoreId(int $storeId): ImportResponseInterface
+    {
+        $this->storeId = $storeId;
+        return $this;
+    }
 
     public function getReceived(): int
     {

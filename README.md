@@ -408,8 +408,59 @@ The two forms are told apart by the scheme.
   later run would trust.
 
 Response: summary counters (`received`, `created`, `updated`, `failed`,
-`elapsedMs`) plus a per-SKU `results` array with `status` and `messages`.
-Errors are per-product; a failing product does not abort the request.
+`elapsedMs`), the `store_id` the request actually ran in, and a per-SKU
+`results` array with `status`, `messages` and — when the product named scopes
+beyond the request's own — `store_results`. Errors are per-product; a failing
+product does not abort the request.
+
+### Scoped results
+
+```jsonc
+{
+  "received": 1, "created": 1, "updated": 0, "failed": 0,
+  "store_id": 0,                                  // the scope the request ran in
+  "results": [
+    {
+      "sku": "ABC-123", "entity_id": 42,
+      "status": "created",                        // the product, at store_id above
+      "messages": [],
+      "store_results": [
+        {"store_id": 3, "status": "written", "messages": []},
+        {"store_id": 5, "status": "skipped",
+         "messages": ["Attribute \"special_price\" is global and has no store dimension; …"]}
+      ]
+    }
+  ]
+}
+```
+
+The response's `store_id` is what `results[].status` and `results[].messages`
+are about. A caller cannot infer it — `/rest/V1/...` resolves against the
+default store view rather than the admin scope, and only `settings` overrides
+that — so it is echoed back rather than assumed.
+
+`store_results` holds **one entry per resolved `store_values` block**, in
+payload order. The request's own scope is deliberately not repeated there: the
+product result already is that scope's outcome, so a caller recording one
+history row per (product, scope) reads the product result plus this list with
+nothing described twice. The field is absent for a payload that named no
+scopes.
+
+A scope's `status` is one of:
+
+| Status | Meaning |
+| --- | --- |
+| `written` | Values or clears were applied in this scope. A clear alone counts — the scope applied a removal. |
+| `skipped` | The scope resolved but nothing was applied: every value it carried was refused (the messages say why), or the block named a scope and carried nothing. |
+| `error` | The product failed, so nothing survives in any of its scopes — a batch is one transaction. Never about the scope alone. |
+
+A message belongs to exactly one result: raised while writing a block, it is on
+that block's entry; otherwise on the product's. A block whose store view could
+not be resolved has no scope to report under, so it stays a product-level
+message.
+
+The counters count **products, not product-scopes**: a product created with
+three localized value sets is one `created`.
 
 ## Attribute definitions
 

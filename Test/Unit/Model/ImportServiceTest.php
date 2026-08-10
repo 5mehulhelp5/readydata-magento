@@ -14,6 +14,8 @@ use PHPUnit\Framework\TestCase;
 use ReadyData\Import\Api\Data\ImportResponseInterfaceFactory;
 use ReadyData\Import\Api\Data\ImportResultInterface;
 use ReadyData\Import\Api\Data\ImportResultInterfaceFactory;
+use ReadyData\Import\Api\Data\StoreResultInterface;
+use ReadyData\Import\Api\Data\StoreResultInterfaceFactory;
 use ReadyData\Import\Logger\Logger;
 use ReadyData\Import\Model\BatchContext;
 use ReadyData\Import\Model\BatchContextFactory;
@@ -22,6 +24,7 @@ use ReadyData\Import\Model\Config;
 use ReadyData\Import\Model\Data\ImportResponse;
 use ReadyData\Import\Model\Data\ImportResult;
 use ReadyData\Import\Model\Data\Product;
+use ReadyData\Import\Model\Data\StoreResult;
 use ReadyData\Import\Model\Event\ImportEventDispatcher;
 use ReadyData\Import\Model\ImportService;
 use ReadyData\Import\Model\ImportState;
@@ -185,10 +188,139 @@ class ImportServiceTest extends TestCase
         return $processor;
     }
 
+    public function testResponseEchoesTheScopeTheRequestActuallyRanIn(): void
+    {
+        // The caller cannot infer it: /rest/V1/... resolves against the default
+        // store view, and only `settings` overrides that.
+        $response = $this->serviceWith([], storeId: 3)->import([$this->product('P1')]);
+
+        self::assertSame(3, $response->getStoreId());
+    }
+
+    public function testProductWithoutScopedValuesReportsNoStoreResults(): void
+    {
+        $response = $this->serviceWith([])->import([$this->product('P1')]);
+
+        // Null, not [] — a payload that predates store_values gets back exactly
+        // the response shape it got before.
+        self::assertNull($response->getResults()[0]->getStoreResults());
+    }
+
+    public function testEachScopeGetsItsOwnResultInPayloadOrder(): void
+    {
+        $processor = $this->scopeWriter([
+            5 => ['applied' => true],
+            3 => ['applied' => false, 'message' => 'every value it carried was refused'],
+        ]);
+
+        $response = $this->serviceWith([$processor])->import([$this->product('P1')]);
+
+        $storeResults = $response->getResults()[0]->getStoreResults();
+        self::assertCount(2, $storeResults);
+        self::assertSame([5, 3], array_map(static fn ($r): int => $r->getStoreId(), $storeResults));
+        self::assertSame(StoreResultInterface::STATUS_WRITTEN, $storeResults[0]->getStatus());
+        self::assertSame([], $storeResults[0]->getMessages());
+        self::assertSame(StoreResultInterface::STATUS_SKIPPED, $storeResults[1]->getStatus());
+        self::assertSame(['every value it carried was refused'], $storeResults[1]->getMessages());
+    }
+
+    /**
+     * A message belongs to exactly one result — the scope's, if it has one.
+     * Reporting it in both places would double-count it in a caller that walks
+     * the product result and then its scopes.
+     */
+    public function testAMessageIsReportedOnceAndOnItsOwnScope(): void
+    {
+        $processor = $this->createMock(ProcessorInterface::class);
+        $processor->method('isEnabled')->willReturn(true);
+        $processor->method('getSortOrder')->willReturn(300);
+        $processor->method('process')->willReturnCallback(
+            static function (BatchContext $context): void {
+                $context->addMessage('P1', 'product-wide');
+                $context->registerScope('P1', 3);
+                $context->markScopeApplied('P1', 3);
+                $context->addMessage('P1', 'scoped', 3);
+            }
+        );
+
+        $result = $this->serviceWith([$processor])->import([$this->product('P1')])->getResults()[0];
+
+        self::assertSame(['product-wide'], $result->getMessages());
+        self::assertSame(['scoped'], $result->getStoreResults()[0]->getMessages());
+    }
+
+    public function testCountersCountProductsNotProductScopes(): void
+    {
+        $processor = $this->scopeWriter([
+            3 => ['applied' => true],
+            4 => ['applied' => true],
+            5 => ['applied' => true],
+        ]);
+
+        $response = $this->serviceWith([$processor])->import([$this->product('P1')]);
+
+        // One product created, not four. Counting scopes would quadruple every
+        // existing dashboard the day a caller starts sending store_values.
+        self::assertSame(1, $response->getReceived());
+        self::assertSame(1, $response->getCreated());
+        self::assertSame(0, $response->getFailed());
+        self::assertCount(3, $response->getResults()[0]->getStoreResults());
+    }
+
+    public function testAFailedProductFailsEveryOneOfItsScopes(): void
+    {
+        // The batch is one transaction: nothing it wrote survives, in any scope.
+        $processor = $this->createMock(ProcessorInterface::class);
+        $processor->method('isEnabled')->willReturn(true);
+        $processor->method('getSortOrder')->willReturn(300);
+        $processor->method('process')->willReturnCallback(
+            static function (BatchContext $context): void {
+                $context->registerScope('P1', 3);
+                $context->markScopeApplied('P1', 3);
+                $context->fail('P1', 'the entity row could not be written');
+            }
+        );
+
+        $response = $this->serviceWith([$processor])->import([$this->product('P1')]);
+
+        self::assertSame(1, $response->getFailed());
+        $result = $response->getResults()[0];
+        self::assertSame(ImportResultInterface::STATUS_ERROR, $result->getStatus());
+        self::assertSame(StoreResultInterface::STATUS_ERROR, $result->getStoreResults()[0]->getStatus());
+    }
+
+    /**
+     * A stand-in for EavValueProcessor: records the scopes a product carries and
+     * what happened in each, which is all buildResponse() reads.
+     *
+     * @param array<int, array{applied: bool, message?: string}> $scopes store ID => outcome
+     */
+    private function scopeWriter(array $scopes): ProcessorInterface&MockObject
+    {
+        $processor = $this->createMock(ProcessorInterface::class);
+        $processor->method('isEnabled')->willReturn(true);
+        $processor->method('getSortOrder')->willReturn(300);
+        $processor->method('process')->willReturnCallback(
+            static function (BatchContext $context) use ($scopes): void {
+                foreach ($scopes as $storeId => $outcome) {
+                    $context->registerScope('P1', $storeId);
+                    if ($outcome['applied']) {
+                        $context->markScopeApplied('P1', $storeId);
+                    }
+                    if (isset($outcome['message'])) {
+                        $context->addMessage('P1', $outcome['message'], $storeId);
+                    }
+                }
+            }
+        );
+
+        return $processor;
+    }
+
     /**
      * @param ProcessorInterface[] $processors
      */
-    private function serviceWith(array $processors): ImportService
+    private function serviceWith(array $processors, int $storeId = 0): ImportService
     {
         $config = $this->createMock(Config::class);
         $config->method('isEnabled')->willReturn(true);
@@ -204,12 +336,14 @@ class ImportServiceTest extends TestCase
         );
 
         $storeWebsiteMap = $this->createMock(StoreWebsiteMap::class);
-        $storeWebsiteMap->method('resolveScopeStoreId')->willReturn(0);
+        $storeWebsiteMap->method('resolveScopeStoreId')->willReturn($storeId);
 
         $responseFactory = $this->createMock(ImportResponseInterfaceFactory::class);
         $responseFactory->method('create')->willReturnCallback(static fn (): ImportResponse => new ImportResponse());
         $resultFactory = $this->createMock(ImportResultInterfaceFactory::class);
         $resultFactory->method('create')->willReturnCallback(static fn (): ImportResult => new ImportResult());
+        $storeResultFactory = $this->createMock(StoreResultInterfaceFactory::class);
+        $storeResultFactory->method('create')->willReturnCallback(static fn (): StoreResult => new StoreResult());
 
         return new ImportService(
             $config,
@@ -222,6 +356,7 @@ class ImportServiceTest extends TestCase
             $this->createMock(ImportState::class),
             $responseFactory,
             $resultFactory,
+            $storeResultFactory,
             $this->logger,
             $processors
         );
