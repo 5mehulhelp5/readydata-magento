@@ -71,6 +71,13 @@
                         <field id="enabled">1</field>
                     </depends>
                 </field>
+                <!-- Deliberately NOT dependent on "enabled": this governs the product
+                     endpoint's "categories" field, not the category sync endpoint. -->
+                <field id="replace_scope" translate="label comment" type="select" sortOrder="40" showInDefault="1">
+                    <label>Product Category Replacement Reaches</label>
+                    <comment>How far the PRODUCT payload's "categories" field reaches when it replaces a product's assignments. Whole Catalog (default) removes every link the payload does not list. Only the Roots the Payload Names removes links only under the root categories the payload's own entries resolve into, leaving other root trees alone — the setting for a catalog whose root trees are fed by different sources. A payload may override this per product with "categories_replace_scope".</comment>
+                    <source_model>ReadyData\Import\Model\Config\Source\CategoryReplaceScope</source_model>
+                </field>
             </group>
             <group id="media" translate="label" type="text" sortOrder="27" showInDefault="1">
                 <label>Media Gallery</label>

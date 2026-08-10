@@ -11,24 +11,52 @@ use PHPUnit\Framework\TestCase;
 use ReadyData\Import\Model\BatchContext;
 use ReadyData\Import\Model\Cache\CategoryPathResolver;
 use ReadyData\Import\Model\Category\PathParser;
+use ReadyData\Import\Model\Config;
 use ReadyData\Import\Model\Data\Product;
 use ReadyData\Import\Model\Processor\CategoryLinkProcessor;
+use ReadyData\Import\Model\ResourceModel\Category as CategoryResource;
 use ReadyData\Import\Model\ResourceModel\CategoryLink;
 
 class CategoryLinkProcessorTest extends TestCase
 {
     private CategoryLink&MockObject $categoryLink;
     private CategoryPathResolver&MockObject $pathResolver;
+    private CategoryResource&MockObject $categoryResource;
+    private Config&MockObject $config;
     private CategoryLinkProcessor $processor;
 
     protected function setUp(): void
     {
         $this->categoryLink = $this->createMock(CategoryLink::class);
         $this->pathResolver = $this->createMock(CategoryPathResolver::class);
+        $this->categoryResource = $this->createMock(CategoryResource::class);
+        $this->config = $this->createMock(Config::class);
+        $this->config->method('getCategoryReplaceScope')->willReturn(Config::REPLACE_SCOPE_ALL_ROOTS);
+
         $this->processor = new CategoryLinkProcessor(
             $this->categoryLink,
             $this->pathResolver,
-            new PathParser()
+            new PathParser(),
+            $this->categoryResource,
+            $this->config
+        );
+    }
+
+    /**
+     * Builds the processor with a non-default replace scope. Separate from
+     * setUp() because the Config stub cannot be re-stubbed once set.
+     */
+    private function processorWithScope(string $scope): CategoryLinkProcessor
+    {
+        $config = $this->createMock(Config::class);
+        $config->method('getCategoryReplaceScope')->willReturn($scope);
+
+        return new CategoryLinkProcessor(
+            $this->categoryLink,
+            $this->pathResolver,
+            new PathParser(),
+            $this->categoryResource,
+            $config
         );
     }
 
@@ -204,16 +232,223 @@ class CategoryLinkProcessorTest extends TestCase
     }
 
     /**
+     * The whole point of the replace scope: two root trees fed by two sources.
+     * A feed that owns the Outdoor tree must not delete the Default tree's
+     * links just because its own payload does not mention them.
+     */
+    public function testPayloadRootsModeLeavesOtherRootTreesAlone(): void
+    {
+        $context = $this->createContext(['SKU-1' => ['Outdoor Catalog/Jackets']], ['SKU-1' => 10]);
+
+        $this->pathResolver->method('resolvePaths')
+            ->willReturn(['Outdoor Catalog/Jackets' => ['id' => 30, 'message' => null]]);
+        $this->pathResolver->method('validateIds')->willReturn([]);
+        // 21 is under Default Category (root 20), 31 under Outdoor (root 29).
+        $this->categoryLink->method('getAssignments')->willReturn([10 => [21, 31]]);
+        $this->stubRoots([21 => 20, 31 => 29, 30 => 29]);
+
+        // Only the Outdoor link goes; the Default Category link survives.
+        $this->categoryLink->expects(self::once())->method('unassign')
+            ->with([['category_id' => 31, 'product_id' => 10]]);
+        $this->categoryLink->expects(self::once())->method('assign')
+            ->with([['category_id' => 30, 'product_id' => 10, 'position' => 0]]);
+
+        $this->processorWithScope(Config::REPLACE_SCOPE_PAYLOAD_ROOTS)->process($context);
+
+        self::assertStringContainsString(
+            'limited to root category 29; 1 existing assignment(s) outside it were kept',
+            $context->getMessages('SKU-1')[0]
+        );
+    }
+
+    public function testAllRootsModeStillReplacesAcrossTheWholeCatalog(): void
+    {
+        $context = $this->createContext(['SKU-1' => ['Outdoor Catalog/Jackets']], ['SKU-1' => 10]);
+
+        $this->pathResolver->method('resolvePaths')
+            ->willReturn(['Outdoor Catalog/Jackets' => ['id' => 30, 'message' => null]]);
+        $this->pathResolver->method('validateIds')->willReturn([]);
+        $this->categoryLink->method('getAssignments')->willReturn([10 => [21, 31]]);
+        // No root lookup happens at all in the default configuration.
+        $this->categoryResource->expects(self::never())->method('getAncestry');
+
+        $this->categoryLink->expects(self::once())->method('unassign')->with([
+            ['category_id' => 21, 'product_id' => 10],
+            ['category_id' => 31, 'product_id' => 10],
+        ]);
+
+        $this->processor->process($context);
+
+        self::assertSame([], $context->getMessages('SKU-1'));
+    }
+
+    public function testAnExplicitScopeOverridesTheConfiguration(): void
+    {
+        $context = $this->createContext(['SKU-1' => []], ['SKU-1' => 10], ['SKU-1' => [20]]);
+
+        $this->pathResolver->method('resolvePaths')->willReturn([]);
+        $this->pathResolver->method('validateIds')->willReturn([]);
+        $this->categoryLink->method('getAssignments')->willReturn([10 => [21, 31]]);
+        $this->stubRoots([21 => 20, 31 => 29]);
+        $this->categoryResource->method('getRootCategoryIds')
+            ->willReturn(['Default Category' => [20], 'Outdoor Catalog' => [29]]);
+
+        // "categories": [] clears the named root and only the named root — the
+        // only way to empty a tree under payload-roots.
+        $this->categoryLink->expects(self::once())->method('unassign')
+            ->with([['category_id' => 21, 'product_id' => 10]]);
+
+        $this->processorWithScope(Config::REPLACE_SCOPE_PAYLOAD_ROOTS)->process($context);
+    }
+
+    /**
+     * An empty payload names no roots, so it removes nothing — the edge that
+     * makes `"categories": []` mean something different under payload-roots.
+     */
+    public function testEmptyCategoriesUnderPayloadRootsRemovesNothing(): void
+    {
+        $context = $this->createContext(['SKU-1' => []], ['SKU-1' => 10]);
+
+        $this->pathResolver->method('resolvePaths')->willReturn([]);
+        $this->pathResolver->method('validateIds')->willReturn([]);
+        $this->categoryLink->method('getAssignments')->willReturn([10 => [21]]);
+        $this->stubRoots([21 => 20]);
+
+        $this->categoryLink->expects(self::once())->method('unassign')->with([]);
+
+        $this->processorWithScope(Config::REPLACE_SCOPE_PAYLOAD_ROOTS)->process($context);
+
+        self::assertStringContainsString(
+            'limited to root categories: none; 1 existing assignment(s) outside it were kept',
+            $context->getMessages('SKU-1')[0]
+        );
+    }
+
+    public function testAnExplicitEmptyScopeMakesTheProductPurelyAdditive(): void
+    {
+        $context = $this->createContext(['SKU-1' => []], ['SKU-1' => 10], ['SKU-1' => []]);
+
+        $this->pathResolver->method('resolvePaths')->willReturn([]);
+        $this->pathResolver->method('validateIds')->willReturn([]);
+        $this->categoryLink->method('getAssignments')->willReturn([10 => [21]]);
+        $this->stubRoots([21 => 20]);
+
+        $this->categoryLink->expects(self::once())->method('unassign')->with([]);
+
+        $this->processor->process($context);
+    }
+
+    public function testANonRootInTheScopeIsReportedAndIgnored(): void
+    {
+        $context = $this->createContext(['SKU-1' => []], ['SKU-1' => 10], ['SKU-1' => [21, 20]]);
+
+        $this->pathResolver->method('resolvePaths')->willReturn([]);
+        $this->pathResolver->method('validateIds')->willReturn([]);
+        $this->categoryLink->method('getAssignments')->willReturn([10 => [21, 31]]);
+        $this->stubRoots([21 => 20, 31 => 29]);
+        $this->categoryResource->method('getRootCategoryIds')
+            ->willReturn(['Default Category' => [20], 'Outdoor Catalog' => [29]]);
+
+        // 21 is a category but not a root, so it narrows nothing; 20 still applies.
+        $this->categoryLink->expects(self::once())->method('unassign')
+            ->with([['category_id' => 21, 'product_id' => 10]]);
+
+        $this->processor->process($context);
+
+        self::assertStringContainsString(
+            'Ignored 21 in categories_replace_scope: not a root category.',
+            $context->getMessages('SKU-1')[0]
+        );
+    }
+
+    /**
+     * A link whose category vanished between the assignment read and now cannot
+     * be placed in a tree, so it cannot be shown to be in scope. Keeping it is
+     * the conservative half of "don't delete what you can't reason about".
+     */
+    public function testALinkWithNoResolvableRootIsKept(): void
+    {
+        $context = $this->createContext(['SKU-1' => []], ['SKU-1' => 10], ['SKU-1' => [20]]);
+
+        $this->pathResolver->method('resolvePaths')->willReturn([]);
+        $this->pathResolver->method('validateIds')->willReturn([]);
+        $this->categoryLink->method('getAssignments')->willReturn([10 => [21, 99]]);
+        $this->stubRoots([21 => 20]);
+        $this->categoryResource->method('getRootCategoryIds')->willReturn(['Default Category' => [20]]);
+
+        $this->categoryLink->expects(self::once())->method('unassign')
+            ->with([['category_id' => 21, 'product_id' => 10]]);
+
+        $this->processor->process($context);
+    }
+
+    /**
+     * The additive safety valve outranks the scope: an unresolved reference
+     * withholds every deletion, so the scope never gets to permit one.
+     */
+    public function testAnUnresolvedReferenceStillWithholdsEveryDeletion(): void
+    {
+        $context = $this->createContext(['SKU-1' => ['Outdoor Catalog/Nope']], ['SKU-1' => 10], ['SKU-1' => [29]]);
+
+        $this->pathResolver->method('resolvePaths')->willReturn([
+            'Outdoor Catalog/Nope' => ['id' => null, 'message' => 'Unknown root category "Outdoor Catalog".'],
+        ]);
+        $this->pathResolver->method('validateIds')->willReturn([]);
+        $this->categoryLink->method('getAssignments')->willReturn([10 => [31]]);
+        $this->stubRoots([31 => 29]);
+        $this->categoryResource->method('getRootCategoryIds')->willReturn(['Outdoor Catalog' => [29]]);
+
+        $this->categoryLink->expects(self::once())->method('unassign')->with([]);
+
+        $this->processor->process($context);
+
+        self::assertStringContainsString('applied additively', $context->getMessages('SKU-1')[1]);
+    }
+
+    /**
+     * Stubs getAncestry() from a flat category => root map, shaping the reply
+     * the way the resource model does (level 1 = the root itself).
+     *
+     * @param array<int, int> $rootByCategoryId
+     */
+    private function stubRoots(array $rootByCategoryId): void
+    {
+        $this->categoryResource->method('getAncestry')->willReturnCallback(
+            static function (array $categoryIds) use ($rootByCategoryId): array {
+                $ancestry = [];
+                foreach ($categoryIds as $categoryId) {
+                    if (!isset($rootByCategoryId[$categoryId])) {
+                        continue;
+                    }
+                    $root = $rootByCategoryId[$categoryId];
+                    $ancestry[$categoryId] = $root === $categoryId
+                        ? ['level' => 1, 'ancestors' => []]
+                        : ['level' => 2, 'ancestors' => [$root]];
+                }
+
+                return $ancestry;
+            }
+        );
+    }
+
+    /**
      * @param array<string, string[]> $categoriesBySku
      * @param array<string, int> $entityIds
+     * @param array<string, int[]> $replaceScopes per-SKU categories_replace_scope
      */
-    private function createContext(array $categoriesBySku, array $entityIds): BatchContext
-    {
+    private function createContext(
+        array $categoriesBySku,
+        array $entityIds,
+        array $replaceScopes = []
+    ): BatchContext {
         $products = [];
         foreach ($categoriesBySku as $sku => $categories) {
             $product = new Product();
             $product->setSku($sku);
             $product->setCategories($categories);
+            if (array_key_exists($sku, $replaceScopes)) {
+                $product->setCategoriesReplaceScope($replaceScopes[$sku]);
+            }
             $products[] = $product;
         }
 

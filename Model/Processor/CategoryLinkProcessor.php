@@ -9,6 +9,8 @@ namespace ReadyData\Import\Model\Processor;
 use ReadyData\Import\Model\BatchContext;
 use ReadyData\Import\Model\Cache\CategoryPathResolver;
 use ReadyData\Import\Model\Category\PathParser;
+use ReadyData\Import\Model\Config;
+use ReadyData\Import\Model\ResourceModel\Category as CategoryResource;
 use ReadyData\Import\Model\ResourceModel\CategoryLink;
 
 /**
@@ -18,6 +20,15 @@ use ReadyData\Import\Model\ResourceModel\CategoryLink;
  * Entries are full category paths ("Default Category/Men/Shirts") or
  * numeric category IDs; missing path segments below an existing root are
  * auto-created (see CategoryPathResolver).
+ *
+ * **How far the replace reaches** is bounded by the replace scope: a set of
+ * root categories whose links this payload may remove. It defaults to the
+ * whole catalog, which is right when one caller owns the catalog and wrong the
+ * moment several root trees are fed by several sources — there, each source's
+ * push would delete the links the others just wrote, and the only symptom is
+ * storefront navigation quietly going missing. Set per product with
+ * `categories_replace_scope`, or catalog-wide with
+ * `readydata_import/categories/replace_scope`.
  *
  * Safety valve: when any of a product's entries fails to resolve, that
  * product is applied additively — inserts happen, deletions are withheld —
@@ -37,10 +48,18 @@ class CategoryLinkProcessor implements ProcessorInterface
     public const CONTEXT_AFFECTED_CATEGORY_IDS = 'affected_category_ids';
     public const CONTEXT_AFFECTED_PRODUCT_IDS = 'affected_product_ids';
 
+    /**
+     * @var array<int, true>|null every root category ID, memoized per request;
+     *      read only to validate an explicit categories_replace_scope
+     */
+    private ?array $rootIds = null;
+
     public function __construct(
         private readonly CategoryLink $categoryLink,
         private readonly CategoryPathResolver $pathResolver,
-        private readonly PathParser $pathParser
+        private readonly PathParser $pathParser,
+        private readonly CategoryResource $categoryResource,
+        private readonly Config $config
     ) {
     }
 
@@ -91,11 +110,10 @@ class CategoryLinkProcessor implements ProcessorInterface
             array_column($refsBySku, 'entity_id')
         );
 
-        $toInsert = [];
-        $toDelete = [];
-        $touchedCategoryIds = [];
-        $touchedProductIds = [];
-
+        // Two passes: the desired sets have to exist in full before roots can be
+        // resolved, because that is one query for the whole batch rather than
+        // one per product.
+        $plans = [];
         foreach ($refsBySku as $sku => $refs) {
             $partial = $refs['partial'];
             $desired = [];
@@ -121,11 +139,26 @@ class CategoryLinkProcessor implements ProcessorInterface
                 }
             }
 
-            $entityId = $refs['entity_id'];
-            $currentSet = array_fill_keys($currentAssignments[$entityId] ?? [], true);
+            $plans[$sku] = [
+                'entity_id' => $refs['entity_id'],
+                'desired' => $desired,
+                'partial' => $partial,
+                'current' => array_fill_keys($currentAssignments[$refs['entity_id']] ?? [], true),
+            ];
+        }
 
-            foreach (array_keys($desired) as $categoryId) {
-                if (!isset($currentSet[$categoryId])) {
+        $rootByCategoryId = $this->resolveRoots($context, $plans);
+
+        $toInsert = [];
+        $toDelete = [];
+        $touchedCategoryIds = [];
+        $touchedProductIds = [];
+
+        foreach ($plans as $sku => $plan) {
+            $entityId = $plan['entity_id'];
+
+            foreach (array_keys($plan['desired']) as $categoryId) {
+                if (!isset($plan['current'][$categoryId])) {
                     $toInsert[] = [
                         'category_id' => $categoryId,
                         'product_id' => $entityId,
@@ -136,11 +169,11 @@ class CategoryLinkProcessor implements ProcessorInterface
                 }
             }
 
-            $removals = array_diff_key($currentSet, $desired);
+            $removals = array_keys(array_diff_key($plan['current'], $plan['desired']));
             if (!$removals) {
                 continue;
             }
-            if ($partial) {
+            if ($plan['partial']) {
                 $context->addMessage(
                     $sku,
                     'Category set applied additively: some references could not be'
@@ -148,7 +181,9 @@ class CategoryLinkProcessor implements ProcessorInterface
                 );
                 continue;
             }
-            foreach (array_keys($removals) as $categoryId) {
+
+            $removals = $this->withinReplaceScope($context, $sku, $plan, $rootByCategoryId, $removals);
+            foreach ($removals as $categoryId) {
                 $toDelete[] = ['category_id' => $categoryId, 'product_id' => $entityId];
                 $touchedCategoryIds[$categoryId] = true;
                 $touchedProductIds[$entityId] = true;
@@ -160,6 +195,169 @@ class CategoryLinkProcessor implements ProcessorInterface
 
         $context->set(self::CONTEXT_AFFECTED_CATEGORY_IDS, array_keys($touchedCategoryIds));
         $context->set(self::CONTEXT_AFFECTED_PRODUCT_IDS, array_keys($touchedProductIds));
+    }
+
+    /**
+     * Root category per category ID, for every ID the batch might reason about
+     * — one query for the whole batch, and none at all when nothing in it
+     * restricts its replace (the default configuration with no per-product
+     * scope, i.e. every payload that predates this feature).
+     *
+     * @param array<string, array{entity_id: int, desired: array<int, true>,
+     *     partial: bool, current: array<int, true>}> $plans
+     * @return array<int, int> category ID => root category ID
+     */
+    private function resolveRoots(BatchContext $context, array $plans): array
+    {
+        $restricts = $this->config->getCategoryReplaceScope() === Config::REPLACE_SCOPE_PAYLOAD_ROOTS;
+        if (!$restricts) {
+            foreach (array_keys($plans) as $sku) {
+                if ($context->getProduct($sku)?->getCategoriesReplaceScope() !== null) {
+                    $restricts = true;
+                    break;
+                }
+            }
+        }
+        if (!$restricts) {
+            return [];
+        }
+
+        $categoryIds = [];
+        foreach ($plans as $plan) {
+            $categoryIds += $plan['current'] + $plan['desired'];
+        }
+        if (!$categoryIds) {
+            return [];
+        }
+
+        $roots = [];
+        foreach ($this->categoryResource->getAncestry(array_keys($categoryIds)) as $categoryId => $ancestry) {
+            // A level-1 category is its own root; deeper ones take the first
+            // ancestor, since getAncestry() already drops the tree root.
+            $roots[$categoryId] = $ancestry['level'] === 1
+                ? $categoryId
+                : ($ancestry['ancestors'][0] ?? $categoryId);
+        }
+
+        return $roots;
+    }
+
+    /**
+     * The removals the product's replace scope actually permits.
+     *
+     * A category whose root cannot be determined — it vanished between the
+     * assignment read and now — is KEPT. The scope is a statement about which
+     * trees the payload owns, and a link that cannot be placed in a tree cannot
+     * be shown to be in one.
+     *
+     * @param array{entity_id: int, desired: array<int, true>, partial: bool,
+     *     current: array<int, true>} $plan
+     * @param array<int, int> $rootByCategoryId
+     * @param int[] $removals
+     * @return int[]
+     */
+    private function withinReplaceScope(
+        BatchContext $context,
+        string|int $sku,
+        array $plan,
+        array $rootByCategoryId,
+        array $removals
+    ): array {
+        $allowedRoots = $this->allowedRoots($context, $sku, $plan, $rootByCategoryId);
+        if ($allowedRoots === null) {
+            return $removals;
+        }
+
+        $allowed = array_fill_keys($allowedRoots, true);
+        $permitted = array_values(array_filter(
+            $removals,
+            static fn (int $categoryId): bool => isset($rootByCategoryId[$categoryId])
+                && isset($allowed[$rootByCategoryId[$categoryId]])
+        ));
+
+        $keptCount = count($removals) - count($permitted);
+        if ($keptCount > 0) {
+            $context->addMessage($sku, sprintf(
+                'Category replacement was limited to root %s; %d existing assignment(s) outside it were kept.',
+                $allowedRoots === []
+                    ? 'categories: none'
+                    : 'categor' . (count($allowedRoots) === 1 ? 'y ' : 'ies ') . implode(', ', $allowedRoots),
+                $keptCount
+            ));
+        }
+
+        return $permitted;
+    }
+
+    /**
+     * Root IDs whose links this product may lose, or null for "no restriction".
+     *
+     * The payload's own `categories_replace_scope` wins over the configuration:
+     * a feed that states which trees it owns knows something the instance-wide
+     * setting does not.
+     *
+     * @param array{entity_id: int, desired: array<int, true>, partial: bool,
+     *     current: array<int, true>} $plan
+     * @param array<int, int> $rootByCategoryId
+     * @return int[]|null
+     */
+    private function allowedRoots(
+        BatchContext $context,
+        string|int $sku,
+        array $plan,
+        array $rootByCategoryId
+    ): ?array {
+        $declared = $context->getProduct($sku)?->getCategoriesReplaceScope();
+        if ($declared !== null) {
+            return $this->validRoots($context, $sku, $declared);
+        }
+        if ($this->config->getCategoryReplaceScope() !== Config::REPLACE_SCOPE_PAYLOAD_ROOTS) {
+            return null;
+        }
+
+        // The roots the payload's own entries land in. An empty `categories`
+        // names no roots and therefore removes nothing — name the root in
+        // `categories_replace_scope` to clear a tree.
+        $roots = [];
+        foreach (array_keys($plan['desired']) as $categoryId) {
+            if (isset($rootByCategoryId[$categoryId])) {
+                $roots[$rootByCategoryId[$categoryId]] = true;
+            }
+        }
+
+        return array_keys($roots);
+    }
+
+    /**
+     * Drops entries that are not root categories, reporting each: silently
+     * ignoring one would narrow the scope without saying so, and the caller
+     * would see links survive a replace with no explanation.
+     *
+     * @param int[] $declared
+     * @return int[]
+     */
+    private function validRoots(BatchContext $context, string|int $sku, array $declared): array
+    {
+        if ($this->rootIds === null) {
+            $this->rootIds = array_fill_keys(
+                array_merge(...array_values($this->categoryResource->getRootCategoryIds()) ?: [[]]),
+                true
+            );
+        }
+
+        $valid = [];
+        foreach (array_unique(array_map('intval', $declared)) as $rootId) {
+            if (isset($this->rootIds[$rootId])) {
+                $valid[] = $rootId;
+                continue;
+            }
+            $context->addMessage($sku, sprintf(
+                'Ignored %d in categories_replace_scope: not a root category.',
+                $rootId
+            ));
+        }
+
+        return $valid;
     }
 
     public function isEnabled(): bool

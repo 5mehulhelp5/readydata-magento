@@ -24,6 +24,7 @@ class Product implements ProductInterface
     private ?string $urlKey = null;
     private ?array $websites = null;
     private ?array $categories = null;
+    private ?array $categoriesReplaceScope = null;
     private ?StockDataInterface $stock = null;
     private ?array $customAttributes = null;
     private ?array $clearAttributes = null;
@@ -151,6 +152,17 @@ class Product implements ProductInterface
     public function setCategories(array $categories): ProductInterface
     {
         $this->categories = $categories;
+        return $this;
+    }
+
+    public function getCategoriesReplaceScope(): ?array
+    {
+        return $this->categoriesReplaceScope;
+    }
+
+    public function setCategoriesReplaceScope(array $categoriesReplaceScope): ProductInterface
+    {
+        $this->categoriesReplaceScope = $categoriesReplaceScope;
         return $this;
     }
 

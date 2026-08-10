@@ -181,6 +181,54 @@ untouched; `[]` removes them all.
   escaped segment (`"Default Category/\42"`), while a bare `"42"` entry
   stays a numeric ID.
 
+#### How far the replace reaches
+
+By default the replace covers the **whole catalog**: every link the payload
+does not list is removed, wherever it sits. That is right when one caller owns
+the catalog, and wrong the moment a product belongs to **several root trees fed
+by several sources** — there, each source's push deletes the links the others
+just wrote, and the only symptom is storefront navigation quietly going
+missing. Note the existing safety valve does not catch this: it withholds
+deletions when a reference fails to *resolve*, and these resolve perfectly.
+
+Two ways to bound it, per product and instance-wide:
+
+```jsonc
+{
+  "sku": "ABC-123",
+  "categories": ["Outdoor Catalog/Men/Shirts"],
+  "categories_replace_scope": [29]        // only links under root 29 may be removed
+}
+```
+
+| `categories_replace_scope` | Effect |
+| --- | --- |
+| omitted / `null` | the system configuration decides (below) |
+| `[29]` | links under root 29 may be removed; every other root tree is left alone |
+| `[]` | an explicit empty scope — nothing is removed, so the payload is purely additive for this product |
+
+`readydata_import/categories/replace_scope` sets the default for payloads that
+say nothing (*Stores → Configuration → ReadyData Import → Categories → Product
+Category Replacement Reaches*):
+
+| Value | Effect |
+| --- | --- |
+| **Whole Catalog** (default) | today's behaviour, unchanged |
+| **Only the Roots the Payload Names** | the replace removes links only under the roots this product's own entries resolve into |
+
+The default stays *Whole Catalog* deliberately: switching it would silently
+redefine what an existing caller's `"categories": []` means.
+
+Which brings up the one edge worth knowing. Under *Only the Roots the Payload
+Names*, `"categories": []` names no roots and therefore **removes nothing** — a
+warning says so. To empty one tree, name it explicitly:
+`"categories": [], "categories_replace_scope": [29]`.
+
+An entry that is not a root category is ignored with a per-product warning
+rather than silently narrowing the scope. A link whose category cannot be
+placed in a tree — deleted between the assignment read and the write — is kept:
+a link that cannot be shown to be in scope is not removed.
+
 ### Related, up-sell & cross-sell links
 
 A `links` block declares the product's merchandising links, each type an
@@ -1063,19 +1111,21 @@ endpoint is a no-op that reports every attribute as `skipped`/`disabled`. There
 is intentionally no attribute-shape config here — scope, flags and placement are
 supplied per attribute by the caller (the system of record).
 
-The **Categories** group has three switches, all default **off**:
+The **Categories** group has three switches, all default **off**, plus one
+setting that belongs to the *product* endpoint:
 
 | Setting | Path | Notes |
 |---|---|---|
 | Enable Category Sync | `readydata_import/categories/enabled` | The kill switch for the whole `POST /V1/readydata/categories` endpoint. When off it is a no-op that reports every category as `skipped`/`disabled` without taking a lock or writing anything. |
 | Allow Category Moves | `readydata_import/categories/allow_move` | Gates reparenting. When off, an entry naming a destination is `skipped`/`move_disabled` and nothing is written. |
 | Allow Category Deletion | `readydata_import/categories/allow_delete` | Gates `delete: 1`. When off, every delete entry is `skipped`/`delete_disabled` before anything is even resolved. |
+| Product Category Replacement Reaches | `readydata_import/categories/replace_scope` | Default `all_roots`. How far the **product** payload's `categories` field reaches when it replaces assignments — see "How far the replace reaches". **Not** gated on the switch above: it governs the product endpoint, which has nothing to do with whether category sync is enabled. |
 
 The endpoint is off by default because creating and renaming categories reshapes
 storefront navigation and category URLs; moves and deletes are gated *again*
 because their blast radius is a whole subtree, and a delete is irreversible.
 Note the master switch gates only the endpoint — the product import's on-demand
-category creation is unaffected.
+category creation is unaffected, and so is the replace scope.
 
 ### Media gallery
 

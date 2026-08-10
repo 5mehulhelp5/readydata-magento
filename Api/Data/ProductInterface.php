@@ -27,6 +27,7 @@ interface ProductInterface
     public const URL_KEY = 'url_key';
     public const WEBSITES = 'websites';
     public const CATEGORIES = 'categories';
+    public const CATEGORIES_REPLACE_SCOPE = 'categories_replace_scope';
     public const STOCK = 'stock';
     public const CUSTOM_ATTRIBUTES = 'custom_attributes';
     public const CLEAR_ATTRIBUTES = 'clear_attributes';
@@ -176,6 +177,38 @@ interface ProductInterface
      * @return $this
      */
     public function setCategories(array $categories): self;
+
+    /**
+     * Root category IDs whose links `categories` may REMOVE — the reach of its
+     * replace, per product. Links under any other root are left alone.
+     *
+     * The reason it exists: `categories` replaces, and on a catalog with
+     * several root trees fed by several sources, each source's push would
+     * otherwise delete the links the others just wrote. Naming the roots a feed
+     * owns makes its replace authoritative there and inert everywhere else.
+     *
+     * - **null/omitted** — the system configuration decides
+     *   (`readydata_import/categories/replace_scope`: whole catalog by default,
+     *   or only the roots this product's own entries resolve into).
+     * - **`[]`** — an explicit empty scope: nothing is removed, so the payload
+     *   becomes purely additive for this product.
+     * - **`[12, 15]`** — only links under roots 12 and 15 may be removed. This
+     *   is also how `"categories": []` removes everything under a chosen root:
+     *   name the root here.
+     *
+     * An entry that is not a root category is ignored with a per-product
+     * warning. Has no effect when `categories` is null/omitted, since nothing
+     * is being replaced.
+     *
+     * @return int[]|null
+     */
+    public function getCategoriesReplaceScope(): ?array;
+
+    /**
+     * @param int[] $categoriesReplaceScope
+     * @return $this
+     */
+    public function setCategoriesReplaceScope(array $categoriesReplaceScope): self;
 
     /**
      * @return \ReadyData\Import\Api\Data\StockDataInterface|null

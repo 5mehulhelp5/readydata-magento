@@ -19,6 +19,7 @@
                 <enabled>0</enabled>
                 <allow_move>0</allow_move>
                 <allow_delete>0</allow_delete>
+                <replace_scope>all_roots</replace_scope>
             </categories>
             <media>
                 <enabled>1</enabled>

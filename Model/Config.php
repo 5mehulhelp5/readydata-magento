@@ -29,6 +29,11 @@ class Config
     public const URL_CONFLICT_APPEND = 'append';
     public const URL_CONFLICT_SKIP = 'skip';
 
+    /** A product's `categories` field replaces its links across the whole catalog. */
+    public const REPLACE_SCOPE_ALL_ROOTS = 'all_roots';
+    /** It replaces only within the root categories its own entries resolve into. */
+    public const REPLACE_SCOPE_PAYLOAD_ROOTS = 'payload_roots';
+
     private const XML_PATH_ENABLED = 'readydata_import/general/enabled';
     private const XML_PATH_BATCH_SIZE = 'readydata_import/general/batch_size';
     private const XML_PATH_CONTINUE_ON_ERROR = 'readydata_import/general/continue_on_error';
@@ -44,6 +49,7 @@ class Config
     private const XML_PATH_CATEGORIES_ENABLED = 'readydata_import/categories/enabled';
     private const XML_PATH_CATEGORIES_ALLOW_MOVE = 'readydata_import/categories/allow_move';
     private const XML_PATH_CATEGORIES_ALLOW_DELETE = 'readydata_import/categories/allow_delete';
+    private const XML_PATH_CATEGORIES_REPLACE_SCOPE = 'readydata_import/categories/replace_scope';
     private const XML_PATH_MEDIA_ENABLED = 'readydata_import/media/enabled';
     private const XML_PATH_MEDIA_DOWNLOAD_TIMEOUT = 'readydata_import/media/download_timeout';
     private const XML_PATH_MEDIA_DOWNLOAD_CONCURRENCY = 'readydata_import/media/download_concurrency';
@@ -174,6 +180,29 @@ class Config
     public function isCategoryDeleteAllowed(): bool
     {
         return $this->scopeConfig->isSetFlag(self::XML_PATH_CATEGORIES_ALLOW_DELETE);
+    }
+
+    /**
+     * How far a product payload's `categories` field reaches when it replaces
+     * the product's assignments — the whole catalog, or only the root
+     * categories the payload's own entries resolve into.
+     *
+     * Governs the PRODUCT endpoint, not the category one, and is deliberately
+     * not gated on {@see isCategorySyncEnabled()}.
+     *
+     * `all_roots` stays the default because it is what the module has always
+     * done, and because switching it would silently redefine what an existing
+     * caller's `"categories": []` means. `payload_roots` is the setting for a
+     * catalog with several root trees fed by several sources, where a replace
+     * across the whole catalog deletes links the caller never knew about.
+     */
+    public function getCategoryReplaceScope(): string
+    {
+        $scope = (string)$this->scopeConfig->getValue(self::XML_PATH_CATEGORIES_REPLACE_SCOPE);
+
+        return $scope === self::REPLACE_SCOPE_PAYLOAD_ROOTS
+            ? self::REPLACE_SCOPE_PAYLOAD_ROOTS
+            : self::REPLACE_SCOPE_ALL_ROOTS;
     }
 
     /**
