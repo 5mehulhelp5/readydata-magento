@@ -16,6 +16,8 @@
                 type="ReadyData\Events\Model\Data\SubscriptionRule"/>
     <preference for="ReadyData\Events\Api\Data\QueueStatusInterface"
                 type="ReadyData\Events\Model\Data\QueueStatus"/>
+    <preference for="ReadyData\Events\Api\Data\EventDescriptionInterface"
+                type="ReadyData\Events\Model\Data\EventDescription"/>
 
     <!--
         Capture state is per-request and shared: the buffer accumulates across

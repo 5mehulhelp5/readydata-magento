@@ -54,6 +54,12 @@
             <resource ref="ReadyData_Events::manage"/>
         </resources>
     </route>
+    <route url="/V1/readydata/eventing/supported/:code" method="GET">
+        <service class="ReadyData\Events\Api\EventingStatusInterface" method="getSupportedDetail"/>
+        <resources>
+            <resource ref="ReadyData_Events::manage"/>
+        </resources>
+    </route>
     <route url="/V1/readydata/eventing/queue" method="GET">
         <service class="ReadyData\Events\Api\EventingStatusInterface" method="getStatus"/>
         <resources>

@@ -17,16 +17,38 @@ namespace ReadyData\Events\Api\Data;
  */
 interface SubscriptionRuleInterface
 {
+    /**
+     * @return string|null
+     */
     public function getField(): ?string;
 
+    /**
+     * @param string|null $field
+     * @return $this
+     */
     public function setField(?string $field): self;
 
-    /** One of ReadyData\Events\Model\Capture\RuleEvaluator::OPERATORS. */
+    /**
+     * One of ReadyData\Events\Model\Capture\RuleEvaluator::OPERATORS.
+     *
+     * @return string|null
+     */
     public function getOperator(): ?string;
 
+    /**
+     * @param string|null $operator
+     * @return $this
+     */
     public function setOperator(?string $operator): self;
 
+    /**
+     * @return string|null
+     */
     public function getValue(): ?string;
 
+    /**
+     * @param string|null $value
+     * @return $this
+     */
     public function setValue(?string $value): self;
 }

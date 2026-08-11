@@ -34,6 +34,19 @@ interface EventingStatusInterface
     public function getSupported(): array;
 
     /**
+     * What one event code carries: field suggestions and a worked sample payload.
+     *
+     * Feeds ReadyData's field picker. Without it an operator types dot paths
+     * from memory, and a path that resolves to nothing fails silently — the
+     * subscription looks configured, events arrive, every payload is empty.
+     *
+     * @param string $code
+     * @return \ReadyData\Events\Api\Data\EventDescriptionInterface
+     * @throws \Magento\Framework\Exception\NoSuchEntityException
+     */
+    public function getSupportedDetail(string $code): \ReadyData\Events\Api\Data\EventDescriptionInterface;
+
+    /**
      * Queue a synthetic event and deliver it immediately, proving capture,
      * signing and the subscriber endpoint end to end.
      *

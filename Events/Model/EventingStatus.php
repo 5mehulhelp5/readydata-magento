@@ -9,7 +9,10 @@ namespace ReadyData\Events\Model;
 use Magento\Framework\DataObject\IdentityGeneratorInterface;
 use Magento\Framework\Event\ConfigInterface as EventConfig;
 use Magento\Framework\Exception\LocalizedException;
+use Magento\Framework\Exception\NoSuchEntityException;
 use Magento\Framework\Serialize\Serializer\Json;
+use ReadyData\Events\Api\Data\EventDescriptionInterface;
+use ReadyData\Events\Api\Data\EventDescriptionInterfaceFactory;
 use ReadyData\Events\Api\Data\QueueStatusInterface;
 use ReadyData\Events\Api\Data\QueueStatusInterfaceFactory;
 use ReadyData\Events\Api\EventingStatusInterface;
@@ -29,6 +32,8 @@ class EventingStatus implements EventingStatusInterface
         private readonly SubscriptionRepository $subscriptions,
         private readonly EventConfig $eventConfig,
         private readonly QueueStatusInterfaceFactory $statusFactory,
+        private readonly EventDescriptionInterfaceFactory $descriptionFactory,
+        private readonly EventSchema $eventSchema,
         private readonly Dispatcher $dispatcher,
         private readonly IdentityGeneratorInterface $identityGenerator,
         private readonly Json $json
@@ -43,6 +48,7 @@ class EventingStatus implements EventingStatusInterface
         return $this->statusFactory->create()
             ->setEnabled($this->config->isEnabled())
             ->setHooked($this->isHooked())
+            ->setInstanceId($this->config->getInstanceId())
             ->setCatalogueSize(count($this->catalogue->codes()))
             ->setSubscriberCode($subscriber?->code)
             ->setSubscriptionCount(count($this->subscriptions->getList()))
@@ -58,6 +64,27 @@ class EventingStatus implements EventingStatusInterface
     public function getSupported(): array
     {
         return $this->catalogue->codes();
+    }
+
+    public function getSupportedDetail(string $code): EventDescriptionInterface
+    {
+        $described = $this->eventSchema->describe($code);
+
+        if ($described === null) {
+            throw new NoSuchEntityException(__(
+                'Event code "%1" is not in this store\'s catalogue. GET supported lists what is.',
+                $code
+            ));
+        }
+
+        return $this->descriptionFactory->create()
+            ->setCode($described['code'])
+            ->setKind($described['kind'])
+            ->setHooked($described['hooked'])
+            ->setEntity($described['entity'])
+            ->setDerivedFrom($described['derived_from'])
+            ->setFields($described['fields'])
+            ->setSample($this->json->serialize($described['sample']));
     }
 
     /**

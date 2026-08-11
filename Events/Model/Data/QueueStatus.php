@@ -12,6 +12,7 @@ class QueueStatus implements QueueStatusInterface
 {
     private ?bool $enabled = null;
     private ?bool $hooked = null;
+    private ?string $instanceId = null;
     private ?int $catalogueSize = null;
     private ?string $subscriberCode = null;
     private ?int $subscriptionCount = null;
@@ -42,6 +43,18 @@ class QueueStatus implements QueueStatusInterface
     public function setHooked(?bool $hooked): QueueStatusInterface
     {
         $this->hooked = $hooked;
+
+        return $this;
+    }
+
+    public function getInstanceId(): ?string
+    {
+        return $this->instanceId;
+    }
+
+    public function setInstanceId(?string $instanceId): QueueStatusInterface
+    {
+        $this->instanceId = $instanceId;
 
         return $this;
     }
