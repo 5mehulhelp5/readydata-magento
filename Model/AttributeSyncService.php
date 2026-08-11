@@ -37,7 +37,22 @@ use ReadyData\Import\Model\ResourceModel\AttributeOption;
  */
 class AttributeSyncService
 {
-    private const LOCK_NAME = 'readydata_attribute_sync';
+    /**
+     * The definition lock, and the option lock this endpoint shares with the
+     * product import because {@see applyExtras()} seeds options through the same
+     * unkeyed read-then-create AttributeProcessor uses. Sharing it closes a race
+     * this module used to document rather than fix: with one lock per endpoint,
+     * a product import and an attribute sync could both insert the same new
+     * option label.
+     *
+     * Both are held for the whole request. Attribute payloads are a feed's
+     * attribute list — tens of entries, sent as a pre-flight step — and the
+     * request is already fully serialized against itself, so there is nothing to
+     * win from narrowing them to the per-attribute transactions.
+     *
+     * @var string[] in ImportLocks::inAcquisitionOrder()
+     */
+    private const LOCK_NAMES = [ImportLocks::ATTRIBUTE_SYNC, ImportLocks::ATTRIBUTE_OPTIONS];
 
     private const OPTION_INPUTS = ['select', 'multiselect'];
 
@@ -85,8 +100,24 @@ class AttributeSyncService
             return $this->buildResponse($received, $this->disabledResults($attributes), $startedAt);
         }
 
-        if (!$this->lockManager->lock(self::LOCK_NAME, ImportLocks::TIMEOUT_SEC)) {
-            throw new LocalizedException(__('Another attribute sync is already running. Try again later.'));
+        $acquired = [];
+        foreach (self::LOCK_NAMES as $lock) {
+            if (!$this->lockManager->lock($lock, ImportLocks::TIMEOUT_SEC)) {
+                foreach (array_reverse($acquired) as $held) {
+                    $this->lockManager->unlock($held);
+                }
+
+                // The wording names what actually blocked. Only the definition
+                // lock means another attribute sync; the option lock is shared,
+                // so a product import creating options is the other candidate —
+                // and that message is the one callers already back off on.
+                throw new LocalizedException(
+                    $lock === ImportLocks::ATTRIBUTE_SYNC
+                        ? __('Another attribute sync is already running. Try again later.')
+                        : __('Another import is already running. Try again later.')
+                );
+            }
+            $acquired[] = $lock;
         }
 
         $results = [];
@@ -136,7 +167,9 @@ class AttributeSyncService
                 $results[] = $result;
             }
         } finally {
-            $this->lockManager->unlock(self::LOCK_NAME);
+            foreach (array_reverse(self::LOCK_NAMES) as $lock) {
+                $this->lockManager->unlock($lock);
+            }
         }
 
         $this->invalidationHandler->execute($changed);

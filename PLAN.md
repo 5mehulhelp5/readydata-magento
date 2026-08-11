@@ -249,9 +249,15 @@ the body, flip the flag.
   field; staging-aware writes are out of scope initially (documented limitation).
 - **Direct DB writes skip plugins/observers** other modules attach to product save —
   by design, but must be a documented, loud caveat in README.
-- **Concurrency:** two simultaneous imports of the same SKUs can deadlock; v1 uses a
-  lock (`readydata_import` mutex via `Magento\Framework\Lock\LockManagerInterface`),
-  async queue-based imports are the future path.
+- **Concurrency:** two simultaneous imports of the same SKUs can corrupt each other
+  wherever there is an unkeyed read-then-create. Guarded by four named locks (via
+  `Magento\Framework\Lock\LockManagerInterface`, see `ImportLocks`), each taken per
+  BATCH and only by the batches whose payload can reach it — never across image
+  downloads or indexing. The remaining step is per-KEY exclusion instead of named
+  locks, which would let overlapping imports of disjoint SKUs stop contending
+  altogether; it needs an isolation-level audit (gap locks do not exist under READ
+  COMMITTED) and a two-connection test harness this module does not have. Async
+  queue-based imports remain the other future path.
 - **Async mode:** for very large feeds, accept-and-queue (bulk API pattern with
   `operation` status endpoint) is the planned expansion — hence the status endpoint
   placeholder.

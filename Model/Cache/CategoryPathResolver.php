@@ -32,8 +32,10 @@ use ReadyData\Import\Model\ResourceModel\Category as CategoryResource;
  * request.
  *
  * Categories created inside a batch transaction vanish if that batch rolls
- * back; entries this resolver created itself are therefore re-verified on
- * every call and evicted (and re-created on demand) when gone.
+ * back, and a category that was already there can be deleted by another request
+ * between two of our batches. Every cached entry is therefore re-verified on
+ * every call and evicted (and re-resolved on demand) when gone — see
+ * {@see evictVanishedCategories()}.
  */
 class CategoryPathResolver
 {
@@ -108,7 +110,7 @@ class CategoryPathResolver
     /**
      * Drop a cached path => ID mapping.
      *
-     * {@see evictRolledBackCreations()} only notices categories whose row
+     * {@see evictVanishedCategories()} only notices categories whose row
      * disappeared. A rename leaves the row in place under a different name, so
      * the cached entry for the OLD path would keep resolving and a later write
      * would land on the wrong category. Whoever renames a category is
@@ -172,7 +174,7 @@ class CategoryPathResolver
      */
     private function walk(array $paths, bool $create, ?int $pinnedRootId = null): array
     {
-        $this->evictRolledBackCreations();
+        $this->evictVanishedCategories();
 
         $results = [];
         $walks = [];
@@ -273,7 +275,7 @@ class CategoryPathResolver
      */
     public function validateIds(array $categoryIds): array
     {
-        $this->evictRolledBackCreations();
+        $this->evictVanishedCategories();
 
         if (!$categoryIds) {
             return [];
@@ -404,38 +406,50 @@ class CategoryPathResolver
     }
 
     /**
-     * Drop cached entries for categories this resolver created that no
-     * longer exist — their creating batch was rolled back. They are
-     * re-created on the next resolution that needs them.
+     * Drop cached entries whose category no longer exists. They are re-resolved
+     * — and, where the caller creates, re-created — on the next resolution that
+     * needs them.
+     *
+     * There are two ways an entry goes stale, and this covers both:
+     *
+     * - a category **this resolver created** was rolled back with its batch;
+     * - a category that was already there has been **deleted by another
+     *   request** since we cached it. The product import releases its locks
+     *   between batches, so a category sync can commit a delete in that window.
+     *   Without this the next batch would write a product assignment against an
+     *   ID that is gone, which fails on the catalog_category_product foreign key
+     *   and rolls the batch back for something that is recoverable.
+     *
+     * One query for every cached ID, once per resolution call.
      */
-    private function evictRolledBackCreations(): void
+    private function evictVanishedCategories(): void
     {
-        if (!$this->createdPaths) {
+        if (!$this->idByPath) {
             return;
         }
 
-        $createdIds = [];
-        foreach ($this->createdPaths as $rootId => $keys) {
-            foreach (array_intersect_key($this->idByPath[$rootId] ?? [], $keys) as $key => $id) {
-                $createdIds[$rootId][$key] = $id;
-            }
-        }
-        if (!$createdIds) {
+        $cachedIds = array_values(array_unique(array_merge(
+            ...array_map('array_values', array_values($this->idByPath))
+        )));
+        if (!$cachedIds) {
             return;
         }
 
-        $existing = $this->categoryResource->getExistingByIds(
-            array_values(array_merge(...array_map('array_values', $createdIds)))
-        );
+        $existing = $this->categoryResource->getExistingByIds($cachedIds);
 
-        foreach ($createdIds as $rootId => $keys) {
+        foreach ($this->idByPath as $rootId => $keys) {
             foreach ($keys as $key => $id) {
                 if (isset($existing[$id])) {
                     continue;
                 }
+                $wasCreatedHere = isset($this->createdPaths[$rootId][$key]);
                 unset($this->idByPath[$rootId][$key], $this->createdPaths[$rootId][$key]);
                 $this->logger->info(sprintf(
-                    'Auto-created category "%s" (ID %d) was rolled back with its batch; it will be re-created on demand.',
+                    $wasCreatedHere
+                        ? 'Auto-created category "%s" (ID %d) was rolled back with its batch;'
+                            . ' it will be re-created on demand.'
+                        : 'Category "%s" (ID %d) was removed by another request during this import;'
+                            . ' its path will be resolved again.',
                     $key,
                     $id
                 ));

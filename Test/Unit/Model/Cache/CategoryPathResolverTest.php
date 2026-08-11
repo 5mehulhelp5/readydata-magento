@@ -24,10 +24,22 @@ class CategoryPathResolverTest extends TestCase
     private CategoryWriter&MockObject $categoryWriter;
     private CategoryPathResolver $resolver;
 
+    /**
+     * @var int[]|null category IDs that have since been deleted, for the
+     *      re-verification pass. Null means "the tree still holds everything".
+     */
+    private ?array $vanishedIds = null;
+
     protected function setUp(): void
     {
+        $this->vanishedIds = null;
+
         $this->categoryResource = $this->createMock(CategoryResource::class);
         $this->categoryResource->method('getRootCategoryIds')->willReturn(['Default Category' => [self::ROOT_ID]]);
+        // Every cached ID is re-verified on every call, so the tree has to be
+        // able to answer for the ones this resolver has already handed out.
+        $this->categoryResource->method('getExistingByIds')
+            ->willReturnCallback(fn (array $ids): array => $this->stillExisting($ids));
 
         $this->categoryWriter = $this->createMock(CategoryWriter::class);
 
@@ -202,6 +214,8 @@ class CategoryPathResolverTest extends TestCase
         $calls = 0;
         $categoryResource = $this->createMock(CategoryResource::class);
         $categoryResource->method('getRootCategoryIds')->willReturn($roots ?? ['Shop' => [2, 3]]);
+        $categoryResource->method('getExistingByIds')
+            ->willReturnCallback(fn (array $ids): array => $this->stillExisting($ids));
         $categoryResource->method('getChildrenByParentIds')
             ->willReturnCallback(function (array $parentIds) use (&$calls): array {
                 $calls++;
@@ -218,6 +232,54 @@ class CategoryPathResolverTest extends TestCase
             new RootCategoryRegistry($categoryResource),
             $this->createMock(Logger::class)
         );
+    }
+
+    /**
+     * What {@see CategoryPathResolver::getExistingByIds()} answers for the
+     * re-verification pass: every ID asked about, minus the ones a test has
+     * declared deleted.
+     *
+     * @param int[] $ids
+     * @return array<int, array{entity_id: int, parent_id: int, level: int, path: string}>
+     */
+    private function stillExisting(array $ids): array
+    {
+        $rows = [];
+        foreach ($ids as $id) {
+            if ($this->vanishedIds !== null && in_array($id, $this->vanishedIds, true)) {
+                continue;
+            }
+            $rows[$id] = ['entity_id' => $id, 'parent_id' => self::ROOT_ID, 'level' => 2, 'path' => '1/2/' . $id];
+        }
+
+        return $rows;
+    }
+
+    /**
+     * The product import releases its locks between batches, so a category sync
+     * can commit a delete in that window. A cached ID that is no longer in the
+     * tree has to be dropped and the path resolved again — writing a product
+     * assignment against it would fail on the catalog_category_product foreign
+     * key, for something that is recoverable.
+     */
+    public function testACategoryDeletedByAnotherRequestIsEvictedAndResolvedAgain(): void
+    {
+        $children = [self::ROOT_ID => ['Men' => self::MEN_ID]];
+        // By reference: the tree changes underneath us halfway through the test.
+        $this->categoryResource->method('getChildrenByParentIds')
+            ->willReturnCallback(static function () use (&$children): array {
+                return $children;
+            });
+
+        $paths = ['Default Category/Men' => ['Default Category', 'Men']];
+        self::assertSame(['Default Category/Men' => self::MEN_ID], $this->resolver->lookupPaths($paths));
+
+        // Another request deletes it, and the tree now holds a different
+        // category under that name.
+        $this->vanishedIds = [self::MEN_ID];
+        $children = [self::ROOT_ID => ['Men' => 99]];
+
+        self::assertSame(['Default Category/Men' => 99], $this->resolver->lookupPaths($paths));
     }
 
     public function testForgetDropsACachedPathSoItIsLookedUpAgain(): void

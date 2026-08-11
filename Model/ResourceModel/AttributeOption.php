@@ -58,6 +58,20 @@ class AttributeOption
         }
     }
 
+    /**
+     * Drop the memo, so the next lookup reads the table again.
+     *
+     * Called when the caller has just (re-)acquired
+     * {@see \ReadyData\Import\Model\ImportLocks::ATTRIBUTE_OPTIONS} and the memo
+     * predates it: an option another request created in the meantime is not in
+     * here, and {@see createOptions()} trusts this map to decide what is missing,
+     * so a stale entry is how a duplicate label gets written under a held lock.
+     */
+    public function forget(): void
+    {
+        $this->optionsByAttribute = [];
+    }
+
     public function getOptionId(int $attributeId, string $label): ?int
     {
         $this->warm([$attributeId]);

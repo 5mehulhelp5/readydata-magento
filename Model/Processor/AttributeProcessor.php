@@ -62,8 +62,8 @@ class AttributeProcessor implements ProcessorInterface
         // Option labels are harvested from the product's own custom attributes
         // ONLY. A `store_values` block's custom attributes are resolved against
         // existing options by EavValueProcessor and never create one, which is
-        // why ImportService::needsWriteLock() does not consult them — extend
-        // both together if that ever changes.
+        // why ImportService::batchLocks() does not consult them — extend both
+        // together if that ever changes.
         foreach ($context->getValidProducts() as $product) {
             foreach ($product->getCustomAttributes() ?? [] as $customAttribute) {
                 $code = $customAttribute->getAttributeCode();

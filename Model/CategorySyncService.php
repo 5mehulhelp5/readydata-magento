@@ -62,10 +62,19 @@ class CategorySyncService
      * concurrently and duplicate siblings.
      *
      * Taken unconditionally here — every request to this endpoint is a category
-     * write. The product import takes the same lock only when its payload can
-     * reach a read-then-create; see {@see ImportService::needsWriteLock()}.
+     * write. The product import takes this one lock out of {@see ImportLocks}
+     * only for the batches whose payload can reach a read-then-create in the
+     * tree; see {@see ImportService::batchLocks()}.
+     *
+     * Held for the whole request, where the product import holds its locks for
+     * one batch at a time. The difference is the sibling map: {@see loadSiblings()}
+     * reads children-by-name once per depth bucket and is only invalidated by
+     * this request's own writes, so releasing between entries would let another
+     * request insert a sibling this map cannot see — which is the duplicate the
+     * lock exists to prevent. Narrowing it means re-reading siblings per entry
+     * instead of per bucket, and that trade has not been made.
      */
-    public const LOCK_NAME = ImportLocks::PRODUCT_IMPORT;
+    public const LOCK_NAME = ImportLocks::CATEGORY_TREE;
 
     public function __construct(
         private readonly Config $config,

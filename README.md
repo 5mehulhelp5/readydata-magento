@@ -446,8 +446,9 @@ The two forms are told apart by the scheme.
 ]
 ```
 
-- **Downloads run before the batch transaction opens**, so no database locks are
-  ever held across network I/O, and they run **concurrently** up to *Download
+- **Downloads run before the batch transaction opens and before its import
+  locks**, so neither database row locks nor the module's own named locks are ever
+  held across network I/O, and they run **concurrently** up to *Download
   Concurrency* (default 4; set it to 1 for fully sequential).
 - A downloaded file is stored under its sanitised name plus a short digest of its
   URL — `https://cdn.example.com/img/hero.jpg` becomes `/h/e/hero_1a2b3c4d.jpg`.
@@ -570,56 +571,75 @@ three localized value sets is one `created`.
 
 ### Concurrency
 
-Overlapping imports are rejected with `Another import is already running.` —
-but only when the payload can reach an **unkeyed read-then-create**: look for a
-row, not find it, insert it, where the database has no unique key to catch a
-second request doing the same thing at the same moment. There are four such
-sequences, and the lock exists for all of them:
+Overlapping imports are only serialized where they could actually corrupt each
+other, and only for as long as it takes. What needs guarding is an **unkeyed
+read-then-create**: look for a row, not find it, insert it, where the database
+has no unique key to catch a second request doing the same thing at the same
+moment. There are four of those, and each has a **lock of its own**:
 
-- **product rows.** `catalog_product_entity.sku` carries a plain index, **not** a
-  unique key — Magento enforces SKU uniqueness in PHP. Two concurrent runs naming
-  the same new SKU both miss the read and both insert, leaving two rows for one
-  SKU, each with its own EAV, gallery and stock satellites.
-- **categories.** Missing path segments are created on demand, and nothing is
-  unique on `(parent_id, name)` or on a category `url_key`. Two concurrent runs
-  both miss and both insert, leaving a duplicate sibling — which then makes that
-  path permanently ambiguous — or a `url_rewrite` unique-key violation that
-  fails whichever request loses. The category endpoint takes the same lock, so
-  the two serialize against each other too.
-- **media gallery rows.** `catalog_product_entity_media_gallery` has no key on
-  `(attribute_id, value)`, and its `value_id` is an autoincrement, so a fresh row
-  cannot be re-selected by its own data at all. Two concurrent runs carrying the
-  same file for one product both insert it and the image is listed twice.
-- **attribute options.** With *Auto-Create Missing Attribute Options* on, missing
-  select/multiselect options are created. `eav_attribute_option` has no key on the
-  label, so two concurrent runs writing the same new option label both insert and
-  the attribute ends up with two options of the same name.
+| Lock | Guards |
+| --- | --- |
+| `readydata_product_create` | **product rows.** `catalog_product_entity.sku` carries a plain index, **not** a unique key — Magento enforces SKU uniqueness in PHP. Two concurrent runs naming the same new SKU both miss the read and both insert, leaving two rows for one SKU, each with its own EAV, gallery and stock satellites. |
+| `readydata_product_import` | **the category tree.** Missing path segments are created on demand, and nothing is unique on `(parent_id, name)` or on a category `url_key`. Two concurrent runs both miss and both insert, leaving a duplicate sibling — which makes that path permanently ambiguous — or a `url_rewrite` unique-key violation that fails whichever request loses. The category endpoint takes this same lock. (The name is the historical one, from when a single lock guarded only the tree; keeping it means a request still running the previous release serializes against this one on the least recoverable race.) |
+| `readydata_media_gallery` | **media gallery rows.** `catalog_product_entity_media_gallery` has no key on `(attribute_id, value)`, and its `value_id` is an autoincrement, so a fresh row cannot be re-selected by its own data at all. Two concurrent runs carrying the same file for one product both insert it and the image is listed twice. |
+| `readydata_attribute_options` | **attribute options.** With *Auto-Create Missing Attribute Options* on, missing select/multiselect options are created. `eav_attribute_option` has no key on the label, so two concurrent runs writing the same new option label both insert and the attribute ends up with two options of the same name. The attribute endpoint takes this same lock. |
 
-Deciding this costs **one indexed query**: the SKUs in the payload are looked up
-before the lock, because nothing in the payload itself reveals whether a product
-row has to be created. A payload whose SKUs all exist and that carries no
-`categories`, no `media` and no `custom_attributes` (with option auto-creation on)
-runs **lock-free**, concurrently with anything else — a price or stock refresh,
+Separate names matter because the payloads that reach them are largely disjoint:
+a media feed and a category sync cannot duplicate each other's work, so one lock
+for both would serialize them for nothing.
+
+**Scope of the hold.** Locks are taken **per batch**, not per request, and only
+the ones that batch's own products can race on. Each is held from just before its
+batch's transaction opens until that transaction commits or rolls back — no
+longer, because the next holder has to be able to *see* the row that was
+inserted, and no more, because:
+
+- **image downloads happen first, unlocked.** They are the longest thing a batch
+  does and they race with nothing;
+- **indexing happens last, unlocked.** A partial reindex of a large payload is
+  easily the longest thing the request does;
+- **after-commit events happen after the release.** An observer is someone
+  else's code doing an unknown amount of work, and by then the rows are visible.
+
+So a competing import waits for one batch transaction, not for a feed's worth of
+downloads and reindexing. Per-batch scoping also means one unknown SKU in a
+5 000-product payload no longer makes the whole request serialize — only the
+batch carrying it does. Lowering *batch size* shortens the hold further.
+
+Deciding all this costs **one indexed query per batch**: its SKUs are looked up
+before the locks, because nothing in the payload reveals whether a product row
+has to be created. A batch whose SKUs all exist and that carries no `categories`,
+no `media` and no `custom_attributes` (with option auto-creation on) runs
+**lock-free**, concurrently with anything else — a price or stock refresh,
 typically, which is the case the fast path is for.
 
 The remaining tests are deliberately conservative: any `categories` field at all
 (including `[]`), any `media` field at all (`[]` means "remove everything", which
 is still work), and any `custom_attributes` while option auto-creation is on.
 `store_values` blocks are **not** consulted — their custom attributes only ever
-resolve option labels they did not create. Erring towards taking the lock costs a
-serialized request; erring the other way costs a duplicate product, category,
-image or attribute option, and none of those is cheap to undo.
+resolve option labels they did not create. Erring towards taking a lock costs a
+serialized batch; erring the other way costs a duplicate product, category, image
+or attribute option, and none of those is cheap to undo.
 
-Two races the lock does **not** cover, both documented rather than closed:
+**When a lock cannot be taken**, a set is acquired all-or-nothing in one fixed
+order (so two requests wanting overlapping sets cannot deadlock on each other),
+and:
 
-- the attribute endpoint seeds options under its own `readydata_attribute_sync`
-  lock, so a product import running concurrently with an attribute sync can still
-  duplicate one option label;
-- `url_rewrite` is unique on `(request_path, store_id)`, so concurrent lock-free
-  requests cannot duplicate a rewrite — but they read the conflict set before
-  writing, which makes the `error` and `append` conflict strategies unreliable
-  under concurrency and can leave the loser's request path pointing at the other
-  product.
+- the **first** batch is rejected outright with `Another import is already
+  running.` — nothing has been committed, so the request did not happen. Note
+  that its file downloads have already run; nothing is wasted, because a
+  downloaded URL maps to a deterministic path that the retry re-uses;
+- a **later** batch fails on its own, reporting `another import is holding …`
+  against its products, and the request still returns results for the batches
+  that did commit. Later batches also wait longer (30 s rather than 10 s):
+  abandoning batch 4 of 10 leaves the caller reconciling a partial import.
+
+One race the locks still do **not** cover: `url_rewrite` is unique on
+`(request_path, store_id)`, so concurrent requests cannot duplicate a rewrite —
+but they read the conflict set before writing, which makes the `error` and
+`append` conflict strategies unreliable under concurrency and can leave the
+loser's request path pointing at the other product. Lock-free and per-batch
+scoping both widen the window in which that can happen.
 
 ## Attribute definitions
 
@@ -765,7 +785,19 @@ backups). Re-sync afterwards reconciles the safe columns.
 
 Concurrent syncs serialize on a `readydata_attribute_sync` lock (with a short
 wait); the `eav_attribute` unique key is the ultimate backstop, so a create that
-loses a race is re-read and treated as an update rather than failing. Each
+loses a race is re-read and treated as an update rather than failing.
+
+This endpoint also seeds attribute **options**, so it takes the product import's
+`readydata_attribute_options` lock as well — which is what stops the two
+endpoints inserting the same new option label at the same time (a race this
+module previously documented rather than closed). The cost is that an attribute
+sync and a product import carrying `custom_attributes` now wait for each other;
+the rejection then reads `Another import is already running.`, naming what
+actually blocked. Both locks are held for the whole request: attribute payloads
+are a feed's attribute list, sent as a pre-flight step, so there is nothing to
+win from narrowing them.
+
+Each
 attribute is processed independently (no wrapping transaction) and reported per
 code. After any change the sync cleans the `eav`/`config`/`full_page`/`block_html`
 cache types and **invalidates** (not partial-reindex — there are no product IDs)
@@ -1247,13 +1279,29 @@ all — there is nothing to localize, and its own `reason` is the whole story.
 
 ### Concurrency & indexing
 
-Category sync takes the **same lock as the product import** (rejecting with
-`Another import is already running.`), because both mutate the category tree and
-there is no unique key on `(parent_id, name)` to fall back on — two concurrent
-runs would resolve the same missing path, both miss, and both insert. This
-endpoint takes it on **every** request, since every request to it is a category
-write; the product endpoint takes it only when its payload can reach one of the
-four unkeyed read-then-creates (see "Concurrency" under the product endpoint).
+Category sync takes the product import's **category-tree lock**
+(`readydata_product_import`, rejecting with `Another import is already
+running.`), because both mutate the tree and there is no unique key on
+`(parent_id, name)` to fall back on — two concurrent runs would resolve the same
+missing path, both miss, and both insert. This endpoint takes it on **every**
+request, since every request to it is a category write; the product endpoint
+takes it only for the batches whose payload can reach the tree, and takes none of
+its other locks on behalf of this one (see "Concurrency" under the product
+endpoint).
+
+It is held for the **whole request**, where the product import holds its locks one
+batch at a time. The difference is the sibling map: children-by-name is read once
+per depth bucket and is only invalidated by this request's own writes, so
+releasing between entries would let another request insert a sibling the map
+cannot see — which is the duplicate the lock exists to prevent. Narrowing it means
+re-reading siblings per entry rather than per bucket, and that trade has not been
+made.
+
+Because the product import now releases its locks between batches, a delete
+committed here can land between two of its batches. Its cached path → ID map
+re-verifies every entry on each use, so a path whose category has gone is
+resolved again (and re-created, as that endpoint creates missing paths) rather
+than written to as a dangling ID.
 
 Each category is processed in its own transaction and reported independently.
 That transaction is what makes a **move** atomic: `changeParent()` re-paths the
@@ -1326,8 +1374,10 @@ per request (see "Moving a category").
 - Indexing: partial reindex of affected IDs (default), invalidate, or none.
   Indexers in "Update by Schedule" mode are left to mview (DB triggers pick
   up direct writes). FPC tags of touched products are cleaned.
-- Concurrency guard: a named lock rejects overlapping imports — taken only when
-  the payload can create a category or an attribute option (see "Concurrency").
+- Concurrency guard: four named locks, one per unkeyed read-then-create, each
+  taken only by the batches whose payload can reach it and held only for that
+  batch's transaction — never across image downloads or indexing (see
+  "Concurrency").
 - Logging to `var/log/readydata_import.log`.
 
 ## Configuration

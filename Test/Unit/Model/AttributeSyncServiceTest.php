@@ -26,6 +26,7 @@ use ReadyData\Import\Model\Data\AttributeSetPlacement;
 use ReadyData\Import\Model\Data\AttributeSyncResponse;
 use ReadyData\Import\Model\Data\AttributeSyncResult;
 use ReadyData\Import\Model\Amasty\AmastyAttributeWriter;
+use ReadyData\Import\Model\ImportLocks;
 use ReadyData\Import\Model\Indexer\AttributeInvalidationHandler;
 use ReadyData\Import\Model\ResourceModel\AttributeDefinition as AttributeDefinitionResource;
 use ReadyData\Import\Model\ResourceModel\AttributeOption;
@@ -257,6 +258,66 @@ class AttributeSyncServiceTest extends TestCase
         self::assertSame(1, $response->getFailed());
         self::assertSame(AttributeSyncResultInterface::STATUS_ERROR, $result->getStatus());
         self::assertStringContainsString('Sync failed', $result->getMessages()[0]);
+    }
+
+    /**
+     * This endpoint seeds options too, so it takes the SAME option lock the
+     * product import takes. With one lock per endpoint the two could both insert
+     * the same new label — the race this module used to document rather than fix.
+     */
+    public function testTheOptionLockIsSharedWithTheProductImport(): void
+    {
+        $this->resource->method('getExistingByCodes')->willReturn([]);
+        $this->eavSetup->method('getAttributeId')->willReturn(100);
+
+        $taken = [];
+        $released = [];
+        $this->lockManager = $this->createMock(LockManagerInterface::class);
+        $this->lockManager->method('lock')->willReturnCallback(
+            static function (string $name) use (&$taken): bool {
+                $taken[] = $name;
+
+                return true;
+            }
+        );
+        $this->lockManager->method('unlock')->willReturnCallback(
+            static function (string $name) use (&$released): bool {
+                $released[] = $name;
+
+                return true;
+            }
+        );
+
+        $this->serviceWithConfig($this->config)->sync([
+            (new AttributeDefinition())->setAttributeCode('color')->setFrontendInput('select'),
+        ]);
+
+        // In the canonical order, and back in reverse: two requests taking
+        // overlapping sets in opposite orders would wait on each other.
+        self::assertSame([ImportLocks::ATTRIBUTE_SYNC, ImportLocks::ATTRIBUTE_OPTIONS], $taken);
+        self::assertSame([ImportLocks::ATTRIBUTE_OPTIONS, ImportLocks::ATTRIBUTE_SYNC], $released);
+    }
+
+    /**
+     * The wording names what actually blocked: the shared option lock means a
+     * product import is the other candidate, and that is the message the caller
+     * already backs off on.
+     */
+    public function testAHeldOptionLockIsReportedAsAnImportInProgress(): void
+    {
+        $this->lockManager = $this->createMock(LockManagerInterface::class);
+        $this->lockManager->method('lock')->willReturnCallback(
+            static fn (string $name): bool => $name !== ImportLocks::ATTRIBUTE_OPTIONS
+        );
+        // The definition lock it did get has to go back, or the retry it just
+        // asked for would block on this request.
+        $this->lockManager->expects(self::once())->method('unlock')->with(ImportLocks::ATTRIBUTE_SYNC);
+
+        $this->expectExceptionMessage('Another import is already running. Try again later.');
+
+        $this->serviceWithConfig($this->config)->sync([
+            (new AttributeDefinition())->setAttributeCode('color')->setFrontendInput('select'),
+        ]);
     }
 
     public function testDisabledNoOps(): void

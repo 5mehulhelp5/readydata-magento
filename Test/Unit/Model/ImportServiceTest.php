@@ -28,11 +28,13 @@ use ReadyData\Import\Model\Data\Product;
 use ReadyData\Import\Model\Data\ProductStoreValues;
 use ReadyData\Import\Model\Data\StoreResult;
 use ReadyData\Import\Model\Event\ImportEventDispatcher;
+use ReadyData\Import\Model\ImportLocks;
 use ReadyData\Import\Model\ImportService;
 use ReadyData\Import\Model\ImportState;
 use ReadyData\Import\Model\Indexer\InvalidationHandler;
 use ReadyData\Import\Model\Processor\PreparableInterface;
 use ReadyData\Import\Model\Processor\ProcessorInterface;
+use ReadyData\Import\Model\ResourceModel\AttributeOption;
 use ReadyData\Import\Model\ResourceModel\ProductEntity;
 
 /**
@@ -50,15 +52,23 @@ class ImportServiceTest extends TestCase
     private array $calls = [];
 
     /**
-     * @var string[] SKUs the catalog already holds. The lock's pre-flight check
-     *      reads this, because an insert of an unknown SKU is itself a race.
+     * @var string[] SKUs the catalog already holds. The lock decision reads this,
+     *      because an insert of an unknown SKU is itself a race.
      */
     private array $existingSkus = [];
+
+    /** @var string[] lock names another request is holding, so lock() refuses them */
+    private array $blockedLocks = [];
+
+    /** Which create() call the batch context factory should throw on, 1-based. */
+    private ?int $contextFactoryFailsOnCall = null;
 
     protected function setUp(): void
     {
         $this->calls = [];
         $this->existingSkus = ['P1'];
+        $this->blockedLocks = [];
+        $this->contextFactoryFailsOnCall = null;
 
         $this->connection = $this->createMock(AdapterInterface::class);
         $this->connection->method('beginTransaction')->willReturnCallback(function (): AdapterInterface {
@@ -69,14 +79,48 @@ class ImportServiceTest extends TestCase
             $this->calls[] = 'commit';
             return $this->connection;
         });
+        $this->connection->method('rollBack')->willReturnCallback(function (): AdapterInterface {
+            $this->calls[] = 'rollBack';
+            return $this->connection;
+        });
         $this->connection->method('fetchOne')->willReturn('1');
 
         $this->lockManager = $this->createMock(LockManagerInterface::class);
-        $this->lockManager->method('lock')->willReturn(true);
-        $this->lockManager->method('isLocked')->willReturn(true);
+        $this->lockManager->method('lock')->willReturnCallback(function (string $name): bool {
+            if (in_array($name, $this->blockedLocks, true)) {
+                $this->calls[] = 'lock-refused:' . $name;
+
+                return false;
+            }
+            $this->calls[] = 'lock:' . $name;
+
+            return true;
+        });
+        $this->lockManager->method('unlock')->willReturnCallback(function (string $name): bool {
+            $this->calls[] = 'unlock:' . $name;
+
+            return true;
+        });
 
         $this->invalidationHandler = $this->createMock(InvalidationHandler::class);
+        $this->invalidationHandler->method('execute')->willReturnCallback(function (): void {
+            $this->calls[] = 'invalidate';
+        });
         $this->logger = $this->createMock(Logger::class);
+    }
+
+    /**
+     * Just the lock traffic from the call log, so a test can assert what was
+     * taken, in which order, and when it went back.
+     *
+     * @return string[]
+     */
+    private function lockCalls(): array
+    {
+        return array_values(array_filter(
+            $this->calls,
+            static fn (string $call): bool => str_starts_with($call, 'lock') || str_starts_with($call, 'unlock')
+        ));
     }
 
     public function testPreparationRunsBeforeTheTransactionOpens(): void
@@ -85,7 +129,10 @@ class ImportServiceTest extends TestCase
 
         $this->serviceWith([$processor])->import([$this->product('P1')]);
 
-        self::assertSame(['prepare:710', 'beginTransaction', 'process:710', 'commit'], $this->calls);
+        self::assertSame(
+            ['prepare:710', 'beginTransaction', 'process:710', 'commit', 'invalidate'],
+            $this->calls
+        );
     }
 
     public function testPreparablesRunInSortOrder(): void
@@ -95,7 +142,15 @@ class ImportServiceTest extends TestCase
         $service->import([$this->product('P1')]);
 
         self::assertSame(
-            ['prepare:710', 'prepare:900', 'beginTransaction', 'process:710', 'process:900', 'commit'],
+            [
+                'prepare:710',
+                'prepare:900',
+                'beginTransaction',
+                'process:710',
+                'process:900',
+                'commit',
+                'invalidate',
+            ],
             $this->calls
         );
     }
@@ -108,7 +163,7 @@ class ImportServiceTest extends TestCase
 
         $this->serviceWith([$processor])->import([$this->product('P1')]);
 
-        self::assertSame(['beginTransaction', 'commit'], $this->calls);
+        self::assertSame(['beginTransaction', 'commit', 'invalidate'], $this->calls);
     }
 
     public function testPlainProcessorIsNotPrepared(): void
@@ -120,7 +175,7 @@ class ImportServiceTest extends TestCase
 
         $this->serviceWith([$processor])->import([$this->product('P1')]);
 
-        self::assertSame(['beginTransaction', 'commit'], $this->calls);
+        self::assertSame(['beginTransaction', 'commit', 'invalidate'], $this->calls);
     }
 
     public function testThrowingPreparationFailsTheBatchWithoutOpeningOrRollingBackAnything(): void
@@ -146,28 +201,6 @@ class ImportServiceTest extends TestCase
         self::assertStringContainsString('the CDN is unreachable', $result->getMessages()[0]);
     }
 
-    public function testLosingTheImportLockDuringPreparationFailsTheBatch(): void
-    {
-        // The lock is a GET_LOCK on the import's own connection, so a reconnect
-        // after a long download phase silently releases it.
-        $this->lockManager = $this->createMock(LockManagerInterface::class);
-        $this->lockManager->method('lock')->willReturn(true);
-        $this->lockManager->method('isLocked')->willReturn(false);
-
-        $this->connection->expects(self::never())->method('beginTransaction');
-
-        // Carries categories, so this payload actually takes the lock — the
-        // probe has nothing to say about one that never held it.
-        $response = $this->serviceWith([$this->preparable(710)])
-            ->import([$this->product('P1')->setCategories(['Default Category/Men'])]);
-
-        self::assertSame(1, $response->getFailed());
-        self::assertStringContainsString(
-            'the import lock was lost',
-            $response->getResults()[0]->getMessages()[0]
-        );
-    }
-
     public function testPreparationIsSkippedEntirelyWhenNoProcessorNeedsIt(): void
     {
         $processor = $this->createMock(ProcessorInterface::class);
@@ -176,23 +209,72 @@ class ImportServiceTest extends TestCase
 
         // No liveness probe either: nothing idled the connection.
         $this->connection->expects(self::never())->method('fetchOne');
-        $this->lockManager->expects(self::never())->method('isLocked');
 
         $this->serviceWith([$processor])->import([$this->product('P1')]);
     }
 
     /**
-     * The lock serializes every import against every other one, and against the
-     * category endpoint. A payload that can reach no read-then-create has
-     * nothing to serialize against and should not pay for it — a price refresh
-     * over products that already exist, typically.
+     * The locks are taken AFTER the download phase and given back as soon as the
+     * transaction resolves. That ordering is the whole point: a competing import
+     * waits for one transaction, not for a feed's worth of image downloads, and
+     * not for the reindex that follows.
      */
-    public function testAPayloadThatCanCreateNothingUnkeyedRunsWithoutTheLock(): void
+    public function testLocksAreHeldOnlyForTheTransactionNeverAcrossDownloadsOrIndexing(): void
     {
-        $this->lockManager->expects(self::never())->method('lock');
-        $this->lockManager->expects(self::never())->method('unlock');
+        $this->serviceWith([$this->preparable(710)])
+            ->import([$this->product('P1')->setCategories([])]);
 
+        self::assertSame(
+            [
+                'prepare:710',
+                'lock:' . ImportLocks::CATEGORY_TREE,
+                'beginTransaction',
+                'process:710',
+                'commit',
+                'unlock:' . ImportLocks::CATEGORY_TREE,
+                'invalidate',
+            ],
+            $this->calls
+        );
+    }
+
+    /**
+     * The locks are also released before the after-commit events: an observer is
+     * someone else's code doing an unknown amount of work, and by then the rows
+     * are committed and visible, so there is nothing left to protect.
+     */
+    public function testLocksAreReleasedBeforeTheAfterCommitEvents(): void
+    {
+        $dispatcher = $this->createMock(ImportEventDispatcher::class);
+        $dispatcher->method('dispatchAfterCommit')->willReturnCallback(function (): void {
+            $this->calls[] = 'afterCommitEvents';
+        });
+
+        $this->serviceWith([], dispatcher: $dispatcher)->import([$this->product('P1')->setCategories([])]);
+
+        self::assertSame(
+            [
+                'lock:' . ImportLocks::CATEGORY_TREE,
+                'beginTransaction',
+                'commit',
+                'unlock:' . ImportLocks::CATEGORY_TREE,
+                'afterCommitEvents',
+                'invalidate',
+            ],
+            $this->calls
+        );
+    }
+
+    /**
+     * A batch that can reach no read-then-create has nothing to serialize
+     * against and should not pay for it — a price refresh over products that
+     * already exist, typically.
+     */
+    public function testAPayloadThatCanCreateNothingUnkeyedRunsWithoutAnyLock(): void
+    {
         $this->serviceWith([])->import([$this->product('P1')->setPrice(9.99)]);
+
+        self::assertSame([], $this->lockCalls());
     }
 
     /**
@@ -201,69 +283,88 @@ class ImportServiceTest extends TestCase
      * same new SKU both miss the read and both insert, and no payload field
      * reveals it: only the database can say whether the row is already there.
      */
-    public function testAnUnknownSkuTakesTheLock(): void
+    public function testAnUnknownSkuTakesTheProductCreateLockAndNothingElse(): void
     {
         $this->existingSkus = [];
-        $this->lockManager->expects(self::once())->method('lock')->willReturn(true);
-        $this->lockManager->expects(self::once())->method('unlock');
 
         $this->serviceWith([])->import([$this->product('P1')->setPrice(9.99)]);
+
+        self::assertSame(
+            ['lock:' . ImportLocks::PRODUCT_CREATE, 'unlock:' . ImportLocks::PRODUCT_CREATE],
+            $this->lockCalls()
+        );
     }
 
     /**
      * catalog_product_entity_media_gallery has no key on (attribute_id, value),
      * so two concurrent runs carrying the same file for one product both insert
      * it. `[]` counts too: it means "remove everything", which is still work.
+     *
+     * That it takes the gallery lock ALONE is the point of splitting the names: a
+     * media feed and a category sync cannot duplicate each other's work, so one
+     * lock for both would serialize them for nothing.
      */
-    public function testAMediaFieldTakesTheLock(): void
+    public function testAMediaFieldTakesTheGalleryLockAndNothingElse(): void
     {
-        $this->lockManager->expects(self::once())->method('lock')->willReturn(true);
-
         $this->serviceWith([])->import([$this->product('P1')->setMedia([])]);
+
+        self::assertSame(
+            ['lock:' . ImportLocks::MEDIA_GALLERY, 'unlock:' . ImportLocks::MEDIA_GALLERY],
+            $this->lockCalls()
+        );
     }
 
     public function testAMediaFieldRunsLockFreeWhenTheMediaStepIsDisabled(): void
     {
         // A disabled media importer inserts nothing, so nothing can race.
-        $this->lockManager->expects(self::never())->method('lock');
-
         $this->serviceWith([], mediaEnabled: false)->import([$this->product('P1')->setMedia([])]);
+
+        self::assertSame([], $this->lockCalls());
     }
 
-    public function testACategoriesFieldTakesTheLock(): void
+    public function testACategoriesFieldTakesTheTreeLockAndNothingElse(): void
     {
         // Presence is the test, not whether any entry turns out to need
         // creating — knowing that means resolving the tree, which is the work
         // the lock protects.
-        $this->lockManager->expects(self::once())->method('lock')->willReturn(true);
-        $this->lockManager->expects(self::once())->method('unlock');
-
         $this->serviceWith([])->import([$this->product('P1')->setCategories([])]);
+
+        self::assertSame(
+            ['lock:' . ImportLocks::CATEGORY_TREE, 'unlock:' . ImportLocks::CATEGORY_TREE],
+            $this->lockCalls()
+        );
     }
 
     /**
      * eav_attribute_option has no key on the label at all, so two concurrent
-     * imports writing the same new option label both miss and both insert.
+     * imports writing the same new option label both miss and both insert. The
+     * attribute endpoint takes this same name, which is what closes that race
+     * across the two endpoints.
      */
-    public function testCustomAttributesTakeTheLockWhenOptionAutoCreationIsOn(): void
+    public function testCustomAttributesTakeTheOptionLockWhenAutoCreationIsOn(): void
     {
-        $this->lockManager->expects(self::once())->method('lock')->willReturn(true);
-
         $product = $this->product('P1')->setCustomAttributes([
             (new CustomAttribute())->setAttributeCode('color')->setValue('Red'),
         ]);
+
         $this->serviceWith([], createMissingOptions: true)->import([$product]);
+
+        self::assertSame(
+            ['lock:' . ImportLocks::ATTRIBUTE_OPTIONS, 'unlock:' . ImportLocks::ATTRIBUTE_OPTIONS],
+            $this->lockCalls()
+        );
     }
 
     public function testCustomAttributesRunLockFreeWhenOptionAutoCreationIsOff(): void
     {
         // Nothing can be created, so nothing can race.
-        $this->lockManager->expects(self::never())->method('lock');
-
         $product = $this->product('P1')->setCustomAttributes([
             (new CustomAttribute())->setAttributeCode('color')->setValue('Red'),
         ]);
+
         $this->serviceWith([], createMissingOptions: false)->import([$product]);
+
+        self::assertSame([], $this->lockCalls());
     }
 
     /**
@@ -273,22 +374,205 @@ class ImportServiceTest extends TestCase
      */
     public function testCustomAttributesInsideAStoreValuesBlockDoNotTakeTheLock(): void
     {
-        $this->lockManager->expects(self::never())->method('lock');
-
         $product = $this->product('P1')->setStoreValues([
             (new ProductStoreValues())->setStoreId(3)->setCustomAttributes([
                 (new CustomAttribute())->setAttributeCode('color')->setValue('Rot'),
             ]),
         ]);
+
         $this->serviceWith([], createMissingOptions: true)->import([$product]);
+
+        self::assertSame([], $this->lockCalls());
     }
 
-    public function testALockFreePayloadStillProbesTheConnectionButNotTheLock(): void
+    public function testALockFreePayloadStillProbesTheConnection(): void
     {
         $this->connection->expects(self::once())->method('fetchOne');
-        $this->lockManager->expects(self::never())->method('isLocked');
 
         $this->serviceWith([$this->preparable(710)])->import([$this->product('P1')]);
+
+        self::assertSame([], $this->lockCalls());
+    }
+
+    /**
+     * Every holder acquires in one fixed order, which is what stops two requests
+     * wanting overlapping sets from taking them in opposite orders and waiting on
+     * each other until both time out. Released in reverse.
+     */
+    public function testASetOfLocksIsTakenInOneCanonicalOrder(): void
+    {
+        $this->existingSkus = [];
+        $product = $this->product('P1')
+            ->setMedia([])
+            ->setCategories([])
+            ->setCustomAttributes([(new CustomAttribute())->setAttributeCode('color')->setValue('Red')]);
+
+        $this->serviceWith([], createMissingOptions: true)->import([$product]);
+
+        self::assertSame(
+            [
+                'lock:' . ImportLocks::ATTRIBUTE_OPTIONS,
+                'lock:' . ImportLocks::PRODUCT_CREATE,
+                'lock:' . ImportLocks::CATEGORY_TREE,
+                'lock:' . ImportLocks::MEDIA_GALLERY,
+                'unlock:' . ImportLocks::MEDIA_GALLERY,
+                'unlock:' . ImportLocks::CATEGORY_TREE,
+                'unlock:' . ImportLocks::PRODUCT_CREATE,
+                'unlock:' . ImportLocks::ATTRIBUTE_OPTIONS,
+            ],
+            $this->lockCalls()
+        );
+    }
+
+    /**
+     * A lock left held would block every later import in the process, so opening
+     * the transaction has to be inside the guarded region too — and rolling back
+     * one that never opened would raise a second, misleading error.
+     */
+    public function testLocksGoBackEvenWhenTheTransactionCannotBeOpened(): void
+    {
+        $this->connection = $this->createMock(AdapterInterface::class);
+        $this->connection->method('fetchOne')->willReturn('1');
+        $this->connection->method('beginTransaction')
+            ->willThrowException(new \RuntimeException('the server has gone away'));
+        $this->connection->expects(self::never())->method('rollBack');
+
+        $response = $this->serviceWith([])->import([$this->product('P1')->setCategories([])]);
+
+        self::assertSame(
+            ['lock:' . ImportLocks::CATEGORY_TREE, 'unlock:' . ImportLocks::CATEGORY_TREE],
+            $this->lockCalls()
+        );
+        self::assertSame(1, $response->getFailed());
+        self::assertStringContainsString('the server has gone away', $response->getResults()[0]->getMessages()[0]);
+    }
+
+    /**
+     * A set is all or nothing. Half of it left held while the caller retries
+     * would block the very request that is about to come back.
+     */
+    public function testAHalfAcquiredSetIsReleasedAgain(): void
+    {
+        $this->existingSkus = [];
+        $this->blockedLocks = [ImportLocks::CATEGORY_TREE];
+
+        $this->expectExceptionMessage('Another import is already running');
+
+        try {
+            $this->serviceWith([])->import([$this->product('P1')->setCategories([])]);
+        } finally {
+            self::assertSame(
+                [
+                    'lock:' . ImportLocks::PRODUCT_CREATE,
+                    'lock-refused:' . ImportLocks::CATEGORY_TREE,
+                    'unlock:' . ImportLocks::PRODUCT_CREATE,
+                ],
+                $this->lockCalls()
+            );
+        }
+    }
+
+    /**
+     * Decided per BATCH, not per request: one unknown SKU in a large payload used
+     * to make the whole request serialize against every other import, when only
+     * the batch carrying it can create anything.
+     */
+    public function testOnlyTheBatchThatCanCreateAProductTakesTheProductLock(): void
+    {
+        $this->existingSkus = ['P1', 'P2'];
+
+        // Batch size 1, so each product is its own batch and only the second one
+        // names a SKU the catalog does not have.
+        $this->serviceWith([], batchSize: 1)->import([
+            $this->product('P1'),
+            $this->product('NEW-1'),
+            $this->product('P2'),
+        ]);
+
+        self::assertSame(
+            ['lock:' . ImportLocks::PRODUCT_CREATE, 'unlock:' . ImportLocks::PRODUCT_CREATE],
+            $this->lockCalls()
+        );
+    }
+
+    /**
+     * The option memo survives batches, but the lock does not. A label another
+     * import committed while we were downloading is not in the memo, and
+     * createOptions() trusts the memo to decide what is missing — so re-reading
+     * under the freshly taken lock is what keeps it from inserting a duplicate.
+     */
+    public function testTheOptionMemoIsDroppedUnderEveryBatchsFreshLock(): void
+    {
+        $attributeOption = $this->createMock(AttributeOption::class);
+        $attributeOption->expects(self::exactly(2))->method('forget');
+
+        $this->serviceWith([], batchSize: 1, attributeOption: $attributeOption)
+            ->import([$this->product('P1'), $this->product('P1-B')]);
+    }
+
+    /**
+     * Nothing is committed yet, so the honest answer is that the request did not
+     * happen — and this is the wording callers recognise and back off on.
+     */
+    public function testAFirstBatchThatCannotTakeItsLocksIsRejectedOutright(): void
+    {
+        $this->blockedLocks = [ImportLocks::CATEGORY_TREE];
+
+        $this->expectExceptionMessage('Another import is already running. Try again later.');
+
+        $this->serviceWith([])->import([$this->product('P1')->setCategories([])]);
+    }
+
+    /**
+     * A later batch has committed work whose results are worth returning, so it
+     * fails as a batch instead of throwing: a request that threw here would hand
+     * back a 400 with no results at all and leave the caller to work out by other
+     * means which of its products landed.
+     */
+    public function testALaterBatchThatCannotTakeItsLocksFailsOnlyItself(): void
+    {
+        $this->existingSkus = ['P1', 'P2'];
+        // Only the batch carrying the media block wants the gallery lock.
+        $this->blockedLocks = [ImportLocks::MEDIA_GALLERY];
+
+        $response = $this->serviceWith([], batchSize: 1)->import([
+            $this->product('P1'),
+            $this->product('P2')->setMedia([]),
+        ]);
+
+        self::assertSame(2, $response->getReceived());
+        self::assertSame(1, $response->getFailed());
+        self::assertSame(ImportResultInterface::STATUS_ERROR, $response->getResults()[1]->getStatus());
+        self::assertStringContainsString(
+            'another import is holding',
+            $response->getResults()[1]->getMessages()[0]
+        );
+        // The first batch committed and is reported normally.
+        self::assertNotSame(ImportResultInterface::STATUS_ERROR, $response->getResults()[0]->getStatus());
+    }
+
+    /**
+     * Work that committed is already visible to the storefront, so anything
+     * escaping the batch loop must not leave it un-indexed behind stale FPC
+     * entries — which is why invalidation runs in a finally.
+     *
+     * The batch itself cannot be the thing that escapes: processBatch() catches
+     * Throwable and reports a rolled-back batch as failed results. What is left
+     * is the machinery around it, and the context factory stands in for that.
+     */
+    public function testCommittedWorkIsStillInvalidatedWhenTheBatchLoopThrows(): void
+    {
+        $this->contextFactoryFailsOnCall = 2;
+
+        try {
+            $this->serviceWith([], batchSize: 1)->import([$this->product('P1'), $this->product('P1-B')]);
+            self::fail('the failure should have propagated');
+        } catch (\RuntimeException $e) {
+            self::assertSame('the context could not be built', $e->getMessage());
+        }
+
+        // The first batch committed, and its IDs still reached the indexers.
+        self::assertSame(['beginTransaction', 'commit', 'invalidate'], $this->calls);
     }
 
     /**
@@ -481,11 +765,14 @@ class ImportServiceTest extends TestCase
         array $processors,
         int $storeId = 0,
         bool $createMissingOptions = false,
-        bool $mediaEnabled = true
+        bool $mediaEnabled = true,
+        int $batchSize = 500,
+        ?AttributeOption $attributeOption = null,
+        ?ImportEventDispatcher $dispatcher = null
     ): ImportService {
         $config = $this->createMock(Config::class);
         $config->method('isEnabled')->willReturn(true);
-        $config->method('getBatchSize')->willReturn(500);
+        $config->method('getBatchSize')->willReturn($batchSize);
         $config->method('isContinueOnError')->willReturn(true);
         $config->method('isCreateMissingOptions')->willReturn($createMissingOptions);
         $config->method('isMediaEnabled')->willReturn($mediaEnabled);
@@ -502,8 +789,15 @@ class ImportServiceTest extends TestCase
         $resourceConnection->method('getConnection')->willReturn($this->connection);
 
         $batchContextFactory = $this->createMock(BatchContextFactory::class);
+        $created = 0;
         $batchContextFactory->method('create')->willReturnCallback(
-            static fn (array $data): BatchContext => new BatchContext($data['products'], $data['storeId'])
+            function (array $data) use (&$created): BatchContext {
+                if (++$created === $this->contextFactoryFailsOnCall) {
+                    throw new \RuntimeException('the context could not be built');
+                }
+
+                return new BatchContext($data['products'], $data['storeId']);
+            }
         );
 
         $storeWebsiteMap = $this->createMock(StoreWebsiteMap::class);
@@ -522,9 +816,10 @@ class ImportServiceTest extends TestCase
             $this->lockManager,
             $batchContextFactory,
             $productEntity,
+            $attributeOption ?? $this->createMock(AttributeOption::class),
             $storeWebsiteMap,
             $this->invalidationHandler,
-            $this->createMock(ImportEventDispatcher::class),
+            $dispatcher ?? $this->createMock(ImportEventDispatcher::class),
             $this->createMock(ImportState::class),
             $responseFactory,
             $resultFactory,
