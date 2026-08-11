@@ -20,6 +20,7 @@ use ReadyData\Import\Api\Data\StoreResultInterfaceFactory;
 use ReadyData\Import\Logger\Logger;
 use ReadyData\Import\Model\Cache\StoreWebsiteMap;
 use ReadyData\Import\Model\Event\ImportEventDispatcher;
+use ReadyData\Import\Model\Exception\ImportLockedException;
 use ReadyData\Import\Model\Indexer\InvalidationHandler;
 use ReadyData\Import\Model\Processor\CategoryLinkProcessor;
 use ReadyData\Import\Model\Processor\PreparableInterface;
@@ -276,20 +277,27 @@ class ImportService
      *
      * The FIRST batch throws, with the wording it has always thrown: nothing is
      * committed, so the honest answer is that the request did not happen, and
-     * callers recognise that message and back off.
+     * callers recognise that message and back off. It is an
+     * {@see ImportLockedException} rather than a plain LocalizedException so the
+     * refusal carries its own status code (429) and a machine-readable reason,
+     * and a caller no longer has to match the message to know it is retryable.
      *
      * Any later batch has committed work whose results are worth returning, so
-     * it fails as a batch instead — a request that threw here would hand back a
-     * 400 with no results at all and leave the caller to discover by other means
-     * which of its products landed.
+     * it fails as a batch instead — a request that threw here would hand back an
+     * error with no results at all and leave the caller to discover by other
+     * means which of its products landed.
      *
      * @param string[] $locks
-     * @throws LocalizedException
+     * @throws ImportLockedException
      */
     private function reportLockRejection(BatchContext $context, int $batchNumber, array $locks): bool
     {
         if ($batchNumber === 0) {
-            throw new LocalizedException(__('Another import is already running. Try again later.'));
+            throw new ImportLockedException(
+                __('Another import is already running. Try again later.'),
+                $locks,
+                ImportLocks::TIMEOUT_SEC
+            );
         }
 
         $message = sprintf(

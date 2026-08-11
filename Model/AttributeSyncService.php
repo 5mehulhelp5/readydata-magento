@@ -21,6 +21,7 @@ use ReadyData\Import\Logger\Logger;
 use ReadyData\Import\Model\Amasty\AmastyAttributeWriter;
 use ReadyData\Import\Model\Cache\AttributeMetadataCache;
 use ReadyData\Import\Model\Exception\AttributeValidationException;
+use ReadyData\Import\Model\Exception\ImportLockedException;
 use ReadyData\Import\Model\Indexer\AttributeInvalidationHandler;
 use ReadyData\Import\Model\ResourceModel\AttributeDefinition as AttributeDefinitionResource;
 use ReadyData\Import\Model\ResourceModel\AttributeOption;
@@ -109,12 +110,17 @@ class AttributeSyncService
 
                 // The wording names what actually blocked. Only the definition
                 // lock means another attribute sync; the option lock is shared,
-                // so a product import creating options is the other candidate —
-                // and that message is the one callers already back off on.
-                throw new LocalizedException(
+                // so a product import creating options is the other candidate.
+                // The TYPE is what makes either one recognisably retryable
+                // without reading it — this endpoint's own wording never matched
+                // the string callers were looking for, so until there was a
+                // status code for it, its rejections were never retried at all.
+                throw new ImportLockedException(
                     $lock === ImportLocks::ATTRIBUTE_SYNC
                         ? __('Another attribute sync is already running. Try again later.')
-                        : __('Another import is already running. Try again later.')
+                        : __('Another import is already running. Try again later.'),
+                    [$lock],
+                    ImportLocks::TIMEOUT_SEC
                 );
             }
             $acquired[] = $lock;

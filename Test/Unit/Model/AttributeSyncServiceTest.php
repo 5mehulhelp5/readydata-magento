@@ -26,6 +26,7 @@ use ReadyData\Import\Model\Data\AttributeSetPlacement;
 use ReadyData\Import\Model\Data\AttributeSyncResponse;
 use ReadyData\Import\Model\Data\AttributeSyncResult;
 use ReadyData\Import\Model\Amasty\AmastyAttributeWriter;
+use ReadyData\Import\Model\Exception\ImportLockedException;
 use ReadyData\Import\Model\ImportLocks;
 use ReadyData\Import\Model\Indexer\AttributeInvalidationHandler;
 use ReadyData\Import\Model\ResourceModel\AttributeDefinition as AttributeDefinitionResource;
@@ -318,6 +319,29 @@ class AttributeSyncServiceTest extends TestCase
         $this->serviceWithConfig($this->config)->sync([
             (new AttributeDefinition())->setAttributeCode('color')->setFrontendInput('select'),
         ]);
+    }
+
+    /**
+     * This endpoint's own wording never matched the string callers were looking
+     * for, so before there was a status code for it, its rejections were never
+     * retried at all. The type is what fixes that — the message stays as it was.
+     */
+    public function testItsOwnLockRejectionIsAlsoRetryable(): void
+    {
+        $this->lockManager = $this->createMock(LockManagerInterface::class);
+        $this->lockManager->method('lock')->willReturn(false);
+
+        try {
+            $this->serviceWithConfig($this->config)->sync([
+                (new AttributeDefinition())->setAttributeCode('color')->setFrontendInput('select'),
+            ]);
+            self::fail('the rejection should have been thrown');
+        } catch (ImportLockedException $e) {
+            self::assertSame('Another attribute sync is already running. Try again later.', $e->getMessage());
+            self::assertSame(429, $e->getHttpCode());
+            self::assertSame(ImportLockedException::REASON, $e->getDetails()['reason']);
+            self::assertSame([ImportLocks::ATTRIBUTE_SYNC], $e->getDetails()['locks']);
+        }
     }
 
     public function testDisabledNoOps(): void

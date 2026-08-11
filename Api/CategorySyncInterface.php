@@ -38,9 +38,15 @@ interface CategorySyncInterface
     /**
      * Create or update the given categories.
      *
+     * A refusal because another request holds a lock this one needs is an
+     * ImportLockedException — a LocalizedException that renders as **429**
+     * rather than 400, because it is the one failure here worth retrying
+     * unchanged. Everything else stays a 400.
+     *
      * @param \ReadyData\Import\Api\Data\CategoryDefinitionInterface[] $categories
      * @param \ReadyData\Import\Api\Data\ImportSettingsInterface|null $settings
      * @return \ReadyData\Import\Api\Data\CategorySyncResponseInterface
+     * @throws \ReadyData\Import\Model\Exception\ImportLockedException
      * @throws \Magento\Framework\Exception\LocalizedException
      */
     public function sync(array $categories, ?ImportSettingsInterface $settings = null): CategorySyncResponseInterface;

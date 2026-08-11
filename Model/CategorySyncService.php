@@ -28,6 +28,7 @@ use ReadyData\Import\Model\Cache\StoreWebsiteMap;
 use ReadyData\Import\Model\Category\CategoryWriter;
 use ReadyData\Import\Model\Category\PathParser;
 use ReadyData\Import\Model\Exception\CategoryValidationException;
+use ReadyData\Import\Model\Exception\ImportLockedException;
 use ReadyData\Import\Model\Indexer\CategoryInvalidationHandler;
 use ReadyData\Import\Model\ResourceModel\Category as CategoryResource;
 
@@ -122,8 +123,13 @@ class CategorySyncService
 
         if (!$this->lockManager->lock(self::LOCK_NAME, ImportLocks::TIMEOUT_SEC)) {
             // Wording matches the product endpoint verbatim: callers already
-            // recognise it and back off.
-            throw new LocalizedException(__('Another import is already running. Try again later.'));
+            // recognise it and back off. The type is what tells them without
+            // reading it — see ImportLockedException.
+            throw new ImportLockedException(
+                __('Another import is already running. Try again later.'),
+                [self::LOCK_NAME],
+                ImportLocks::TIMEOUT_SEC
+            );
         }
 
         $results = [];

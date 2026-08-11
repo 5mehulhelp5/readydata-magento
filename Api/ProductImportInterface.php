@@ -23,9 +23,15 @@ interface ProductImportInterface
     /**
      * Import (create or update) products in bulk via direct database writes.
      *
+     * A refusal because another request holds a lock this one needs is an
+     * ImportLockedException — a LocalizedException that renders as **429**
+     * rather than 400, because it is the one failure here worth retrying
+     * unchanged. Everything else stays a 400.
+     *
      * @param \ReadyData\Import\Api\Data\ProductInterface[] $products
      * @param \ReadyData\Import\Api\Data\ImportSettingsInterface|null $settings
      * @return \ReadyData\Import\Api\Data\ImportResponseInterface
+     * @throws \ReadyData\Import\Model\Exception\ImportLockedException
      * @throws \Magento\Framework\Exception\LocalizedException
      */
     public function import(array $products, ?ImportSettingsInterface $settings = null): ImportResponseInterface;

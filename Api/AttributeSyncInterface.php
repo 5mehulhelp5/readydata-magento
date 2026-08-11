@@ -29,8 +29,14 @@ interface AttributeSyncInterface
     /**
      * Create or update the given product attribute definitions.
      *
+     * A refusal because another request holds a lock this one needs is an
+     * ImportLockedException — a LocalizedException that renders as **429**
+     * rather than 400, because it is the one failure here worth retrying
+     * unchanged. Everything else stays a 400.
+     *
      * @param \ReadyData\Import\Api\Data\AttributeDefinitionInterface[] $attributes
      * @return \ReadyData\Import\Api\Data\AttributeSyncResponseInterface
+     * @throws \ReadyData\Import\Model\Exception\ImportLockedException
      * @throws \Magento\Framework\Exception\LocalizedException
      */
     public function sync(array $attributes): AttributeSyncResponseInterface;

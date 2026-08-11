@@ -36,6 +36,8 @@ use ReadyData\Import\Model\Data\CategorySyncResponse;
 use ReadyData\Import\Model\Data\ImportSettings;
 use ReadyData\Import\Model\Data\CategorySyncResult;
 use ReadyData\Import\Model\Data\CustomAttribute;
+use ReadyData\Import\Model\Exception\ImportLockedException;
+use ReadyData\Import\Model\ImportLocks;
 use ReadyData\Import\Model\Indexer\CategoryInvalidationHandler;
 use ReadyData\Import\Model\ResourceModel\Category as CategoryResource;
 
@@ -824,16 +826,27 @@ class CategorySyncServiceTest extends TestCase
         );
     }
 
-    public function testLockContentionThrows(): void
+    /**
+     * Still a LocalizedException for anything catching that, but typed and
+     * carrying its own 429 so a caller can tell "come back shortly" apart from
+     * the 400s that mean the payload itself is wrong.
+     */
+    public function testLockContentionThrowsARetryableRejection(): void
     {
         $lockManager = $this->createMock(LockManagerInterface::class);
         $lockManager->method('lock')->willReturn(false);
         $service = $this->buildService(null, $lockManager);
 
-        $this->expectException(LocalizedException::class);
-        $this->expectExceptionMessage('Another import is already running.');
-
-        $service->sync([$this->definition('Default Category/Men')]);
+        try {
+            $service->sync([$this->definition('Default Category/Men')]);
+            self::fail('the rejection should have been thrown');
+        } catch (ImportLockedException $e) {
+            self::assertInstanceOf(LocalizedException::class, $e);
+            self::assertStringContainsString('Another import is already running.', $e->getMessage());
+            self::assertSame(429, $e->getHttpCode());
+            self::assertSame(ImportLockedException::REASON, $e->getDetails()['reason']);
+            self::assertSame([ImportLocks::CATEGORY_TREE], $e->getDetails()['locks']);
+        }
     }
 
     public function testEmptyPayloadThrows(): void

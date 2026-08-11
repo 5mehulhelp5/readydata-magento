@@ -634,6 +634,31 @@ and:
   that did commit. Later batches also wait longer (30 s rather than 10 s):
   abandoning batch 4 of 10 leaves the caller reconciling a partial import.
 
+That outright rejection is the **only** failure these endpoints answer with
+**`429 Too Many Requests`**; everything else is a `400`. The distinction is the
+point: a 400 means the request is wrong and will stay wrong, while this one means
+nothing is wrong at all and sending it again shortly is the whole remedy. The
+body carries a machine-readable reason so a caller never has to match the
+message:
+
+```json
+{
+  "message": "Another import is already running. Try again later.",
+  "parameters": {
+    "reason": "import_locked",
+    "locks": ["readydata_product_import"],
+    "retry_after": 10
+  }
+}
+```
+
+429 rather than 503 (which reads as "this store is unhealthy" to every proxy and
+health check between the caller and PHP) or 409 (accurate about the state, but it
+tells a caller to resolve a conflict when there is nothing to resolve but the
+wait). No `Retry-After` header: the hint is in the body, where a non-HTTP caller
+can read it too. Match on `parameters.reason`, not on the status alone — a bare
+429 from a proxy in front of the store is somebody else's rate limiting.
+
 One race the locks still do **not** cover: `url_rewrite` is unique on
 `(request_path, store_id)`, so concurrent requests cannot duplicate a rewrite —
 but they read the conflict set before writing, which makes the `error` and
@@ -796,6 +821,12 @@ the rejection then reads `Another import is already running.`, naming what
 actually blocked. Both locks are held for the whole request: attribute payloads
 are a feed's attribute list, sent as a pre-flight step, so there is nothing to
 win from narrowing them.
+
+Either rejection comes back as **`429`** with `parameters.reason:
+"import_locked"`, exactly as the product endpoint's does (see "Concurrency"
+there). That matters most here: this endpoint's own wording says *attribute
+sync*, not *import*, so a caller matching the product endpoint's message never
+recognised it — and never retried a refusal that only ever needed retrying.
 
 Each
 attribute is processed independently (no wrapping transaction) and reported per
@@ -1280,8 +1311,9 @@ all — there is nothing to localize, and its own `reason` is the whole story.
 ### Concurrency & indexing
 
 Category sync takes the product import's **category-tree lock**
-(`readydata_product_import`, rejecting with `Another import is already
-running.`), because both mutate the tree and there is no unique key on
+(`readydata_product_import`, rejecting with `Another import is already running.`
+as **`429`** with `parameters.reason: "import_locked"` — see "Concurrency" under
+the product endpoint), because both mutate the tree and there is no unique key on
 `(parent_id, name)` to fall back on — two concurrent runs would resolve the same
 missing path, both miss, and both insert. This endpoint takes it on **every**
 request, since every request to it is a category write; the product endpoint
@@ -1725,4 +1757,15 @@ base for a step that should be registered but inert until it is written.
 composer require readydata/module-import
 bin/magento module:enable ReadyData_Import
 bin/magento setup:upgrade
+bin/magento setup:di:compile   # on a compiled (production) deployment
 ```
+
+### Upgrading to the typed lock rejection
+
+A lock conflict used to be a `400` that callers recognised by its message; it is
+now a `429` carrying `parameters.reason: "import_locked"` (see "Concurrency").
+**Update the caller first.** A caller that only knows the old signal stops
+recognising the new one, and a refusal it would have retried becomes a hard
+failure — so it has to accept both before this module starts sending the new one.
+Recognising both is all that is needed; nothing has to be switched over
+afterwards, since the wording is unchanged.

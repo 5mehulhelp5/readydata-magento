@@ -8,6 +8,7 @@ namespace ReadyData\Import\Test\Unit\Model;
 
 use Magento\Framework\App\ResourceConnection;
 use Magento\Framework\DB\Adapter\AdapterInterface;
+use Magento\Framework\Exception\LocalizedException;
 use Magento\Framework\Lock\LockManagerInterface;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
@@ -28,6 +29,7 @@ use ReadyData\Import\Model\Data\Product;
 use ReadyData\Import\Model\Data\ProductStoreValues;
 use ReadyData\Import\Model\Data\StoreResult;
 use ReadyData\Import\Model\Event\ImportEventDispatcher;
+use ReadyData\Import\Model\Exception\ImportLockedException;
 use ReadyData\Import\Model\ImportLocks;
 use ReadyData\Import\Model\ImportService;
 use ReadyData\Import\Model\ImportState;
@@ -513,12 +515,41 @@ class ImportServiceTest extends TestCase
     /**
      * Nothing is committed yet, so the honest answer is that the request did not
      * happen — and this is the wording callers recognise and back off on.
+     *
+     * The type carries the rest: a status code of its own (429) and a
+     * machine-readable reason, so a caller never has to match the message. Every
+     * other failure from this endpoint is a 400, which must not be retried.
      */
-    public function testAFirstBatchThatCannotTakeItsLocksIsRejectedOutright(): void
+    public function testAFirstBatchThatCannotTakeItsLocksIsRejectedAsRetryable(): void
     {
         $this->blockedLocks = [ImportLocks::CATEGORY_TREE];
 
-        $this->expectExceptionMessage('Another import is already running. Try again later.');
+        try {
+            $this->serviceWith([])->import([$this->product('P1')->setCategories([])]);
+            self::fail('the rejection should have been thrown');
+        } catch (ImportLockedException $e) {
+            self::assertSame('Another import is already running. Try again later.', $e->getMessage());
+            self::assertSame(429, $e->getHttpCode());
+            self::assertSame(
+                [
+                    'reason' => ImportLockedException::REASON,
+                    'locks' => [ImportLocks::CATEGORY_TREE],
+                    'retry_after' => ImportLocks::TIMEOUT_SEC,
+                ],
+                $e->getDetails()
+            );
+        }
+    }
+
+    /**
+     * It is still a LocalizedException, so a caller outside the web API — the
+     * CLI, another module — catches it exactly as it always did.
+     */
+    public function testTheRejectionRemainsALocalizedException(): void
+    {
+        $this->blockedLocks = [ImportLocks::CATEGORY_TREE];
+
+        $this->expectException(LocalizedException::class);
 
         $this->serviceWith([])->import([$this->product('P1')->setCategories([])]);
     }
