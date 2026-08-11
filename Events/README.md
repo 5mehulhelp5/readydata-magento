@@ -62,11 +62,31 @@ Under `/rest/all/V1/readydata/eventing/`, ACL-guarded by `ReadyData_Events::mana
 | `POST subscriptions` | subscribe, or update an existing subscription |
 | `DELETE subscriptions/:id` | unsubscribe |
 | `GET supported` | every subscribable code — feeds ReadyData's event picker |
+| `GET supported/:code` | what one event carries: entity, suggested fields, worked sample payload |
 | `GET queue` | depth, status counts, oldest waiting event, and `hooked` |
 | `POST test` | deliver a synthetic event now, proving connectivity |
 
 Subscription changes take effect on the **next request, with no deploy**. That is
 the property the whole design is built around; see below.
+
+### Authenticate with OAuth 1.0a, not a bearer token
+
+Magento 2.4.4 turned `oauth/consumer/enable_integration_as_bearer` **off by
+default**, and 2.4.8 ships no value for it. An integration access token sent as
+`Authorization: Bearer` is therefore refused — with
+
+```
+The consumer isn't authorized to access %resources.  resources: ReadyData_Events::manage
+```
+
+which reads exactly like a missing ACL grant and is not one. Granting the
+resource changes nothing. Use OAuth 1.0a (what ReadyData's connector does), or
+set that config flag to `1` if bearer tokens are genuinely wanted.
+
+Every method on every `Api` and `Api\Data` interface also carries an explicit
+`@return` doc block, because Magento's webapi builds its schema by reflecting
+doc blocks rather than PHP return types. A native return type alone produces
+`Each method must have a doc block` on the first real call.
 
 ### Registering
 
@@ -152,6 +172,77 @@ When a rule cannot express the condition, a subscription may name a
 `gate_class` implementing `Api\EventGateInterface`. Note the trade: **a rule is
 remote configuration, a gate is a deploy.**
 
+### Processors and converters
+
+Two extension points that run at **opposite ends** of the pipeline, and cannot
+be swapped:
+
+| | Runs at | Purpose | On failure |
+|---|---|---|---|
+| `FieldConverterInterface` | **capture** | redact | drops the field |
+| `EventDataProcessorInterface` | **send** | enrich | is skipped |
+
+A **converter** must run at capture. A value masked at send time would already
+be sitting in the queue table in clear — and in database backups, and in
+whatever retention has not deleted yet. Masking is only worth something if the
+raw value never lands anywhere. Returning `null` drops the field entirely, so
+"redact completely" needs no second mechanism.
+
+A **processor** must run at send. That is what makes the read *current*: two
+saves of one entity that coalesced into a single queue row deliver one
+present-tense picture rather than a snapshot from capture time, which is also
+what defuses out-of-order delivery. The cost is a re-read per event during
+dispatch, so reach for one only where the subscriber would otherwise make
+several follow-up calls to reassemble a single logical object.
+
+They fail in opposite directions on purpose. An unresolvable converter drops its
+field — failing open would publish exactly what it was configured to withhold.
+An unresolvable processor is skipped — failing closed would discard a delivery
+that is merely thinner than intended.
+
+Shipped implementations:
+
+- `Model\Processor\OrderEventProcessor` — composes an order's items, addresses,
+  payment, totals and customer from a row carrying little more than an id. The
+  case that justifies the mechanism: without it ReadyData makes four or five
+  follow-up calls per order. **Catalog events should stay thin** — `product-import`
+  re-reads anyway, so a fat product payload is work nobody consumes.
+- `Model\Converter\MaskPostcodeConverter` — keeps the leading characters and
+  masks the rest, so a subscription can carry a shipping address without
+  carrying a full one.
+
+```json
+{"subscription": {
+  "eventCode": "observer.sales_order_save_commit_after",
+  "fields": ["increment_id", "postcode"],
+  "processors": ["ReadyData\\Events\\Model\\Processor\\OrderEventProcessor"],
+  "converters": [{"field": "postcode",
+                  "converterClass": "ReadyData\\Events\\Model\\Converter\\MaskPostcodeConverter"}]
+}}
+```
+
+A class that does not exist, or does not implement the right contract, is
+refused at subscribe time rather than failing silently forever.
+
+### Near-real-time delivery
+
+Delivery is the one-minute cron by default, and that is deliberate: it needs no
+extra process, so a store gets the whole feature by installing a module. A
+subscription marked `priority` additionally publishes to a message queue for
+immediate delivery:
+
+```
+bin/magento queue:consumers:start readydata.events.publish
+```
+
+Opt-in per subscription, so **no store has to run a consumer to get value**.
+Publishing goes over the `db` connection, so it needs no broker. The message
+carries only the event code — the queue table stays the single source of truth,
+which means nothing can disagree with it and no customer data enters a transport
+with its own retention and access rules. A failed publish is logged, not raised:
+the cron delivers the same rows a minute later, so a store whose consumer is not
+running must not lose events.
+
 ## Loop suppression
 
 ReadyData writes to Magento through `ReadyData_Import`, which deliberately
@@ -186,6 +277,31 @@ A code outside the catalogue is refused at subscribe time — nothing would capt
 it — and needs `Model/Catalogue.php` extended, `bin/magento readydata:events:generate`,
 and a recompile.
 
+### Under load
+
+Measured on a 14,500-product catalogue, importing through `ReadyData_Import`
+with a product subscription active, against the same import with eventing off:
+
+| Products | Events | Import overhead | Per event | Memory |
+|---|---|---|---|---|
+| 2,000 | 2,000 | +3.2% (+0.17 s) | 0.084 ms | +17 MB |
+| 8,000 | 8,000 | +11.9% (+2.28 s) | 0.285 ms | +17 MB |
+
+**Memory is bounded by `buffer_size`, not by import size** — identical at both
+volumes, which is the property the per-batch flush exists to provide.
+
+Per-event cost is *not* constant: it rises as the queue table and its unique
+index fill. Budget for the higher figure on a store with a deep queue, and keep
+the retention sweep running.
+
+### Concurrency
+
+Six dispatcher processes running simultaneously against 400 queued events
+delivered **400 distinct events, 400 total deliveries, zero duplicates**, with
+the work genuinely split across all six. The claim is a single `UPDATE` that
+stamps a `lock_token`, so two cron nodes cannot take the same row — verified
+rather than assumed, because a double-send is invisible from the store's side.
+
 ## Operations
 
 Two jobs in their own cron group `readydata_events`, so a slow delivery cannot
@@ -202,6 +318,29 @@ concurrent cron nodes cannot double-send. A dispatcher killed mid-flight leaves
 rows claimed; they are reclaimed after 15 minutes.
 
 Logs go to `var/log/readydata_events.log`.
+
+### Admin
+
+**System → ReadyData Events** shows the queue: status counts, the oldest
+undelivered event, per-row failure detail, and a retry action for failed and
+dead-lettered rows. It lives in Magento's admin rather than only in ReadyData
+because when events are not arriving the person looking is often a Magento
+developer with no ReadyData login, and every question they need answered is in
+this store's data.
+
+Retry resets the attempt counter as well as the status. Leaving it at the
+maximum would dead-letter the row again on its first failure, which is a
+formality rather than a retry.
+
+### CLI
+
+| Command | Does |
+|---|---|
+| `bin/magento readydata:events:dispatch [--passes=N]` | deliver queued events now, without waiting for cron |
+| `bin/magento readydata:events:generate` | regenerate `etc/events.xml` from the catalogue (then `setup:di:compile`) |
+
+`dispatch` runs the same dispatcher the cron and the priority consumer run, so
+there is one delivery path rather than three.
 
 ### When events are not arriving
 
@@ -259,10 +398,13 @@ platform behaves exactly as before, just with more delay. Anyone selling it as
 
 ```
 Api/                    service contracts + EventGateInterface
-Console/                readydata:events:generate
+Block/, Controller/     the System → ReadyData Events queue grid
+Console/                readydata:events:generate, readydata:events:dispatch
 Cron/                   DispatchQueue, CleanQueue
 Model/Capture/          EventCapture, FieldExtractor, RuleEvaluator, GateRegistry, QueueBuffer
-Model/Delivery/         Dispatcher, EnvelopeBuilder, Signer
+Model/Converter/        field converters (redact, at capture)
+Model/Delivery/         Dispatcher, EnvelopeBuilder, Signer, PayloadEnricher, priority path
+Model/Processor/        event data processors (enrich, at send)
 Model/Subscriber/       Subscriber + repository (secret encrypted at rest)
 Model/Subscription/     Subscription, SubscriptionMap (cached), repository
 Observer/               CaptureObserver — one class, every catalogue event
@@ -275,8 +417,12 @@ etc/events.xml          GENERATED — edit Model/Catalogue.php and regenerate
 - **One subscriber.** The schema and endpoints are multi-capable; the dispatcher
   and state machine are written for one. A second destination is a
   schema-compatible follow-up, not a rewrite.
-- **No near-real-time path.** Delivery is the ≤60s cron. The message-queue
-  priority path is a later phase, so no store has to run an extra consumer.
-- **`priority` and `coalesce_by`** are stored and honoured for per-request dedupe
-  but do not yet drive a coalescing window.
-- **No admin grid** over the queue yet; `GET queue` and the log are the tools.
+- **Near-real-time delivery is opt-in** and needs a consumer process running.
+  Without one, delivery is the ≤60s cron, which is the supported default.
+- **`coalesce_by`** drives per-request dedupe on this side. Windowed coalescing
+  lives on the ReadyData side, which is where a mass action becomes one run.
+- **Converters see one field's value and nothing else.** A rule that depends on
+  another field — masking a postcode only outside the US, say — needs a
+  processor, which sees the whole payload.
+- **Per-event capture cost grows with queue depth** (see Under load). Keep the
+  retention sweep running.

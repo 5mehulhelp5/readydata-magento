@@ -80,6 +80,7 @@
         <arguments>
             <argument name="commands" xsi:type="array">
                 <item name="readydata_events_generate" xsi:type="object">ReadyData\Events\Console\GenerateHooksCommand</item>
+                <item name="readydata_events_dispatch" xsi:type="object">ReadyData\Events\Console\DispatchCommand</item>
             </argument>
         </arguments>
     </type>
