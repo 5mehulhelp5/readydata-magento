@@ -51,6 +51,10 @@
                 comment="Skip capture while a ReadyData import owns the writes. Default on: without it an import feeds itself back"/>
         <column xsi:type="varchar" name="coalesce_by" length="64" nullable="true"
                 comment="Field path to coalesce repeated events on within a request"/>
+        <column xsi:type="text" name="processors" nullable="true"
+                comment="EventDataProcessorInterface class names, JSON array. Run at SEND time, so the payload they compose is a current read rather than a capture-time snapshot"/>
+        <column xsi:type="text" name="converters" nullable="true"
+                comment="field path =&gt; FieldConverterInterface class name, JSON object. Run at CAPTURE time, so an unmasked value never reaches this table"/>
         <column xsi:type="timestamp" name="created_at" on_update="false" nullable="false" default="CURRENT_TIMESTAMP"/>
         <column xsi:type="timestamp" name="updated_at" on_update="true" nullable="false" default="CURRENT_TIMESTAMP"/>
         <constraint xsi:type="primary" referenceId="PRIMARY">

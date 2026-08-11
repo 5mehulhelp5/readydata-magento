@@ -14,6 +14,8 @@
                 type="ReadyData\Events\Model\Data\Subscription"/>
     <preference for="ReadyData\Events\Api\Data\SubscriptionRuleInterface"
                 type="ReadyData\Events\Model\Data\SubscriptionRule"/>
+    <preference for="ReadyData\Events\Api\Data\SubscriptionConverterInterface"
+                type="ReadyData\Events\Model\Data\SubscriptionConverter"/>
     <preference for="ReadyData\Events\Api\Data\QueueStatusInterface"
                 type="ReadyData\Events\Model\Data\QueueStatus"/>
     <preference for="ReadyData\Events\Api\Data\EventDescriptionInterface"
@@ -59,6 +61,18 @@
         <plugin name="readydata_events_product_repository"
                 type="ReadyData\Events\Plugin\ProductRepositoryCapture"
                 sortOrder="1000"/>
+    </type>
+
+    <!--
+        Proxied so an ordinary capture never constructs the publisher. Most
+        stores have no priority subscription at all, and building message-queue
+        machinery on the hot path to then not use it is exactly the kind of cost
+        the O(1) subscription lookup exists to avoid.
+    -->
+    <type name="ReadyData\Events\Model\Delivery\PriorityPublisher">
+        <arguments>
+            <argument name="publisher" xsi:type="object">Magento\Framework\MessageQueue\PublisherInterface\Proxy</argument>
+        </arguments>
     </type>
 
     <!-- CLI -->

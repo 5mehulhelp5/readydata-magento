@@ -10,6 +10,7 @@ use Magento\Framework\DataObject\IdentityGeneratorInterface;
 use Magento\Framework\Serialize\Serializer\Json;
 use ReadyData\Events\Logger\Logger;
 use ReadyData\Events\Model\Config;
+use ReadyData\Events\Model\Delivery\PriorityPublisher;
 use ReadyData\Events\Model\ResourceModel\Queue;
 
 /**
@@ -43,6 +44,7 @@ class QueueBuffer
         private readonly Config $config,
         private readonly Json $json,
         private readonly IdentityGeneratorInterface $identityGenerator,
+        private readonly PriorityPublisher $priorityPublisher,
         private readonly Logger $logger
     ) {
     }
@@ -94,11 +96,36 @@ class QueueBuffer
             }
 
             $this->queue->insertMultiple($rows);
+            $this->nudgePriority($rows);
         } catch (\Throwable $e) {
             $this->logger->error(
                 sprintf('Failed to queue %d captured event(s): %s', count($rows), $e->getMessage()),
                 ['exception' => $e]
             );
+        }
+    }
+
+    /**
+     * Tells the consumer there is priority work, once per distinct code.
+     *
+     * After the insert, never before: the queue table is the source of truth,
+     * and a consumer woken before the rows exist would find nothing and go back
+     * to sleep. Publishing per code rather than per row keeps a 500-product
+     * mass action to one message.
+     *
+     * @param array<int, array<string, mixed>> $rows
+     */
+    private function nudgePriority(array $rows): void
+    {
+        $codes = [];
+        foreach ($rows as $row) {
+            $codes[(string)$row['event_code']] = true;
+        }
+
+        foreach (array_keys($codes) as $eventCode) {
+            if ($this->priorityPublisher->isPriority($eventCode)) {
+                $this->priorityPublisher->publish($eventCode);
+            }
         }
     }
 

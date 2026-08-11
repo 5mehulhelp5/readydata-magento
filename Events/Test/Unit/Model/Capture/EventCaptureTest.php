@@ -13,6 +13,7 @@ use ReadyData\Events\Api\EventGateInterface;
 use ReadyData\Events\Logger\Logger;
 use ReadyData\Events\Model\Capture\EventCapture;
 use ReadyData\Events\Model\Capture\FieldExtractor;
+use ReadyData\Events\Model\Capture\ExtensionRegistry;
 use ReadyData\Events\Model\Capture\GateRegistry;
 use ReadyData\Events\Model\Capture\QueueBuffer;
 use ReadyData\Events\Model\Capture\RuleEvaluator;
@@ -28,6 +29,7 @@ class EventCaptureTest extends TestCase
     private Config&MockObject $config;
     private SubscriptionMap&MockObject $map;
     private GateRegistry&MockObject $gates;
+    private ExtensionRegistry&MockObject $extensions;
     private QueueBuffer&MockObject $buffer;
     private ImportState $importState;
     private EventCapture $capture;
@@ -37,6 +39,7 @@ class EventCaptureTest extends TestCase
         $this->config = $this->createMock(Config::class);
         $this->map = $this->createMock(SubscriptionMap::class);
         $this->gates = $this->createMock(GateRegistry::class);
+        $this->extensions = $this->createMock(ExtensionRegistry::class);
         $this->buffer = $this->createMock(QueueBuffer::class);
         $this->importState = new ImportState();
 
@@ -49,6 +52,7 @@ class EventCaptureTest extends TestCase
             new RuleEvaluator($extractor),
             $extractor,
             $this->gates,
+            $this->extensions,
             $this->buffer,
             $this->importState,
             $this->createMock(Logger::class)
@@ -233,6 +237,7 @@ class EventCaptureTest extends TestCase
             new RuleEvaluator($extractor),
             $extractor,
             $this->gates,
+            $this->extensions,
             $this->buffer,
             $this->importState,
             $this->createMock(Logger::class)

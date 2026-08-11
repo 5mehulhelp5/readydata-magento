@@ -10,7 +10,9 @@ use Magento\Framework\App\ResourceConnection;
 use Magento\Framework\Exception\LocalizedException;
 use Magento\Framework\Exception\NoSuchEntityException;
 use Magento\Framework\Serialize\Serializer\Json;
+use ReadyData\Events\Api\EventDataProcessorInterface;
 use ReadyData\Events\Api\EventGateInterface;
+use ReadyData\Events\Api\FieldConverterInterface;
 use ReadyData\Events\Model\Capture\RuleEvaluator;
 use ReadyData\Events\Model\Catalogue;
 
@@ -77,6 +79,8 @@ class SubscriptionRepository
         $this->assertSubscribable($eventCode);
         $this->assertRulesValid($data['rules'] ?? []);
         $this->assertGateValid($data['gate_class'] ?? null);
+        $this->assertImplement($data['processors'] ?? [], EventDataProcessorInterface::class, 'processor');
+        $this->assertImplement(array_values((array)($data['converters'] ?? [])), FieldConverterInterface::class, 'converter');
 
         $connection = $this->resource->getConnection();
 
@@ -93,6 +97,8 @@ class SubscriptionRepository
                 ? (!empty($data['ignore_readydata_origin']) ? 1 : 0)
                 : 1,
             'coalesce_by' => $data['coalesce_by'] ?? null,
+            'processors' => $this->encodeList($data['processors'] ?? []),
+            'converters' => $this->encodeMap($data['converters'] ?? []),
         ];
 
         $existing = $connection->fetchOne(
@@ -185,6 +191,46 @@ class SubscriptionRepository
                 EventGateInterface::class
             ));
         }
+    }
+
+    /**
+     * Refusing an unusable class name here turns a silent misconfiguration into
+     * an error at the moment somebody can still fix it: a processor that never
+     * loads delivers thin payloads forever, and a converter that never loads
+     * would drop the field it was meant to redact.
+     *
+     * @param mixed $classNames
+     */
+    private function assertImplement($classNames, string $contract, string $label): void
+    {
+        foreach ((array)$classNames as $className) {
+            if (!is_string($className) || $className === '') {
+                continue;
+            }
+
+            if (!class_exists($className)) {
+                throw new LocalizedException(__('%1 class "%2" does not exist.', ucfirst($label), $className));
+            }
+
+            if (!is_subclass_of($className, $contract)) {
+                throw new LocalizedException(
+                    __('%1 class "%2" must implement %3.', ucfirst($label), $className, $contract)
+                );
+            }
+        }
+    }
+
+    /** @param mixed $map @return string|null */
+    private function encodeMap($map): ?string
+    {
+        $clean = [];
+        foreach ((array)$map as $field => $className) {
+            if (is_string($field) && is_string($className) && $field !== '' && $className !== '') {
+                $clean[$field] = $className;
+            }
+        }
+
+        return $clean === [] ? null : $this->json->serialize($clean);
     }
 
     /** @param mixed $list */

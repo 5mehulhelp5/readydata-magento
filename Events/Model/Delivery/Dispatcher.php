@@ -32,6 +32,7 @@ class Dispatcher
         private readonly Queue $queue,
         private readonly SubscriberRepository $subscribers,
         private readonly EnvelopeBuilder $envelopeBuilder,
+        private readonly PayloadEnricher $enricher,
         private readonly Signer $signer,
         private readonly Config $config,
         private readonly Curl $curl,
@@ -73,6 +74,12 @@ class Dispatcher
         if ($rows === []) {
             return $result;
         }
+
+        // Enrichment happens here, between claim and send, which is what makes a
+        // thin queue row and a rich delivery the same design: the entity is read
+        // now, so the payload describes where it ended up rather than every
+        // state it passed through.
+        $rows = $this->enricher->enrich($rows);
 
         $queueIds = array_map(static fn(array $row): int => (int)$row['queue_id'], $rows);
 

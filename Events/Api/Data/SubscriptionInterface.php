@@ -119,6 +119,36 @@ interface SubscriptionInterface
     public function setIgnoreReadydataOrigin(?bool $ignore): self;
 
     /**
+     * EventDataProcessorInterface class names, run at send time.
+     *
+     * Reach for one only where the subscriber would otherwise make several
+     * follow-up calls to reassemble a single logical object. Catalog events
+     * almost never need one.
+     *
+     * @return string[]|null
+     */
+    public function getProcessors(): ?array;
+
+    /**
+     * @param string[]|null $processors
+     * @return $this
+     */
+    public function setProcessors(?array $processors): self;
+
+    /**
+     * Field converters, run at capture so an unmasked value is never stored.
+     *
+     * @return \ReadyData\Events\Api\Data\SubscriptionConverterInterface[]|null
+     */
+    public function getConverters(): ?array;
+
+    /**
+     * @param \ReadyData\Events\Api\Data\SubscriptionConverterInterface[]|null $converters
+     * @return $this
+     */
+    public function setConverters(?array $converters): self;
+
+    /**
      * Field path to collapse repeated events on within one request.
      *
      * @return string|null

@@ -46,16 +46,17 @@ class FieldExtractor
     /**
      * @param array<string, mixed> $eventData
      * @param string[] $fields
+     * @param array<string, callable(mixed, string): mixed> $converters keyed by field path
      * @return array<string, mixed>
      */
-    public function extract(array $eventData, array $fields): array
+    public function extract(array $eventData, array $fields, array $converters = []): array
     {
         if ($fields === []) {
-            return $this->extractIdentity($eventData);
+            return $this->convertAll($this->extractIdentity($eventData), $converters);
         }
 
         if (in_array('*', $fields, true)) {
-            return $this->extractAllScalars($eventData);
+            return $this->convertAll($this->extractAllScalars($eventData), $converters);
         }
 
         $payload = [];
@@ -63,6 +64,44 @@ class FieldExtractor
             $value = $this->resolve($eventData, $path);
             if ($value !== null) {
                 $payload[$path] = $value;
+            }
+        }
+
+        return $this->convertAll($payload, $converters);
+    }
+
+    /**
+     * Applies field converters before the payload is handed on.
+     *
+     * Here rather than at send time on purpose: converters redact, and a value
+     * masked at send would already have been written to the queue table in
+     * clear — into database backups, and into whatever the retention window has
+     * not deleted yet. Masking is only worth anything if the raw value never
+     * lands anywhere.
+     *
+     * A converter returning null drops the field, so "redact entirely" is
+     * expressible without a second mechanism.
+     *
+     * @param array<string, mixed> $payload
+     * @param array<string, callable(mixed, string): mixed> $converters
+     * @return array<string, mixed>
+     */
+    private function convertAll(array $payload, array $converters): array
+    {
+        if ($converters === []) {
+            return $payload;
+        }
+
+        foreach ($payload as $field => $value) {
+            if (!isset($converters[$field])) {
+                continue;
+            }
+
+            $converted = $converters[$field]($value, (string)$field);
+            if ($converted === null) {
+                unset($payload[$field]);
+            } else {
+                $payload[$field] = $converted;
             }
         }
 

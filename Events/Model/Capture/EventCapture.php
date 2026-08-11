@@ -48,6 +48,7 @@ class EventCapture
         private readonly RuleEvaluator $rules,
         private readonly FieldExtractor $extractor,
         private readonly GateRegistry $gates,
+        private readonly ExtensionRegistry $extensions,
         private readonly QueueBuffer $buffer,
         private readonly ImportState $importState,
         private readonly Logger $logger
@@ -114,7 +115,11 @@ class EventCapture
                 }
             }
 
-            $payload = $this->extractor->extract($eventData, $subscription->fields);
+            $payload = $this->extractor->extract(
+                $eventData,
+                $subscription->fields,
+                $this->converterCallbacks($subscription)
+            );
 
             $key = $this->dedupeKey($subscription, $eventCode, $eventData, $payload);
             if (isset($this->seen[$key])) {
@@ -124,6 +129,33 @@ class EventCapture
 
             $this->buffer->add($eventCode, $subscription->subscriberId, $payload);
         }
+    }
+
+    /**
+     * Resolves a subscription's converters into callables the extractor can
+     * apply, dropping any that will not resolve.
+     *
+     * A converter that cannot be loaded drops its field rather than passing the
+     * raw value through: converters exist to redact, so failing open would put
+     * on the wire exactly what somebody configured it to withhold.
+     *
+     * @return array<string, callable(mixed, string): mixed>
+     */
+    private function converterCallbacks(Subscription $subscription): array
+    {
+        if ($subscription->converters === []) {
+            return [];
+        }
+
+        $callbacks = [];
+        foreach ($subscription->converters as $field => $className) {
+            $converter = $this->extensions->converter($className);
+            $callbacks[$field] = $converter !== null
+                ? static fn(mixed $value, string $path): mixed => $converter->convert($value, $path)
+                : static fn(): mixed => null;
+        }
+
+        return $callbacks;
     }
 
     /**

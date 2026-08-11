@@ -9,6 +9,8 @@ namespace ReadyData\Events\Model;
 use Magento\Framework\Exception\LocalizedException;
 use ReadyData\Events\Api\Data\SubscriptionInterface;
 use ReadyData\Events\Api\Data\SubscriptionInterfaceFactory;
+use ReadyData\Events\Api\Data\SubscriptionConverterInterface;
+use ReadyData\Events\Api\Data\SubscriptionConverterInterfaceFactory;
 use ReadyData\Events\Api\Data\SubscriptionRuleInterface;
 use ReadyData\Events\Api\Data\SubscriptionRuleInterfaceFactory;
 use ReadyData\Events\Api\SubscriptionManagementInterface;
@@ -21,7 +23,8 @@ class SubscriptionManagement implements SubscriptionManagementInterface
         private readonly SubscriptionRepository $repository,
         private readonly SubscriberRepository $subscribers,
         private readonly SubscriptionInterfaceFactory $subscriptionFactory,
-        private readonly SubscriptionRuleInterfaceFactory $ruleFactory
+        private readonly SubscriptionRuleInterfaceFactory $ruleFactory,
+        private readonly SubscriptionConverterInterfaceFactory $converterFactory
     ) {
     }
 
@@ -49,6 +52,8 @@ class SubscriptionManagement implements SubscriptionManagementInterface
             'store_ids' => $subscription->getStoreIds() ?? [],
             'ignore_readydata_origin' => $subscription->getIgnoreReadydataOrigin() ?? true,
             'coalesce_by' => $subscription->getCoalesceBy(),
+            'processors' => $subscription->getProcessors() ?? [],
+            'converters' => $this->convertersToMap($subscription->getConverters() ?? []),
         ]);
 
         return $this->toDto($this->repository->getById($id));
@@ -80,6 +85,24 @@ class SubscriptionManagement implements SubscriptionManagementInterface
         return $out;
     }
 
+    /**
+     * @param SubscriptionConverterInterface[] $converters
+     * @return array<string, string>
+     */
+    private function convertersToMap(array $converters): array
+    {
+        $map = [];
+        foreach ($converters as $converter) {
+            $field = (string)$converter->getField();
+            $class = (string)$converter->getConverterClass();
+            if ($field !== '' && $class !== '') {
+                $map[$field] = $class;
+            }
+        }
+
+        return $map;
+    }
+
     /** @param array<string, mixed> $row */
     private function toDto(array $row): SubscriptionInterface
     {
@@ -102,6 +125,13 @@ class SubscriptionManagement implements SubscriptionManagementInterface
             ->setGateClass($model->gateClass)
             ->setStoreIds($model->storeIds)
             ->setIgnoreReadydataOrigin($model->ignoreReadyDataOrigin)
-            ->setCoalesceBy($model->coalesceBy);
+            ->setCoalesceBy($model->coalesceBy)
+            ->setProcessors($model->processors)
+            ->setConverters(array_map(
+                fn(string $field, string $class): SubscriptionConverterInterface
+                    => $this->converterFactory->create()->setField($field)->setConverterClass($class),
+                array_keys($model->converters),
+                array_values($model->converters)
+            ));
     }
 }

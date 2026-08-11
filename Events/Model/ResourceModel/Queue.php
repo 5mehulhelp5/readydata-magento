@@ -220,6 +220,78 @@ class Queue
     }
 
     /**
+     * Returns rows to the waiting state so the dispatcher picks them up again.
+     *
+     * Clears `retries` as well as `status`. Leaving the counter at its maximum
+     * would have the row dead-letter again on its first failure, which is a
+     * formality rather than a retry — and the reason somebody pressed retry is
+     * almost always that they just fixed the thing that was failing.
+     *
+     * @param int[] $queueIds
+     */
+    public function requeue(array $queueIds): int
+    {
+        if ($queueIds === []) {
+            return 0;
+        }
+
+        return (int)$this->getConnection()->update(
+            $this->getTable(),
+            [
+                'status' => self::STATUS_WAITING,
+                'retries' => 0,
+                'lock_token' => null,
+                'next_attempt_at' => null,
+            ],
+            ['queue_id IN (?)' => $queueIds]
+        );
+    }
+
+    /**
+     * Bulk retry by status, for "an endpoint was down for an hour and there are
+     * four thousand of them" — which is the shape this failure actually takes.
+     *
+     * @param int[] $statuses
+     */
+    public function requeueByStatus(array $statuses): int
+    {
+        if ($statuses === []) {
+            return 0;
+        }
+
+        return (int)$this->getConnection()->update(
+            $this->getTable(),
+            [
+                'status' => self::STATUS_WAITING,
+                'retries' => 0,
+                'lock_token' => null,
+                'next_attempt_at' => null,
+            ],
+            ['status IN (?)' => $statuses]
+        );
+    }
+
+    /**
+     * Most recent events first, for the admin grid.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    public function recent(int $limit = 200, ?int $status = null): array
+    {
+        $connection = $this->getConnection();
+        $select = $connection->select()
+            ->from($this->getTable())
+            ->order('queue_id DESC')
+            ->limit($limit);
+
+        if ($status !== null) {
+            $select->where('status = ?', $status);
+        }
+
+        return $connection->fetchAll($select);
+    }
+
+    /**
      * Retention deletes settled events only. An event still waiting is never
      * deleted however old it is — age means delivery is broken, and deleting the
      * evidence would turn a visible backlog into silent data loss.

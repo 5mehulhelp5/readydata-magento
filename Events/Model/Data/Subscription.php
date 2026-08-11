@@ -19,6 +19,8 @@ class Subscription implements SubscriptionInterface
     private ?array $storeIds = null;
     private ?bool $ignoreReadydataOrigin = true;
     private ?string $coalesceBy = null;
+    private ?array $processors = null;
+    private ?array $converters = null;
 
     public function getId(): ?int
     {
@@ -112,6 +114,30 @@ class Subscription implements SubscriptionInterface
     public function setIgnoreReadydataOrigin(?bool $ignore): SubscriptionInterface
     {
         $this->ignoreReadydataOrigin = $ignore;
+
+        return $this;
+    }
+
+    public function getProcessors(): ?array
+    {
+        return $this->processors;
+    }
+
+    public function setProcessors(?array $processors): SubscriptionInterface
+    {
+        $this->processors = $processors;
+
+        return $this;
+    }
+
+    public function getConverters(): ?array
+    {
+        return $this->converters;
+    }
+
+    public function setConverters(?array $converters): SubscriptionInterface
+    {
+        $this->converters = $converters;
 
         return $this;
     }

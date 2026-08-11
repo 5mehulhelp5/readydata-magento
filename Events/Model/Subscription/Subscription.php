@@ -29,7 +29,13 @@ class Subscription
         public readonly ?string $gateClass = null,
         public readonly ?array $storeIds = null,
         public readonly bool $ignoreReadyDataOrigin = true,
-        public readonly ?string $coalesceBy = null
+        public readonly ?string $coalesceBy = null,
+        /** @var string[] EventDataProcessorInterface class names, run at send time. */
+        public readonly array $processors = [],
+        /** @var array<string, string> field path => FieldConverterInterface class name. */
+        public readonly array $converters = [],
+        /** Deliver via the message queue instead of waiting for the cron. */
+        public readonly bool $priority = false
     ) {
     }
 
@@ -66,7 +72,10 @@ class Subscription
             isset($row['gate_class']) && $row['gate_class'] !== '' ? (string)$row['gate_class'] : null,
             self::decodeStoreIds($row['store_ids'] ?? null),
             (bool)($row['ignore_readydata_origin'] ?? true),
-            isset($row['coalesce_by']) && $row['coalesce_by'] !== '' ? (string)$row['coalesce_by'] : null
+            isset($row['coalesce_by']) && $row['coalesce_by'] !== '' ? (string)$row['coalesce_by'] : null,
+            self::decodeList($row['processors'] ?? null),
+            self::decodeMap($row['converters'] ?? null),
+            (bool)($row['priority'] ?? false)
         );
     }
 
@@ -106,6 +115,28 @@ class Subscription
         }
 
         return $rules;
+    }
+
+    /** @return array<string, string> */
+    private static function decodeMap(?string $json): array
+    {
+        if ($json === null || $json === '') {
+            return [];
+        }
+
+        $decoded = json_decode($json, true);
+        if (!is_array($decoded)) {
+            return [];
+        }
+
+        $map = [];
+        foreach ($decoded as $key => $value) {
+            if (is_string($key) && is_string($value)) {
+                $map[$key] = $value;
+            }
+        }
+
+        return $map;
     }
 
     /** @return int[]|null */
