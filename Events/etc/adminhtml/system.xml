@@ -1,0 +1,83 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:module:Magento_Config:etc/system_file.xsd">
+    <system>
+        <tab id="readydata" translate="label" sortOrder="400">
+            <label>ReadyData</label>
+        </tab>
+        <section id="readydata_events" translate="label" type="text" sortOrder="20"
+                 showInDefault="1" showInWebsite="0" showInStore="0">
+            <class>separator-top</class>
+            <label>Eventing</label>
+            <tab>readydata</tab>
+            <resource>ReadyData_Events::config</resource>
+
+            <group id="general" translate="label" type="text" sortOrder="10" showInDefault="1">
+                <label>General</label>
+                <field id="enabled" translate="label comment" type="select" sortOrder="10" showInDefault="1">
+                    <label>Enable Eventing</label>
+                    <comment>Capture subscribed events and deliver them to the registered subscriber. Off by default: with no subscriber registered there is nothing to deliver to.</comment>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                </field>
+                <field id="instance_id" translate="label comment" type="text" sortOrder="20" showInDefault="1">
+                    <label>Instance ID</label>
+                    <comment>Identifies this store in every delivered event. Leave empty to derive one from the installation. Give staging and production different values or ReadyData cannot tell their events apart.</comment>
+                </field>
+            </group>
+
+            <group id="capture" translate="label" type="text" sortOrder="20" showInDefault="1">
+                <label>Capture</label>
+                <field id="buffer_size" translate="label comment" type="text" sortOrder="10" showInDefault="1">
+                    <label>Buffer Size</label>
+                    <comment>Events held in memory before one multi-row INSERT. A mass action or import saving hundreds of entities should cost a handful of inserts, not one per entity.</comment>
+                    <validate>validate-digits validate-greater-than-zero</validate>
+                </field>
+                <field id="max_queue_depth" translate="label comment" type="text" sortOrder="20" showInDefault="1">
+                    <label>Maximum Queue Depth</label>
+                    <comment>Above this many events awaiting delivery, capture stops and logs an error instead of filling the disk. A queue this deep means delivery is broken, and continuing to capture makes the outage worse.</comment>
+                    <validate>validate-digits validate-greater-than-zero</validate>
+                </field>
+            </group>
+
+            <group id="delivery" translate="label" type="text" sortOrder="30" showInDefault="1">
+                <label>Delivery</label>
+                <field id="batch_size" translate="label comment" type="text" sortOrder="10" showInDefault="1">
+                    <label>Delivery Batch Size</label>
+                    <comment>Events per HTTP request to the subscriber.</comment>
+                    <validate>validate-digits validate-greater-than-zero</validate>
+                </field>
+                <field id="max_retries" translate="label comment" type="text" sortOrder="20" showInDefault="1">
+                    <label>Maximum Retries</label>
+                    <comment>After this many failed attempts an event is dead-lettered and stops being retried, so a permanently broken endpoint cannot occupy the queue forever.</comment>
+                    <validate>validate-digits validate-greater-than-zero</validate>
+                </field>
+                <field id="timeout" translate="label comment" type="text" sortOrder="30" showInDefault="1">
+                    <label>Request Timeout (seconds)</label>
+                    <validate>validate-digits validate-greater-than-zero</validate>
+                </field>
+                <field id="backoff_seconds" translate="label comment" type="text" sortOrder="40" showInDefault="1">
+                    <label>Retry Backoff (seconds)</label>
+                    <comment>Multiplied by the attempt count, so retries space out instead of hammering an endpoint that is already failing.</comment>
+                    <validate>validate-digits validate-greater-than-zero</validate>
+                </field>
+            </group>
+
+            <group id="retention" translate="label" type="text" sortOrder="40" showInDefault="1">
+                <label>Retention</label>
+                <field id="days" translate="label comment" type="text" sortOrder="10" showInDefault="1">
+                    <label>Keep Delivered Events For (days)</label>
+                    <comment>Delivered and dead-lettered events older than this are deleted daily. Events still awaiting delivery are never deleted, however old.</comment>
+                    <validate>validate-digits validate-greater-than-zero</validate>
+                </field>
+            </group>
+
+            <group id="logging" translate="label" type="text" sortOrder="50" showInDefault="1">
+                <label>Logging</label>
+                <field id="enabled" translate="label" type="select" sortOrder="10" showInDefault="1">
+                    <label>Enable Logging</label>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                </field>
+            </group>
+        </section>
+    </system>
+</config>

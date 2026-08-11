@@ -7,12 +7,17 @@ module and can be developed in place inside a Magento checkout.
 | Module | Directory | Purpose |
 |---|---|---|
 | `ReadyData_Import` | [`Import/`](Import/) | Bulk product, attribute and category import via REST, writing directly to the database. See [Import/README.md](Import/README.md). |
+| `ReadyData_Events` | [`Events/`](Events/) | Pushes Magento events to ReadyData: curated event catalogue, durable queue, HMAC-signed batched delivery. See [Events/README.md](Events/README.md). |
+
+The two are the write path and the read path of the same integration, and they
+are aware of each other: `ReadyData_Events` skips capture while a
+`ReadyData_Import` import owns the writes, so an import cannot feed itself back.
 
 ## Installation
 
 ```
 composer require readydata/magento-modules
-bin/magento module:enable ReadyData_Import
+bin/magento module:enable ReadyData_Import ReadyData_Events
 bin/magento setup:upgrade
 bin/magento setup:di:compile   # on a compiled (production) deployment
 ```

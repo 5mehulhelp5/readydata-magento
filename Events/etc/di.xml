@@ -1,0 +1,70 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:framework:ObjectManager/etc/config.xsd">
+    <!-- Service contracts -->
+    <preference for="ReadyData\Events\Api\SubscriberManagementInterface"
+                type="ReadyData\Events\Model\SubscriberManagement"/>
+    <preference for="ReadyData\Events\Api\SubscriptionManagementInterface"
+                type="ReadyData\Events\Model\SubscriptionManagement"/>
+    <preference for="ReadyData\Events\Api\EventingStatusInterface"
+                type="ReadyData\Events\Model\EventingStatus"/>
+    <preference for="ReadyData\Events\Api\Data\SubscriberInterface"
+                type="ReadyData\Events\Model\Data\Subscriber"/>
+    <preference for="ReadyData\Events\Api\Data\SubscriptionInterface"
+                type="ReadyData\Events\Model\Data\Subscription"/>
+    <preference for="ReadyData\Events\Api\Data\SubscriptionRuleInterface"
+                type="ReadyData\Events\Model\Data\SubscriptionRule"/>
+    <preference for="ReadyData\Events\Api\Data\QueueStatusInterface"
+                type="ReadyData\Events\Model\Data\QueueStatus"/>
+
+    <!--
+        Capture state is per-request and shared: the buffer accumulates across
+        every hook in one request and the dedupe map has to see them all. These
+        are singletons by Magento's default, which is what makes one multi-row
+        INSERT per batch possible instead of one per event.
+    -->
+    <type name="ReadyData\Events\Model\Capture\EventCapture" shared="true"/>
+    <type name="ReadyData\Events\Model\Capture\QueueBuffer" shared="true"/>
+    <type name="ReadyData\Events\Model\Subscription\SubscriptionMap" shared="true"/>
+
+    <!-- Module logger, writing to var/log/readydata_events.log -->
+    <type name="ReadyData\Events\Logger\Handler">
+        <arguments>
+            <argument name="filesystem" xsi:type="object">Magento\Framework\Filesystem\Driver\File</argument>
+        </arguments>
+    </type>
+    <type name="ReadyData\Events\Logger\Logger">
+        <arguments>
+            <argument name="name" xsi:type="string">readydata_events</argument>
+            <argument name="handlers" xsi:type="array">
+                <item name="system" xsi:type="object">ReadyData\Events\Logger\Handler</item>
+            </argument>
+        </arguments>
+    </type>
+
+    <!--
+        MSI stock hook. Magento\Inventory\Model\SourceItem\Command\SourceItemsSave
+        dispatches no events, so on an MSI store this plugin is the only way a
+        stock change is visible at all.
+    -->
+    <type name="Magento\InventoryApi\Api\SourceItemsSaveInterface">
+        <plugin name="readydata_events_source_items_save"
+                type="ReadyData\Events\Plugin\SourceItemsSaveCapture"
+                sortOrder="1000"/>
+    </type>
+
+    <type name="Magento\Catalog\Api\ProductRepositoryInterface">
+        <plugin name="readydata_events_product_repository"
+                type="ReadyData\Events\Plugin\ProductRepositoryCapture"
+                sortOrder="1000"/>
+    </type>
+
+    <!-- CLI -->
+    <type name="Magento\Framework\Console\CommandListInterface">
+        <arguments>
+            <argument name="commands" xsi:type="array">
+                <item name="readydata_events_generate" xsi:type="object">ReadyData\Events\Console\GenerateHooksCommand</item>
+            </argument>
+        </arguments>
+    </type>
+</config>

@@ -1,0 +1,69 @@
+<?xml version="1.0"?>
+<!--
+    Consumed with the same integration credentials ReadyData_Import already uses.
+    Every route is ACL-guarded: this API can point a store's event stream at an
+    arbitrary URL, so it is strictly more sensitive than the import endpoints.
+-->
+<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:module:Magento_Webapi:etc/webapi.xsd">
+
+    <!-- Subscriber: register / inspect / deregister the delivery destination -->
+    <route url="/V1/readydata/eventing/subscribers" method="GET">
+        <service class="ReadyData\Events\Api\SubscriberManagementInterface" method="get"/>
+        <resources>
+            <resource ref="ReadyData_Events::manage"/>
+        </resources>
+    </route>
+    <route url="/V1/readydata/eventing/subscribers" method="POST">
+        <service class="ReadyData\Events\Api\SubscriberManagementInterface" method="register"/>
+        <resources>
+            <resource ref="ReadyData_Events::manage"/>
+        </resources>
+    </route>
+    <route url="/V1/readydata/eventing/subscribers/:code" method="DELETE">
+        <service class="ReadyData\Events\Api\SubscriberManagementInterface" method="delete"/>
+        <resources>
+            <resource ref="ReadyData_Events::manage"/>
+        </resources>
+    </route>
+
+    <!-- Subscriptions: per-event subscribe / update / unsubscribe -->
+    <route url="/V1/readydata/eventing/subscriptions" method="GET">
+        <service class="ReadyData\Events\Api\SubscriptionManagementInterface" method="getList"/>
+        <resources>
+            <resource ref="ReadyData_Events::manage"/>
+        </resources>
+    </route>
+    <route url="/V1/readydata/eventing/subscriptions" method="POST">
+        <service class="ReadyData\Events\Api\SubscriptionManagementInterface" method="save"/>
+        <resources>
+            <resource ref="ReadyData_Events::manage"/>
+        </resources>
+    </route>
+    <route url="/V1/readydata/eventing/subscriptions/:id" method="DELETE">
+        <service class="ReadyData\Events\Api\SubscriptionManagementInterface" method="deleteById"/>
+        <resources>
+            <resource ref="ReadyData_Events::manage"/>
+        </resources>
+    </route>
+
+    <!-- Discovery and health -->
+    <route url="/V1/readydata/eventing/supported" method="GET">
+        <service class="ReadyData\Events\Api\EventingStatusInterface" method="getSupported"/>
+        <resources>
+            <resource ref="ReadyData_Events::manage"/>
+        </resources>
+    </route>
+    <route url="/V1/readydata/eventing/queue" method="GET">
+        <service class="ReadyData\Events\Api\EventingStatusInterface" method="getStatus"/>
+        <resources>
+            <resource ref="ReadyData_Events::queue"/>
+        </resources>
+    </route>
+    <route url="/V1/readydata/eventing/test" method="POST">
+        <service class="ReadyData\Events\Api\EventingStatusInterface" method="test"/>
+        <resources>
+            <resource ref="ReadyData_Events::manage"/>
+        </resources>
+    </route>
+</routes>

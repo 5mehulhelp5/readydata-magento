@@ -1,0 +1,110 @@
+<?xml version="1.0"?>
+<!--
+    Every table is prefixed readydata_event_ and shares nothing with Adobe's
+    magento/commerce-eventing, which owns event_data and its own crons. A store
+    running both keeps two independent pipelines (plan §3, risk 5).
+-->
+<schema xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:framework:Setup/Declaration/Schema/etc/schema.xsd">
+
+    <!-- The destination. v1 permits exactly one row; see SubscriberRepository. -->
+    <table name="readydata_event_subscriber" resource="default" engine="innodb"
+           comment="ReadyData eventing: registered delivery destinations">
+        <column xsi:type="int" name="subscriber_id" unsigned="true" nullable="false" identity="true"/>
+        <column xsi:type="varchar" name="code" length="64" nullable="false"
+                comment="Stable identifier used by the REST API"/>
+        <column xsi:type="varchar" name="endpoint_url" length="1024" nullable="false"/>
+        <column xsi:type="varchar" name="secret" length="512" nullable="false"
+                comment="HMAC signing secret, Encryptor-backed at rest"/>
+        <column xsi:type="boolean" name="enabled" nullable="false" default="true"/>
+        <column xsi:type="int" name="max_batch_size" unsigned="true" nullable="false" default="100"/>
+        <column xsi:type="text" name="headers" nullable="true" comment="Extra request headers, JSON object"/>
+        <column xsi:type="timestamp" name="created_at" on_update="false" nullable="false" default="CURRENT_TIMESTAMP"/>
+        <column xsi:type="timestamp" name="updated_at" on_update="true" nullable="false" default="CURRENT_TIMESTAMP"/>
+        <constraint xsi:type="primary" referenceId="PRIMARY">
+            <column name="subscriber_id"/>
+        </constraint>
+        <constraint xsi:type="unique" referenceId="READYDATA_EVENT_SUBSCRIBER_CODE">
+            <column name="code"/>
+        </constraint>
+    </table>
+
+    <!-- What to capture, per event code. Rows here win over etc/readydata_events.xml. -->
+    <table name="readydata_event_subscription" resource="default" engine="innodb"
+           comment="ReadyData eventing: per-event capture configuration">
+        <column xsi:type="int" name="subscription_id" unsigned="true" nullable="false" identity="true"/>
+        <column xsi:type="varchar" name="event_code" length="255" nullable="false"
+                comment="observer.* or plugin.* code"/>
+        <column xsi:type="int" name="subscriber_id" unsigned="true" nullable="false"/>
+        <column xsi:type="boolean" name="enabled" nullable="false" default="true"/>
+        <column xsi:type="text" name="fields" nullable="true"
+                comment="Allow-list of dot-notation field paths, JSON array. Null or [*] sends every scalar"/>
+        <column xsi:type="text" name="rules" nullable="true"
+                comment="Declarative filters, JSON array of {field,operator,value}"/>
+        <column xsi:type="varchar" name="gate_class" length="255" nullable="true"
+                comment="Optional EventGateInterface implementation, run after rules"/>
+        <column xsi:type="boolean" name="priority" nullable="false" default="false"
+                comment="Reserved for the phase 4 message-queue path"/>
+        <column xsi:type="varchar" name="store_ids" length="255" nullable="true"
+                comment="Comma-separated store id allow-list; null means every store"/>
+        <column xsi:type="boolean" name="ignore_readydata_origin" nullable="false" default="true"
+                comment="Skip capture while a ReadyData import owns the writes. Default on: without it an import feeds itself back"/>
+        <column xsi:type="varchar" name="coalesce_by" length="64" nullable="true"
+                comment="Field path to coalesce repeated events on within a request"/>
+        <column xsi:type="timestamp" name="created_at" on_update="false" nullable="false" default="CURRENT_TIMESTAMP"/>
+        <column xsi:type="timestamp" name="updated_at" on_update="true" nullable="false" default="CURRENT_TIMESTAMP"/>
+        <constraint xsi:type="primary" referenceId="PRIMARY">
+            <column name="subscription_id"/>
+        </constraint>
+        <constraint xsi:type="foreign" referenceId="READYDATA_EVENT_SUBSCRIPTION_SUBSCRIBER_ID"
+                    table="readydata_event_subscription" column="subscriber_id"
+                    referenceTable="readydata_event_subscriber" referenceColumn="subscriber_id"
+                    onDelete="CASCADE"/>
+        <constraint xsi:type="unique" referenceId="READYDATA_EVENT_SUBSCRIPTION_CODE_SUBSCRIBER">
+            <column name="event_code"/>
+            <column name="subscriber_id"/>
+        </constraint>
+    </table>
+
+    <!--
+        The durable queue. MySQL rather than Redis on purpose: Redis on a Magento
+        instance is the cache/session store, configured with an eviction policy
+        and flushed by deploys, and an evicted queue is silently lost events —
+        the one failure this table exists to prevent (plan §3.4).
+    -->
+    <table name="readydata_event_queue" resource="default" engine="innodb"
+           comment="ReadyData eventing: captured events awaiting delivery">
+        <column xsi:type="bigint" name="queue_id" unsigned="true" nullable="false" identity="true"/>
+        <column xsi:type="varchar" name="event_id" length="36" nullable="false"
+                comment="UUID; the idempotency key the subscriber dedupes on"/>
+        <column xsi:type="varchar" name="event_code" length="255" nullable="false"/>
+        <column xsi:type="int" name="subscriber_id" unsigned="true" nullable="false"/>
+        <column xsi:type="mediumtext" name="payload" nullable="false" comment="Extracted fields, JSON object"/>
+        <column xsi:type="smallint" name="status" unsigned="true" nullable="false" default="0"
+                comment="0 waiting, 1 sent, 2 failed, 3 in progress, 4 dead-lettered"/>
+        <column xsi:type="smallint" name="retries" unsigned="true" nullable="false" default="0"/>
+        <column xsi:type="text" name="info" nullable="true" comment="Last failure detail"/>
+        <column xsi:type="varchar" name="lock_token" length="36" nullable="true"
+                comment="Set by the claiming dispatcher so concurrent cron nodes cannot double-send"/>
+        <column xsi:type="timestamp" name="created_at" on_update="false" nullable="false" default="CURRENT_TIMESTAMP"/>
+        <column xsi:type="datetime" name="next_attempt_at" nullable="true"
+                comment="Incremental backoff gate; null means eligible immediately"/>
+        <column xsi:type="datetime" name="sent_at" nullable="true"/>
+        <constraint xsi:type="primary" referenceId="PRIMARY">
+            <column name="queue_id"/>
+        </constraint>
+        <constraint xsi:type="unique" referenceId="READYDATA_EVENT_QUEUE_EVENT_ID">
+            <column name="event_id"/>
+        </constraint>
+        <index referenceId="READYDATA_EVENT_QUEUE_STATUS_NEXT_ATTEMPT_AT" indexType="btree">
+            <column name="status"/>
+            <column name="next_attempt_at"/>
+        </index>
+        <index referenceId="READYDATA_EVENT_QUEUE_LOCK_TOKEN" indexType="btree">
+            <column name="lock_token"/>
+        </index>
+        <index referenceId="READYDATA_EVENT_QUEUE_CREATED_AT" indexType="btree">
+            <column name="created_at"/>
+        </index>
+    </table>
+</schema>

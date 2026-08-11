@@ -23,10 +23,12 @@
     },
     "autoload": {
         "files": [
-            "Import/registration.php"
+            "Import/registration.php",
+            "Events/registration.php"
         ],
         "psr-4": {
-            "ReadyData\\Import\\": "Import/"
+            "ReadyData\\Import\\": "Import/",
+            "ReadyData\\Events\\": "Events/"
         }
     }
 }
