@@ -15,6 +15,7 @@ use ReadyData\Import\Model\Cache\AttributeMetadataCache;
 use ReadyData\Import\Model\Config;
 use ReadyData\Import\Model\Data\MediaEntry;
 use ReadyData\Import\Model\Data\Product;
+use ReadyData\Import\Model\ImportLocks;
 use ReadyData\Import\Model\Media\FileResolver;
 use ReadyData\Import\Model\Processor\EntityProcessor;
 use ReadyData\Import\Model\Processor\MediaProcessor;
@@ -70,6 +71,40 @@ class MediaProcessorTest extends TestCase
             $this->config,
             $this->logger
         );
+    }
+
+    /**
+     * The gallery predicate is deliberately the CONSERVATIVE one, unlike the
+     * other three: answering "will a row be inserted" needs the
+     * desired-versus-existing diff process() performs, per product, against link
+     * IDs that do not exist yet when the locks are decided. On the one lock
+     * where being wrong lists an image twice, presence of the field is the
+     * affordable answer — measured at 251 ms of hold, the cheapest of the four.
+     */
+    public function testAMediaFieldTakesTheGalleryLock(): void
+    {
+        $context = $this->contextFor('P1', [$this->entry(self::FILE_A)], 10);
+
+        self::assertSame([ImportLocks::MEDIA_GALLERY], $this->processor->requiredLocks($context));
+    }
+
+    /**
+     * `[]` counts. It means "remove everything", and while a delete cannot
+     * duplicate a row, the delete-then-insert of the `_value` rows in the same
+     * pass can.
+     */
+    public function testAnEmptyMediaArrayStillTakesTheLock(): void
+    {
+        $context = $this->contextFor('P1', [], 10);
+
+        self::assertSame([ImportLocks::MEDIA_GALLERY], $this->processor->requiredLocks($context));
+    }
+
+    public function testAProductWithoutAMediaFieldTakesNoLock(): void
+    {
+        $context = new BatchContext([(new Product())->setSku('P1')]);
+
+        self::assertSame([], $this->processor->requiredLocks($context));
     }
 
     public function testCreatesGalleryWithLabelsPositionsAndRoles(): void

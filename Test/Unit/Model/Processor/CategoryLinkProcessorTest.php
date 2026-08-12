@@ -14,6 +14,7 @@ use ReadyData\Import\Model\Cache\RootCategoryRegistry;
 use ReadyData\Import\Model\Category\PathParser;
 use ReadyData\Import\Model\Config;
 use ReadyData\Import\Model\Data\Product;
+use ReadyData\Import\Model\ImportLocks;
 use ReadyData\Import\Model\Processor\CategoryLinkProcessor;
 use ReadyData\Import\Model\ResourceModel\Category as CategoryResource;
 use ReadyData\Import\Model\ResourceModel\CategoryLink;
@@ -421,6 +422,7 @@ class CategoryLinkProcessorTest extends TestCase
             29
         );
         $context->setEntityId('SKU-1', 10);
+        $context->setHeldLocks([ImportLocks::CATEGORY_TREE]);
 
         $this->pathResolver->expects(self::once())->method('resolvePaths')
             ->with(['Shop/Men' => ['Shop', 'Men']], 29)
@@ -429,6 +431,123 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->method('getAssignments')->willReturn([]);
 
         $this->processor->process($context);
+    }
+
+    /**
+     * The pin reaches the non-creating walk too. Losing it there would resolve
+     * the path under whichever root the name happens to pick — the same
+     * wrong-catalog assignment, arrived at by the quiet path.
+     */
+    public function testTheRequestRootPinAlsoReachesTheLockFreeLookup(): void
+    {
+        $context = new BatchContext(
+            [(new Product())->setSku('SKU-1')->setCategories(['Shop/Men'])],
+            0,
+            29
+        );
+        $context->setEntityId('SKU-1', 10);
+
+        $this->pathResolver->expects(self::never())->method('resolvePaths');
+        $this->pathResolver->expects(self::once())->method('lookupPaths')
+            ->with(['Shop/Men' => ['Shop', 'Men']], 29)
+            ->willReturn(['Shop/Men' => 31]);
+        $this->pathResolver->method('validateIds')->willReturn([]);
+        $this->categoryLink->method('getAssignments')->willReturn([]);
+
+        $this->processor->process($context);
+
+        self::assertSame([], $context->getMessages('SKU-1'));
+    }
+
+    /**
+     * The predicate: a batch whose every path is already there creates nothing,
+     * so it takes nothing. This is the case a steady-state feed is in on every
+     * push, and the one the old "a categories field is present" test got wrong —
+     * measured at 322 ms of hold and 572 ms of a competitor's wait, for nothing.
+     */
+    public function testNoLockIsTakenWhenEveryPathAlreadyResolves(): void
+    {
+        $context = $this->createContext(
+            ['SKU-1' => ['Default Category/Men', '42']],
+            ['SKU-1' => 10],
+            holdsTreeLock: false
+        );
+
+        $this->pathResolver->method('lookupPaths')
+            ->with(['Default Category/Men' => ['Default Category', 'Men']])
+            ->willReturn(['Default Category/Men' => 5]);
+
+        self::assertSame([], $this->processor->requiredLocks($context));
+    }
+
+    public function testTheTreeLockIsTakenWhenAPathHasToBeCreated(): void
+    {
+        $context = $this->createContext(
+            ['SKU-1' => ['Default Category/Men/New Thing']],
+            ['SKU-1' => 10],
+            holdsTreeLock: false
+        );
+
+        $this->pathResolver->method('lookupPaths')->willReturn([]);
+
+        self::assertSame([ImportLocks::CATEGORY_TREE], $this->processor->requiredLocks($context));
+    }
+
+    /**
+     * Neither a numeric ID nor an empty array can bring a category into
+     * existence, so neither is worth serializing on. `[]` still removes every
+     * link — deleting is not a read-then-create.
+     *
+     * @dataProvider referencesThatCreateNothing
+     */
+    public function testReferencesThatCannotCreateTakeNoLock(array $categories): void
+    {
+        $context = $this->createContext(['SKU-1' => $categories], ['SKU-1' => 10], holdsTreeLock: false);
+
+        $this->pathResolver->expects(self::never())->method('lookupPaths');
+
+        self::assertSame([], $this->processor->requiredLocks($context));
+    }
+
+    /**
+     * @return array<string, array{string[]}>
+     */
+    public static function referencesThatCreateNothing(): array
+    {
+        return [
+            'numeric IDs only' => [['42', '7']],
+            'empty array' => [[]],
+        ];
+    }
+
+    /**
+     * The window the predicate cannot close: the path resolved when the lock
+     * decision was made and does not now, so this batch holds nothing. Creating
+     * it here is the unguarded read-then-create the lock exists to prevent, so
+     * the product is reported and applied additively instead — its existing
+     * links survive, and the retry's predicate takes the lock.
+     */
+    public function testAPathThatVanishesAfterTheLockDecisionIsReportedNotCreated(): void
+    {
+        $context = $this->createContext(
+            ['SKU-1' => ['Default Category/Men']],
+            ['SKU-1' => 10],
+            holdsTreeLock: false
+        );
+
+        $this->pathResolver->expects(self::never())->method('resolvePaths');
+        $this->pathResolver->method('lookupPaths')->willReturn([]);
+        $this->categoryLink->method('getAssignments')->willReturn([10 => [7]]);
+
+        // Additive: the link it could not resolve is not a reason to drop the
+        // links it already has.
+        $this->categoryLink->expects(self::once())->method('unassign')->with([]);
+
+        $this->processor->process($context);
+
+        $messages = $context->getMessages('SKU-1');
+        self::assertStringContainsString('stopped resolving', $messages[0]);
+        self::assertFalse($context->isFailed('SKU-1'));
     }
 
     /**
@@ -462,10 +581,18 @@ class CategoryLinkProcessorTest extends TestCase
      * @param array<string, int> $entityIds
      * @param array<string, int[]> $replaceScopes per-SKU categories_replace_scope
      */
+    /**
+     * @param bool $holdsTreeLock whether the batch reserved the right to create
+     *        categories. True by default because these tests are about link
+     *        semantics, and a batch that names a path needing creation is
+     *        exactly the batch whose predicate takes the lock; the lock-free
+     *        walk has its own tests.
+     */
     private function createContext(
         array $categoriesBySku,
         array $entityIds,
-        array $replaceScopes = []
+        array $replaceScopes = [],
+        bool $holdsTreeLock = true
     ): BatchContext {
         $products = [];
         foreach ($categoriesBySku as $sku => $categories) {
@@ -481,6 +608,9 @@ class CategoryLinkProcessorTest extends TestCase
         $context = new BatchContext($products);
         foreach ($entityIds as $sku => $entityId) {
             $context->setEntityId($sku, $entityId);
+        }
+        if ($holdsTreeLock) {
+            $context->setHeldLocks([ImportLocks::CATEGORY_TREE]);
         }
 
         return $context;

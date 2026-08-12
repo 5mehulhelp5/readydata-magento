@@ -604,22 +604,55 @@ inserted, and no more, because:
 So a competing import waits for one batch transaction, not for a feed's worth of
 downloads and reindexing. Per-batch scoping also means one unknown SKU in a
 5 000-product payload no longer makes the whole request serialize — only the
-batch carrying it does. Lowering *batch size* shortens the hold further.
+batch carrying it does.
 
-Deciding all this costs **one indexed query per batch**: its SKUs are looked up
-before the locks, because nothing in the payload reveals whether a product row
-has to be created. A batch whose SKUs all exist and that carries no `categories`,
-no `media` and no `custom_attributes` (with option auto-creation on) runs
-**lock-free**, concurrently with anything else — a price or stock refresh,
-typically, which is the case the fast path is for.
+**What a batch takes is decided by what it will actually create**, not by which
+fields its payload carries. Each pipeline step that can create something unkeyed
+is asked, before the locks, what it needs for *this* batch, and answers by
+reading what is already there:
 
-The remaining tests are deliberately conservative: any `categories` field at all
-(including `[]`), any `media` field at all (`[]` means "remove everything", which
-is still work), and any `custom_attributes` while option auto-creation is on.
-`store_values` blocks are **not** consulted — their custom attributes only ever
-resolve option labels they did not create. Erring towards taking a lock costs a
-serialized batch; erring the other way costs a duplicate product, category, image
-or attribute option, and none of those is cheap to undo.
+| Step | Takes its lock when |
+| --- | --- |
+| `EntityProcessor` | a SKU in the batch is not in `catalog_product_entity`. |
+| `CategoryLinkProcessor` | a `categories` path does not resolve to a category that exists. Numeric IDs and `[]` never do. |
+| `AttributeProcessor` | a `custom_attributes` label has no option on that attribute yet — after multiselect values are split and trimmed, so the check and the create agree on what a label is. Off entirely when option auto-creation is off. |
+| `MediaProcessor` | a `media` field is present at all — see below. |
+
+The distinction is the whole point. A feed sends `categories` and
+`custom_attributes` on every product of every push, while the tree and the
+options it names were created the first time it ran. Measured on prelive, a batch
+whose categories all existed still held the tree lock for **322 ms** and cost a
+competing import **572 ms**, to guard a create that never happened. Such a batch
+now takes nothing and runs concurrently with everything else — as does a price or
+stock refresh, which was always the fast path.
+
+Deciding costs a handful of indexed reads per batch, and they are not extra: they
+are the same lookups the steps make anyway, moved to **before** the lock instead
+of inside it, and their caches are shared with the pipeline that follows.
+
+**`MediaProcessor` is the exception** and stays conservative — any `media` field,
+including `[]`, takes the gallery lock. Being exact there means answering "will a
+gallery row be inserted", which needs the desired-versus-existing diff the step
+performs per product, against link IDs that do not exist yet when the locks are
+decided (a new product has no gallery to read). On the one lock where being wrong
+lists an image twice, the conservative answer is worth its 251 ms.
+
+`store_values` blocks are **not** consulted for options — their custom attributes
+only ever resolve labels they did not create.
+
+**The probes read before the lock is taken**, so what they saw can be gone by the
+time the transaction runs — a category or option deleted in between turns a
+resolve into a create the batch never reserved for. No step creates in that case.
+It reports the product instead and carries on: an unresolved category leaves the
+product applied additively (its existing links survive), an unresolved option is
+reported as unknown, a vanished SKU fails that product alone. The retry, whose
+probe now sees the gap, takes the lock and does the work. Erring this way costs a
+re-send; erring the other way costs a duplicate product, category, image or
+attribute option, and none of those is cheap to undo.
+
+A third-party pipeline step that creates something unkeyed declares its own lock
+the same way, by implementing `LockAwareInterface` — the orchestrator has no list
+of its own.
 
 **When a lock cannot be taken**, a set is acquired all-or-nothing in one fixed
 order (so two requests wanting overlapping sets cannot deadlock on each other),
@@ -1550,10 +1583,12 @@ removals of legacy junk rows whose stored path was NULL or a duplicate.
 
 No placeholder steps remain — every dimension in the pipeline is implemented.
 To add one: implement `ProcessorInterface` (plus `PreparableInterface` when the
-step needs network or filesystem access before the batch transaction opens) and
-register it in `etc/di.xml` (`ImportService`, argument `processors`). Position is
-`getSortOrder()`, not the order of the XML items; core steps use 100–750 with
-gaps left for third-party insertion. `AbstractPlaceholderProcessor` remains as the
+step needs network or filesystem access before the batch transaction opens, and
+`LockAwareInterface` when it performs an unkeyed read-then-create and therefore
+needs one of the named locks — see "Concurrency") and register it in `etc/di.xml`
+(`ImportService`, argument `processors`). Position is `getSortOrder()`, not the
+order of the XML items; core steps use 100–750 with gaps left for third-party
+insertion. `AbstractPlaceholderProcessor` remains as the
 base for a step that should be registered but inert until it is written.
 
 ## Important caveats

@@ -23,27 +23,29 @@ use ReadyData\Import\Model\Event\ImportEventDispatcher;
 use ReadyData\Import\Model\Exception\ImportLockedException;
 use ReadyData\Import\Model\Indexer\InvalidationHandler;
 use ReadyData\Import\Model\Processor\CategoryLinkProcessor;
+use ReadyData\Import\Model\Processor\LockAwareInterface;
 use ReadyData\Import\Model\Processor\PreparableInterface;
 use ReadyData\Import\Model\Processor\ProcessorInterface;
 use ReadyData\Import\Model\ResourceModel\AttributeOption;
-use ReadyData\Import\Model\ResourceModel\ProductEntity;
 
 /**
  * Orchestrates a bulk import: batching, transactions, the processor
  * pipeline, index invalidation and response assembly.
  *
  * Concurrency is scoped as tightly as the races allow. Locks are taken per
- * BATCH rather than per request, from the subset of {@see ImportLocks} that
- * batch's own payload can race on, and held only for its transaction — never
- * across the file downloads that precede it or the reindex that follows it. A
- * competing import therefore waits for one transaction, and only if it can race
- * on the same thing. See {@see processBatch()} and {@see batchLocks()}.
+ * BATCH rather than per request, and only the ones the batch's own steps say
+ * they will actually create something under — not the ones its payload could in
+ * principle reach. They are held only for its transaction, never across the file
+ * downloads that precede it or the reindex that follows it. A competing import
+ * therefore waits for one transaction, and only if it is going to create the
+ * same kind of thing. See {@see processBatch()}, {@see batchLocks()} and
+ * {@see \ReadyData\Import\Model\Processor\LockAwareInterface}.
  */
 class ImportService
 {
     /**
-     * @deprecated There is no single import lock any more: a batch takes the
-     *             subset of {@see ImportLocks} its own payload can race on.
+     * @deprecated There is no single import lock any more: a batch takes only
+     *             the {@see ImportLocks} its own steps will create under.
      * @see ImportLocks::CATEGORY_TREE
      * @see ImportService::batchLocks()
      */
@@ -62,7 +64,6 @@ class ImportService
         private readonly ResourceConnection $resourceConnection,
         private readonly LockManagerInterface $lockManager,
         private readonly BatchContextFactory $batchContextFactory,
-        private readonly ProductEntity $productEntity,
         private readonly AttributeOption $attributeOption,
         private readonly StoreWebsiteMap $storeWebsiteMap,
         private readonly InvalidationHandler $invalidationHandler,
@@ -120,7 +121,7 @@ class ImportService
                 ]);
                 $contexts[] = $context;
 
-                if (!$this->processBatch($context, $batchNumber, $batch) && !$continueOnError) {
+                if (!$this->processBatch($context, $batchNumber) && !$continueOnError) {
                     break;
                 }
             }
@@ -164,30 +165,35 @@ class ImportService
      * FileResolver maps a URL to a deterministic path and skips what is already
      * there, so the caller's retry re-uses every one of them.
      *
-     * @param ProductInterface[] $batch this batch's slice of the payload
      * @return bool true when the batch committed
      * @throws LocalizedException when the FIRST batch cannot take its locks
      */
-    private function processBatch(BatchContext $context, int $batchNumber, array $batch): bool
+    private function processBatch(BatchContext $context, int $batchNumber): bool
     {
         if (!$this->prepareBatch($context, $batchNumber)) {
             return false;
         }
 
-        $locks = $this->batchLocks($batch);
+        $locks = $this->batchLocks($context);
         if (!$this->acquireLocks($locks, $batchNumber > 0)) {
             return $this->reportLockRejection($context, $batchNumber, $locks);
         }
+        // What was taken, for the steps that may only create what they declared.
+        $context->setHeldLocks($locks);
 
-        // The option memo is per request and survives batches, but the lock does
-        // not: an option another request committed while this batch was
-        // downloading is not in it. Dropped for EVERY batch, not only the ones
-        // holding ATTRIBUTE_OPTIONS — with the lock, a stale memo is how
-        // AttributeProcessor inserts a duplicate label under a lock that was
-        // supposed to prevent exactly that; without it, a stale memo reports a
-        // label that now exists as an unknown option. One re-read per attribute
-        // per batch either way.
-        $this->attributeOption->forget();
+        if (in_array(ImportLocks::ATTRIBUTE_OPTIONS, $locks, true)) {
+            // The option memo is per request and survives batches, but the lock
+            // does not: an option another request committed while this batch was
+            // downloading is not in it, and createOptions() trusts the memo to
+            // decide what is missing — a stale entry is how a duplicate label
+            // gets written under the very lock meant to prevent it.
+            //
+            // Only when the lock was taken. A batch without it creates nothing,
+            // so a stale memo cannot cause a duplicate there, and the memo it
+            // keeps is the one its own lock predicate just warmed — the read
+            // would otherwise be made twice per batch to no end.
+            $this->attributeOption->forget();
+        }
 
         $connection = $this->resourceConnection->getConnection();
         $committed = false;
@@ -312,69 +318,39 @@ class ImportService
     }
 
     /**
-     * Which of {@see ImportLocks} this batch's payload can race on. Empty for a
-     * batch that can reach none of them, which then runs lock-free, concurrently
-     * with anything else — a price or stock refresh over products that already
-     * exist, typically.
+     * Which of {@see ImportLocks} this batch needs: the union of what its
+     * {@see LockAwareInterface} steps declare. Empty for a batch that can create
+     * nothing unkeyed, which then runs lock-free, concurrently with anything
+     * else — a price or stock refresh over products that already exist, but also
+     * any push whose categories, options and products are all already there,
+     * which is what a steady-state feed mostly is.
      *
      * Decided per BATCH, not per request: one unknown SKU in a 5 000-product
      * payload used to make the whole request serialize against every other
-     * import, when only the batch carrying it can create anything. The cost is
-     * one indexed query per batch instead of one per request, next to the one
-     * EntityProcessor makes anyway.
+     * import, when only the batch carrying it can create anything.
      *
-     * The SKU test is the reason the others are worth making:
-     * `catalog_product_entity.sku` is NOT unique, so an insert of an unknown SKU
-     * is itself a race, and no payload field reveals it — only the database can
-     * say whether the row is already there. A SKU that exists now and is deleted
-     * before the batch writes would slip through; a product vanishing mid-import
-     * fails the batch on its own terms.
+     * Asked of the STEPS rather than decided here, because the question is
+     * "will this create something", and only the code that does the creating can
+     * answer it without drifting from itself. Each step probes what already
+     * exists — see the implementations — so the answer is about what is actually
+     * missing rather than about which payload fields are present. That
+     * distinction is the whole value: measured on prelive, a batch whose
+     * categories all existed still held the tree lock for 322 ms and cost a
+     * competing import 572 ms, to guard a create that never happened.
      *
-     * The rest are deliberately **conservative** — they ask what the payload
-     * *could* reach, not what it would turn out to do:
+     * The probes read before the locks are taken, so what they saw can be gone
+     * by the time the transaction runs. That is not a hole: a step may only
+     * create what it declared, checks {@see BatchContext::holdsLock()} before
+     * doing so, and reports the product instead of creating unguarded.
      *
-     * - a `categories` field is the only way into CategoryPathResolver, and
-     *   whether any of its entries turns out to need creating is not knowable
-     *   without resolving the tree, which is the work the lock is protecting;
-     * - a `media` field is the only way into a gallery insert, and whether a
-     *   file is already on the product is not knowable without the gallery read
-     *   that same insert follows. `[]` counts: it means "remove everything",
-     *   which is still work;
-     * - a custom attribute value is the only way into option auto-creation, and
-     *   telling a `select` from a text attribute needs the metadata cache the
-     *   pipeline warms later. `status` and `visibility` are selects too, but
-     *   AttributeProcessor skips them, and they are first-class fields here
-     *   rather than custom attributes. `store_values` blocks are deliberately
-     *   NOT consulted: their custom attributes only ever resolve option labels
-     *   they did not create — see AttributeProcessor::ensureOptions().
-     *
-     * Erring towards taking a lock costs a serialized batch; erring the other way
-     * costs a duplicate product, category, image or attribute option, and none of
-     * those is cheap to undo.
-     *
-     * @param ProductInterface[] $products one batch
      * @return string[] in acquisition order
      */
-    private function batchLocks(array $products): array
+    private function batchLocks(BatchContext $context): array
     {
         $locks = [];
-
-        $skus = array_map(static fn (ProductInterface $product): string => $product->getSku(), $products);
-        if (count($this->productEntity->getExistingBySkus($skus)) !== count($skus)) {
-            $locks[] = ImportLocks::PRODUCT_CREATE;
-        }
-
-        $mediaEnabled = $this->config->isMediaEnabled();
-        $createsOptions = $this->config->isCreateMissingOptions();
-        foreach ($products as $product) {
-            if ($product->getCategories() !== null) {
-                $locks[] = ImportLocks::CATEGORY_TREE;
-            }
-            if ($mediaEnabled && $product->getMedia() !== null) {
-                $locks[] = ImportLocks::MEDIA_GALLERY;
-            }
-            if ($createsOptions && $product->getCustomAttributes()) {
-                $locks[] = ImportLocks::ATTRIBUTE_OPTIONS;
+        foreach ($this->processors as $processor) {
+            if ($processor instanceof LockAwareInterface && $processor->isEnabled()) {
+                $locks = array_merge($locks, $processor->requiredLocks($context));
             }
         }
 

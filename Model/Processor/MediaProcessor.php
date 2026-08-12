@@ -11,6 +11,7 @@ use ReadyData\Import\Logger\Logger;
 use ReadyData\Import\Model\BatchContext;
 use ReadyData\Import\Model\Cache\AttributeMetadataCache;
 use ReadyData\Import\Model\Config;
+use ReadyData\Import\Model\ImportLocks;
 use ReadyData\Import\Model\Media\FileResolver;
 use ReadyData\Import\Model\ResourceModel\EavValue;
 use ReadyData\Import\Model\ResourceModel\ProductEntity;
@@ -62,7 +63,7 @@ use ReadyData\Import\Model\ResourceModel\ProductMediaGallery;
  *    it touched, so the dispatcher can tell a genuine detachment from a file
  *    that merely moved between products.
  */
-class MediaProcessor implements ProcessorInterface, PreparableInterface
+class MediaProcessor implements ProcessorInterface, PreparableInterface, LockAwareInterface
 {
     public const CONTEXT_RESOLVED_FILES = 'media_resolved_files';
 
@@ -152,6 +153,34 @@ class MediaProcessor implements ProcessorInterface, PreparableInterface
         }
 
         $context->set(self::CONTEXT_RESOLVED_FILES, $this->fileResolver->resolve(array_keys($references)));
+    }
+
+    /**
+     * The gallery lock, for any batch carrying a `media` field at all.
+     *
+     * Deliberately still the CONSERVATIVE test, unlike the other three. Being
+     * exact here means answering "will any gallery row be inserted", and a
+     * gallery row has no natural key to look itself up by — the answer needs the
+     * desired-versus-existing diff that {@see process()} performs, per product,
+     * against link IDs that do not exist yet at this point (EntityProcessor has
+     * not run, and a new product has no row to read a gallery for). Reproducing
+     * that here would be the duplicate-logic hazard {@see LockAwareInterface}
+     * warns about, on the one lock where being wrong lists an image twice.
+     *
+     * `[]` counts: it means "remove everything", and while a delete cannot
+     * duplicate a row, the delete-then-insert of `_value` rows in the same pass
+     * can. Measured at 251 ms of hold — the cheapest of the four — so the
+     * conservative answer is the affordable one.
+     */
+    public function requiredLocks(BatchContext $context): array
+    {
+        foreach ($context->getValidProducts() as $product) {
+            if ($product->getMedia() !== null) {
+                return [ImportLocks::MEDIA_GALLERY];
+            }
+        }
+
+        return [];
     }
 
     public function process(BatchContext $context): void
