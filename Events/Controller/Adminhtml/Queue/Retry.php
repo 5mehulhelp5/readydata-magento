@@ -6,10 +6,11 @@ declare(strict_types=1);
 
 namespace ReadyData\Events\Controller\Adminhtml\Queue;
 
-use Magento\Backend\App\Action;
 use Magento\Backend\App\Action\Context;
+use Magento\Backend\Model\View\Result\ForwardFactory;
 use Magento\Framework\App\Action\HttpPostActionInterface;
 use Magento\Framework\Controller\ResultInterface;
+use ReadyData\Events\Model\Config;
 use ReadyData\Events\Model\ResourceModel\Queue;
 
 /**
@@ -25,19 +26,26 @@ use ReadyData\Events\Model\ResourceModel\Queue;
  * maximum would have the row dead-letter again on its first failure, which is
  * not a retry so much as a formality.
  */
-class Retry extends Action implements HttpPostActionInterface
+class Retry extends AbstractQueueAction implements HttpPostActionInterface
 {
-    public const ADMIN_RESOURCE = 'ReadyData_Events::queue';
-
     public function __construct(
         Context $context,
+        Config $eventsConfig,
+        ForwardFactory $forwardFactory,
         private readonly Queue $queue
     ) {
-        parent::__construct($context);
+        parent::__construct($context, $eventsConfig, $forwardFactory);
     }
 
     public function execute(): ResultInterface
     {
+        // The grid is this action's only entry point, so it goes away with it —
+        // otherwise a stale form or a bookmarked POST could still requeue.
+        $disabled = $this->gridDisabledResult();
+        if ($disabled !== null) {
+            return $disabled;
+        }
+
         $ids = $this->getRequest()->getParam('queue_ids');
         $scope = (string)$this->getRequest()->getParam('scope', '');
 

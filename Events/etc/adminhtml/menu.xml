@@ -2,8 +2,14 @@
 <config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="urn:magento:module:Magento_Backend:etc/menu.xsd">
     <menu>
+        <!--
+            dependsOnConfig hides the item; it does not protect the URL, which
+            is why the controllers carry the same guard. Menu visibility is a
+            convenience, never a control.
+        -->
         <add id="ReadyData_Events::queue" title="ReadyData Events" module="ReadyData_Events"
              sortOrder="80" parent="Magento_Backend::system" resource="ReadyData_Events::queue"
-             action="readydata_events/queue/index"/>
+             action="readydata_events/queue/index"
+             dependsOnConfig="readydata_events/queue_grid/enabled"/>
     </menu>
 </config>

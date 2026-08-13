@@ -32,6 +32,7 @@ class Config
     private const XML_PATH_BACKOFF_SECONDS = 'readydata_events/delivery/backoff_seconds';
     private const XML_PATH_RETENTION_DAYS = 'readydata_events/retention/days';
     private const XML_PATH_LOGGING_ENABLED = 'readydata_events/logging/enabled';
+    private const XML_PATH_QUEUE_GRID_ENABLED = 'readydata_events/queue_grid/enabled';
 
     public function __construct(
         private readonly ScopeConfigInterface $scopeConfig,
@@ -99,6 +100,20 @@ class Config
     public function isLoggingEnabled(): bool
     {
         return $this->scopeConfig->isSetFlag(self::XML_PATH_LOGGING_ENABLED);
+    }
+
+    /**
+     * Whether the Events Status grid is reachable in the admin.
+     *
+     * Purely about the admin surface: capture, delivery and retention are
+     * unaffected, and the queue table keeps exactly the rows it kept before.
+     * A store that has no one to read the grid — or whose queue is deep enough
+     * that rendering it is itself a cost — can take the page away without
+     * standing the pipeline down.
+     */
+    public function isQueueGridEnabled(): bool
+    {
+        return $this->scopeConfig->isSetFlag(self::XML_PATH_QUEUE_GRID_ENABLED);
     }
 
     /**
