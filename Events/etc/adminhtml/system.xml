@@ -78,6 +78,15 @@
                     <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
                 </field>
             </group>
+
+            <group id="queue_grid" translate="label" type="text" sortOrder="60" showInDefault="1">
+                <label>Admin</label>
+                <field id="enabled" translate="label comment" type="select" sortOrder="10" showInDefault="1">
+                    <label>Show Events Status Grid</label>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                    <comment>Hides System → ReadyData Events and makes its URL a 404. Capture, delivery and retention are unaffected — only the page goes away, and the queue keeps every row it kept before.</comment>
+                </field>
+            </group>
         </section>
     </system>
 </config>

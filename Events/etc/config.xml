@@ -32,6 +32,14 @@
             <logging>
                 <enabled>1</enabled>
             </logging>
+            <queue_grid>
+                <!--
+                    On by default: when events are not arriving, the person
+                    looking is often a Magento developer with no ReadyData
+                    login, and this grid is where the answer is.
+                -->
+                <enabled>1</enabled>
+            </queue_grid>
         </readydata_events>
     </default>
 </config>

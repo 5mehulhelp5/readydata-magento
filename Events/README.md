@@ -46,6 +46,7 @@ cost of the registered hooks, measured below.
 | Maximum Retries | 7 | Then the event is dead-lettered. |
 | Retry Backoff | 60s | Multiplied by attempt count. |
 | Retention | 3 days | Settled events only; waiting events are never deleted. |
+| Show Events Status Grid | on | Admin surface only — hides the grid and 404s its URL. Capture, delivery and retention are untouched. |
 
 ## REST API
 
@@ -331,6 +332,20 @@ this store's data.
 Retry resets the attempt counter as well as the status. Leaving it at the
 maximum would dead-letter the row again on its first failure, which is a
 formality rather than a retry.
+
+**Turning the grid off** (*Admin → Show Events Status Grid*) hides the menu item
+and makes `readydata_events/queue/index` a 404 — for a store whose queue is deep
+enough that rendering the grid is itself a cost, or one where nobody should be
+requeueing by hand. It is an **admin-surface switch only**: capture still
+captures, the cron still delivers, retention still sweeps, and the queue table
+keeps every row it kept before. Nothing about the pipeline changes, and the same
+questions are still answerable over `GET queue`.
+
+The menu's `dependsOnConfig` only removes the link, so both controllers carry
+the guard too — a bookmark, a history entry or a stale form POST would otherwise
+still reach the page and the retry action. They answer **404 rather than 403**:
+the ACL resource is still granted and still meaningful, so "forbidden" would
+send whoever hit it to check role permissions that are not the problem.
 
 ### CLI
 
