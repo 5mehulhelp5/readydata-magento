@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<!--
+    Not started automatically. A store that wants near-real-time delivery runs
+    `bin/magento queue:consumers:start readydata.events.publish`; every other
+    store delivers on the one-minute cron and never touches the queue.
+-->
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:framework-message-queue:etc/consumer.xsd">
+    <consumer name="readydata.events.publish" queue="readydata.events.publish"
+              connection="db" handler="ReadyData\Events\Model\Delivery\PriorityConsumer::process"/>
+</config>

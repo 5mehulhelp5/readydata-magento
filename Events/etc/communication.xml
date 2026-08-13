@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<!--
+    The near-real-time path. Opt-in per subscription: an ordinary store runs no
+    consumer and delivers on the one-minute cron, which is the whole reason the
+    module is useful without any extra process.
+
+    The message carries only the event code. The queue table stays the source of
+    truth, so nothing here can disagree with it — and no customer data enters a
+    transport with its own retention and its own access rules.
+-->
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:framework-message-queue:etc/communication.xsd">
+    <topic name="readydata.events.publish" request="string">
+        <handler name="readydata_events_priority_dispatch"
+                 type="ReadyData\Events\Model\Delivery\PriorityConsumer"
+                 method="process"/>
+    </topic>
+</config>
