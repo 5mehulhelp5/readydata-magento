@@ -9,6 +9,7 @@ namespace ReadyData\Import\Model\Processor;
 use Magento\Framework\Stdlib\DateTime\DateTime;
 use ReadyData\Import\Model\BatchContext;
 use ReadyData\Import\Model\Cache\AttributeMetadataCache;
+use ReadyData\Import\Model\ImportLocks;
 use ReadyData\Import\Model\ResourceModel\ProductEntity;
 
 /**
@@ -21,7 +22,7 @@ use ReadyData\Import\Model\ResourceModel\ProductEntity;
  *  - "type_ids": array<string sku, string> resolved product type per SKU
  *    (payload value or, for existing products, the stored type).
  */
-class EntityProcessor implements ProcessorInterface
+class EntityProcessor implements ProcessorInterface, LockAwareInterface
 {
     public const CONTEXT_LINK_IDS = 'link_ids';
     public const CONTEXT_TYPE_IDS = 'type_ids';
@@ -43,6 +44,29 @@ class EntityProcessor implements ProcessorInterface
     ) {
     }
 
+    /**
+     * The product-row lock, and only when this batch names a SKU the catalog
+     * does not have.
+     *
+     * This is the one predicate that was always exact, because it has to be:
+     * `catalog_product_entity.sku` is NOT unique, so an insert of an unknown SKU
+     * is itself the race, and no payload field reveals whether the row is
+     * already there — only the database can say. The read is the same one
+     * {@see process()} makes moments later, against the same connection, so the
+     * cost is one indexed query per batch.
+     */
+    public function requiredLocks(BatchContext $context): array
+    {
+        $skus = array_keys($context->getValidProducts());
+        if (!$skus) {
+            return [];
+        }
+
+        return count($this->productEntity->getExistingBySkus($skus)) === count($skus)
+            ? []
+            : [ImportLocks::PRODUCT_CREATE];
+    }
+
     public function process(BatchContext $context): void
     {
         $existing = $this->productEntity->getExistingBySkus($context->getSkus());
@@ -56,6 +80,19 @@ class EntityProcessor implements ProcessorInterface
 
         foreach ($context->getValidProducts() as $sku => $product) {
             $isNew = !isset($existing[$sku]);
+
+            if ($isNew && !$context->holdsLock(ImportLocks::PRODUCT_CREATE)) {
+                // The lock predicate read this SKU as existing and the row is
+                // gone now — deleted between that read and this transaction.
+                // Inserting here is exactly the unguarded read-then-create the
+                // lock exists to prevent, so the product is reported instead:
+                // the retry's probe sees the gap, takes the lock, and creates it.
+                $context->fail(
+                    $sku,
+                    'Product vanished after the lock decision; skipped rather than created unguarded.'
+                );
+                continue;
+            }
 
             if ($isNew && $this->productEntity->isStagingEnvironment()) {
                 // Creating rows in a staged (EE) catalog needs sequence + created_in/updated_in

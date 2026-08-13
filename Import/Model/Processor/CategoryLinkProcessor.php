@@ -11,6 +11,7 @@ use ReadyData\Import\Model\Cache\CategoryPathResolver;
 use ReadyData\Import\Model\Cache\RootCategoryRegistry;
 use ReadyData\Import\Model\Category\PathParser;
 use ReadyData\Import\Model\Config;
+use ReadyData\Import\Model\ImportLocks;
 use ReadyData\Import\Model\ResourceModel\Category as CategoryResource;
 use ReadyData\Import\Model\ResourceModel\CategoryLink;
 
@@ -44,7 +45,7 @@ use ReadyData\Import\Model\ResourceModel\CategoryLink;
  *  - "affected_product_ids": int[] product IDs whose category links changed;
  *    consumed by ImportEventDispatcher for the category-changed event.
  */
-class CategoryLinkProcessor implements ProcessorInterface
+class CategoryLinkProcessor implements ProcessorInterface, LockAwareInterface
 {
     public const CONTEXT_AFFECTED_CATEGORY_IDS = 'affected_category_ids';
     public const CONTEXT_AFFECTED_PRODUCT_IDS = 'affected_product_ids';
@@ -59,48 +60,68 @@ class CategoryLinkProcessor implements ProcessorInterface
     ) {
     }
 
+    /**
+     * The tree lock, and only when a path in this batch does not resolve to a
+     * category that is already there.
+     *
+     * The old test was "a `categories` field is present", which a feed sends on
+     * every product of every push while the tree it names has existed since the
+     * first one. Measured on prelive, that cost 322 ms of hold and 572 ms of a
+     * competitor's wait per batch, to guard nothing: resolving an existing path
+     * is a read, and only the create is a race. It is the most expensive of the
+     * four locks — the create behind it runs through the category repository —
+     * so it is also the one most worth not taking.
+     *
+     * {@see CategoryPathResolver::lookupPaths()} is the same walk
+     * {@see process()} makes, minus the creating, and the resolver is shared and
+     * caches — so the reads move OUT of the lock rather than being added to it.
+     *
+     * Numeric IDs and an empty `categories` array are deliberately not counted:
+     * neither can create a category.
+     */
+    public function requiredLocks(BatchContext $context): array
+    {
+        $collected = $this->collectReferences($context, false);
+        if (!$collected['paths']) {
+            return [];
+        }
+
+        $resolved = $this->pathResolver->lookupPaths($collected['paths'], $context->getRootCategoryId());
+
+        return count($resolved) === count($collected['paths']) ? [] : [ImportLocks::CATEGORY_TREE];
+    }
+
     public function process(BatchContext $context): void
     {
-        $uniquePaths = [];
-        $uniqueIds = [];
+        $collected = $this->collectReferences($context, true);
+
         $refsBySku = [];
-
-        foreach ($context->getValidProducts() as $sku => $product) {
-            if ($product->getCategories() === null) {
-                continue;
-            }
+        foreach ($collected['refs'] as $sku => $refs) {
+            // Products whose row could not be resolved are dropped HERE rather
+            // than during collection, so their paths cannot pull a category
+            // into existence for a product this batch is not writing.
             $entityId = $context->getEntityId($sku);
-            if ($entityId === null) {
-                continue;
+            if ($entityId !== null) {
+                $refsBySku[$sku] = ['entity_id' => $entityId] + $refs;
             }
-
-            $refs = ['entity_id' => $entityId, 'paths' => [], 'ids' => [], 'partial' => false];
-            foreach ($product->getCategories() as $reference) {
-                $parsed = $this->pathParser->parse((string)$reference);
-                if ($parsed === null) {
-                    $context->addMessage($sku, 'Empty category reference skipped.');
-                    $refs['partial'] = true;
-                    continue;
-                }
-                if ($parsed['type'] === PathParser::TYPE_ID) {
-                    $uniqueIds[$parsed['id']] = true;
-                    $refs['ids'][$parsed['id']] = true;
-                } else {
-                    // Escaped canonical key — a plain implode would collide
-                    // ["a/b"] with ["a","b"].
-                    $key = PathParser::buildKey($parsed['segments']);
-                    $uniquePaths[$key] = $parsed['segments'];
-                    $refs['paths'][$key] = true;
-                }
-            }
-            $refsBySku[$sku] = $refs;
         }
 
         if (!$refsBySku) {
             return;
         }
 
-        $pathResults = $this->pathResolver->resolvePaths($uniquePaths, $context->getRootCategoryId());
+        $uniquePaths = [];
+        $uniqueIds = [];
+        foreach ($refsBySku as $refs) {
+            foreach (array_keys($refs['paths']) as $key) {
+                $uniquePaths[$key] = $collected['paths'][$key];
+            }
+            foreach (array_keys($refs['ids']) as $categoryId) {
+                $uniqueIds[$categoryId] = true;
+            }
+        }
+
+        $pathResults = $this->resolvePaths($context, $uniquePaths);
         $validIds = $this->pathResolver->validateIds(array_keys($uniqueIds));
         $currentAssignments = $this->categoryLink->getAssignments(
             array_column($refsBySku, 'entity_id')
@@ -355,6 +376,99 @@ class CategoryLinkProcessor implements ProcessorInterface
         }
 
         return $valid;
+    }
+
+    /**
+     * Parse every product's `categories` entries once, into the unique paths and
+     * IDs the batch names plus a per-SKU index of which it named.
+     *
+     * Shared by {@see requiredLocks()} and {@see process()} so the lock decision
+     * and the write can never disagree about what the payload says — a
+     * predicate parsing paths even slightly differently would answer for a
+     * different set of categories than the one that gets created.
+     *
+     * @param bool $reportProblems whether to attach per-product messages; false
+     *        for the predicate pass, which runs before the write and must not
+     *        report a problem the write is about to report again
+     * @return array{paths: array<string, string[]>, ids: array<int, true>,
+     *         refs: array<string, array{paths: array<string, true>,
+     *         ids: array<int, true>, partial: bool}>}
+     */
+    private function collectReferences(BatchContext $context, bool $reportProblems): array
+    {
+        $uniquePaths = [];
+        $uniqueIds = [];
+        $refsBySku = [];
+
+        foreach ($context->getValidProducts() as $sku => $product) {
+            if ($product->getCategories() === null) {
+                continue;
+            }
+
+            $refs = ['paths' => [], 'ids' => [], 'partial' => false];
+            foreach ($product->getCategories() as $reference) {
+                $parsed = $this->pathParser->parse((string)$reference);
+                if ($parsed === null) {
+                    if ($reportProblems) {
+                        $context->addMessage($sku, 'Empty category reference skipped.');
+                    }
+                    $refs['partial'] = true;
+                    continue;
+                }
+                if ($parsed['type'] === PathParser::TYPE_ID) {
+                    $uniqueIds[$parsed['id']] = true;
+                    $refs['ids'][$parsed['id']] = true;
+                } else {
+                    // Escaped canonical key — a plain implode would collide
+                    // ["a/b"] with ["a","b"].
+                    $key = PathParser::buildKey($parsed['segments']);
+                    $uniquePaths[$key] = $parsed['segments'];
+                    $refs['paths'][$key] = true;
+                }
+            }
+            $refsBySku[$sku] = $refs;
+        }
+
+        return ['paths' => $uniquePaths, 'ids' => $uniqueIds, 'refs' => $refsBySku];
+    }
+
+    /**
+     * Resolve the batch's paths, creating missing subtrees only if this batch
+     * reserved the right to.
+     *
+     * Without the lock the walk is the non-creating one. A path that resolved
+     * during {@see requiredLocks()} and does not now was deleted in between;
+     * creating it here would be the unguarded read-then-create the lock exists
+     * to prevent, so it is reported instead. The product is then applied
+     * additively by the caller — its existing links survive — and the retry,
+     * whose predicate now sees the gap, takes the lock and creates it.
+     *
+     * @param array<string, string[]> $paths cache key => segments
+     * @return array<string, array{id: ?int, message: ?string}> keyed like $paths
+     */
+    private function resolvePaths(BatchContext $context, array $paths): array
+    {
+        if ($context->holdsLock(ImportLocks::CATEGORY_TREE)) {
+            return $this->pathResolver->resolvePaths($paths, $context->getRootCategoryId());
+        }
+
+        $resolved = $this->pathResolver->lookupPaths($paths, $context->getRootCategoryId());
+
+        $results = [];
+        foreach (array_keys($paths) as $key) {
+            $results[$key] = isset($resolved[$key])
+                ? ['id' => $resolved[$key], 'message' => null]
+                : [
+                    'id' => null,
+                    'message' => sprintf(
+                        'Category "%s" stopped resolving after this batch decided it had nothing to create;'
+                        . ' it was not created here. Re-send to have it created.',
+                        $key
+                    ),
+                ];
+        }
+
+        return $results;
     }
 
     public function isEnabled(): bool

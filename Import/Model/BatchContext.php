@@ -80,6 +80,11 @@ class BatchContext
     private array $data = [];
 
     /**
+     * @var array<string, true> lock names this batch holds, as a set
+     */
+    private array $heldLocks = [];
+
+    /**
      * @param ProductInterface[] $products
      * @param int $storeId target store scope for store-scoped values (0 = global)
      * @param int|null $rootCategoryId root every category path is pinned to,
@@ -98,6 +103,34 @@ class BatchContext
     public function getStoreId(): int
     {
         return $this->storeId;
+    }
+
+    /**
+     * Record what the orchestrator managed to take for this batch, before the
+     * transaction opens.
+     *
+     * @param string[] $locks
+     */
+    public function setHeldLocks(array $locks): void
+    {
+        $this->heldLocks = array_fill_keys($locks, true);
+    }
+
+    /**
+     * Whether this batch may perform the unkeyed create that $lock guards.
+     *
+     * A step asks at WRITE time, not at declare time, because the two are
+     * separated by a probe that can go stale: the lock set was decided from a
+     * read taken before the lock, and a row deleted in between turns a resolve
+     * into a create nobody reserved for. Answering false is the signal to
+     * report the product and skip the create — never to create anyway, which is
+     * precisely the duplicate the lock exists to prevent.
+     *
+     * @see \ReadyData\Import\Model\Processor\LockAwareInterface
+     */
+    public function holdsLock(string $lock): bool
+    {
+        return isset($this->heldLocks[$lock]);
     }
 
     /**
