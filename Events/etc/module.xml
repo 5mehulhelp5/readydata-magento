@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<!--
+    ReadyData_Events sequences after every module whose events it captures.
+
+    Sequence is load order, and load order is observer order within one event.
+    Phase 0 measured what that costs when it goes wrong: core's
+    ImageResizeAfterProductSave threw on catalog_product_save_commit_after, which
+    aborted the rest of the chain, and the capture registered behind it never
+    ran while the import reported success. Being late in the chain means another
+    module's exception silently costs us events, so we sequence after the
+    modules we hook — which places us at the end of their observer lists — and
+    never assume the chain completes. Reconciliation, not ordering, is the
+    real guarantee (see the plan's §4.7).
+-->
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:framework:Module/etc/module.xsd">
+    <module name="ReadyData_Events">
+        <sequence>
+            <module name="ReadyData_Import"/>
+            <module name="Magento_Catalog"/>
+            <module name="Magento_CatalogInventory"/>
+            <module name="Magento_Customer"/>
+            <module name="Magento_Sales"/>
+            <module name="Magento_Cms"/>
+        </sequence>
+    </module>
+</config>

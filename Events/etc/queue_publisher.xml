@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<!--
+    The `db` connection, not AMQP: it is always available, needs no broker, and
+    keeps the priority path installable on a store that has never run RabbitMQ.
+    A store that does have AMQP can override this in its own queue_publisher.xml.
+-->
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:framework-message-queue:etc/publisher.xsd">
+    <publisher topic="readydata.events.publish">
+        <connection name="db" exchange="magento-db"/>
+    </publisher>
+</config>

@@ -1,9 +1,12 @@
 {
-    "name": "readydata/module-import",
-    "description": "ReadyData bulk product import for Magento 2 via direct database writes",
+    "name": "readydata/magento-modules",
+    "description": "ReadyData modules for Magento 2 compatibility",
     "type": "magento2-module",
     "license": "proprietary",
     "version": "0.1.0",
+    "replace": {
+        "readydata/module-import": "self.version"
+    },
     "require": {
         "php": "~8.1.0||~8.2.0||~8.3.0",
         "guzzlehttp/guzzle": "^7.5",
@@ -20,10 +23,12 @@
     },
     "autoload": {
         "files": [
-            "registration.php"
+            "Import/registration.php",
+            "Events/registration.php"
         ],
         "psr-4": {
-            "ReadyData\\Import\\": ""
+            "ReadyData\\Import\\": "Import/",
+            "ReadyData\\Events\\": "Events/"
         }
     }
 }

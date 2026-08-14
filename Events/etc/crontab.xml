@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<!--
+    Own cron group, so a slow or failing event delivery cannot delay Magento's
+    default group — and so an operator can stop eventing alone without stopping
+    indexing, emails and everything else that shares `default`.
+-->
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:module:Magento_Cron:etc/crontab.xsd">
+    <group id="readydata_events">
+        <job name="readydata_events_dispatch" instance="ReadyData\Events\Cron\DispatchQueue" method="execute">
+            <schedule>* * * * *</schedule>
+        </job>
+        <job name="readydata_events_clean" instance="ReadyData\Events\Cron\CleanQueue" method="execute">
+            <schedule>0 3 * * *</schedule>
+        </job>
+    </group>
+</config>

@@ -1,0 +1,45 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:module:Magento_Store:etc/config.xsd">
+    <default>
+        <readydata_events>
+            <general>
+                <!-- Off by default: an instance nobody has subscribed to must pay nothing. -->
+                <enabled>0</enabled>
+                <instance_id/>
+            </general>
+            <capture>
+                <!--
+                    Events buffered before a multi-row INSERT. Phase 0 measured a
+                    500-SKU import emitting 1000 events in one request, so
+                    buffering to request end is not an option: at the importer's
+                    default batch size a 200k-product import would hold ~400k rows.
+                -->
+                <buffer_size>500</buffer_size>
+                <!-- Above this many waiting rows, capture stops and raises an alarm
+                     rather than filling the client's disk. -->
+                <max_queue_depth>100000</max_queue_depth>
+            </capture>
+            <delivery>
+                <batch_size>100</batch_size>
+                <max_retries>7</max_retries>
+                <timeout>15</timeout>
+                <backoff_seconds>60</backoff_seconds>
+            </delivery>
+            <retention>
+                <days>3</days>
+            </retention>
+            <logging>
+                <enabled>1</enabled>
+            </logging>
+            <queue_grid>
+                <!--
+                    On by default: when events are not arriving, the person
+                    looking is often a Magento developer with no ReadyData
+                    login, and this grid is where the answer is.
+                -->
+                <enabled>1</enabled>
+            </queue_grid>
+        </readydata_events>
+    </default>
+</config>

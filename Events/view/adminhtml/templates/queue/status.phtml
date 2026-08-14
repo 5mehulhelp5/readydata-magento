@@ -1,0 +1,94 @@
+<?php
+/**
+ * @var \ReadyData\Events\Block\Adminhtml\QueueStatus $block
+ * @var \Magento\Framework\Escaper $escaper
+ */
+$counts = $block->getStatusCounts();
+$rows = $block->getRows();
+$oldest = $block->getOldestWaitingAt();
+$subscriber = $block->getSubscriberDescription();
+?>
+<div class="readydata-events-status">
+    <?php if (!$block->isEnabled()): ?>
+        <div class="message message-warning">
+            Eventing is <strong>disabled</strong> in configuration, so nothing is captured or delivered.
+            Enable it under Stores → Configuration → ReadyData → Eventing.
+        </div>
+    <?php endif; ?>
+
+    <?php if ($subscriber === null): ?>
+        <div class="message message-warning">
+            No subscriber is registered, so there is nowhere to deliver to. ReadyData registers one
+            automatically from its connector page.
+        </div>
+    <?php else: ?>
+        <div class="message message-notice">
+            Delivering to <strong><?= $escaper->escapeHtml($subscriber) ?></strong>.
+            <?= (int) $block->getCatalogueSize() ?> event codes are subscribable on this store.
+        </div>
+    <?php endif; ?>
+
+    <?php if ($oldest !== null): ?>
+        <div class="message message-notice">
+            Oldest undelivered event: <strong><?= $escaper->escapeHtml($oldest) ?></strong> (UTC).
+            A deep queue whose oldest entry is minutes old is a busy store; one whose oldest entry is
+            days old is a stopped cron.
+        </div>
+    <?php endif; ?>
+
+    <div class="admin__data-grid-header">
+        <p>
+            <?php foreach ([0, 1, 2, 3, 4] as $status): ?>
+                <a href="<?= $escaper->escapeUrl($block->getFilterUrl($status)) ?>">
+                    <?= $escaper->escapeHtml($block->getStatusLabel($status)) ?>:
+                    <strong><?= (int) ($counts[$status] ?? 0) ?></strong>
+                </a>&nbsp;&nbsp;
+            <?php endforeach; ?>
+            <a href="<?= $escaper->escapeUrl($block->getFilterUrl(null)) ?>">Show all</a>
+        </p>
+
+        <form method="post" action="<?= $escaper->escapeUrl($block->getRetryUrl()) ?>" style="display:inline">
+            <?= $block->getBlockHtml('formkey') ?>
+            <input type="hidden" name="scope" value="failed"/>
+            <button type="submit" class="action-secondary">Retry all failed and dead-lettered</button>
+        </form>
+    </div>
+
+    <table class="admin__table-primary">
+        <thead>
+            <tr>
+                <th>ID</th><th>Event</th><th>Status</th><th>Tries</th>
+                <th>Payload</th><th>Last response</th><th>Captured</th><th></th>
+            </tr>
+        </thead>
+        <tbody>
+        <?php if (!$rows): ?>
+            <tr><td colspan="8">No events captured yet.</td></tr>
+        <?php endif; ?>
+        <?php foreach ($rows as $row): ?>
+            <tr>
+                <td><?= (int) $row['queue_id'] ?></td>
+                <td><code><?= $escaper->escapeHtml($row['event_code']) ?></code></td>
+                <td>
+                    <span class="<?= $escaper->escapeHtmlAttr($block->getStatusClass((int) $row['status'])) ?>">
+                        <?= $escaper->escapeHtml($block->getStatusLabel((int) $row['status'])) ?>
+                    </span>
+                </td>
+                <td><?= (int) $row['retries'] ?></td>
+                <td><code><?= $escaper->escapeHtml($block->shortenPayload((string) $row['payload'])) ?></code></td>
+                <td><?= $escaper->escapeHtml($block->shortenPayload((string) ($row['info'] ?? ''), 160)) ?></td>
+                <td><?= $escaper->escapeHtml($row['created_at']) ?></td>
+                <td>
+                    <?php if (in_array((int) $row['status'], [2, 4], true)): ?>
+                        <form method="post" action="<?= $escaper->escapeUrl($block->getRetryUrl()) ?>">
+                            <?= $block->getBlockHtml('formkey') ?>
+                            <input type="hidden" name="queue_ids[]" value="<?= (int) $row['queue_id'] ?>"/>
+                            <button type="submit" class="action-secondary">Retry</button>
+                        </form>
+                    <?php endif; ?>
+                </td>
+            </tr>
+        <?php endforeach; ?>
+        </tbody>
+    </table>
+</div>
