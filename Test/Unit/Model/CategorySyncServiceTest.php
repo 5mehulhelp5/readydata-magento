@@ -123,10 +123,35 @@ class CategorySyncServiceTest extends TestCase
         $storeWebsiteMap->method('describeScope')->willReturnCallback(
             static fn (ScopedValuesInterface $block): string => $scopeFormatter->describeScope($block)
         );
+        // Mirrors StoreWebsiteMap: the ID when it resolves, otherwise the code —
+        // see StoreWebsiteMapTest for the rules themselves.
+        $ids = [0, 1, 2, 3];
+        $byCode = ['admin' => 0, 'de_de' => 1];
         $storeWebsiteMap->method('findScopeStoreId')->willReturnCallback(
-            fn (?int $storeId, ?string $code): ?int => match (true) {
-                $storeId !== null => in_array($storeId, [0, 1, 2, 3], true) ? $storeId : null,
-                default => ['de_de' => 1][$code] ?? null,
+            static fn (?int $storeId, ?string $code): ?int => match (true) {
+                $storeId !== null && in_array($storeId, $ids, true) => $storeId,
+                (string)$code !== '' => $byCode[$code] ?? null,
+                default => null,
+            }
+        );
+        $storeWebsiteMap->method('scopeMismatch')->willReturnCallback(
+            static function (?int $storeId, ?string $code) use ($ids, $byCode): ?string {
+                if ($storeId === null || (string)$code === '') {
+                    return null;
+                }
+                $codeStoreId = $byCode[$code] ?? null;
+                if (in_array($storeId, $ids, true)) {
+                    return $codeStoreId === null || $codeStoreId === $storeId
+                        ? null
+                        : sprintf('Names ID %d and "%s" (ID %d); the ID was used.', $storeId, $code, $codeStoreId);
+                }
+
+                return $codeStoreId === null ? null : sprintf(
+                    'No store view with ID %d; "%s" (ID %d) was used instead.',
+                    $storeId,
+                    $code,
+                    $codeStoreId
+                );
             }
         );
 
@@ -1532,6 +1557,68 @@ class CategorySyncServiceTest extends TestCase
         self::assertSame(CategoryStoreResultInterface::STATUS_UPDATED, $storeResults[0]->getStatus());
         self::assertSame(ScopeResultInterface::REASON_INVALID_DEFINITION, $storeResults[1]->getReason());
         self::assertStringContainsString('merge them', $storeResults[1]->getMessages()[0]);
+    }
+
+    /**
+     * A block naming both an ID and a code has told us the scope twice.
+     * Believing one of them silently writes a translation into a storefront the
+     * payload also named and nothing ever looked at.
+     */
+    public function testABlockWhoseIdAndCodeDisagreeSaysSoOnItsOwnRow(): void
+    {
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([self::ROOT_ID => ['Men' => [self::MEN_ID]]]);
+        $this->writer->method('update')->willReturn(true);
+
+        $definition = $this->definition('Default Category/Men')->setStoreValues([
+            (new CategoryStoreValues())->setStoreId(2)->setStoreViewCode('de_de')->setName('Herren'),
+        ]);
+        $response = $this->service->sync([$definition]);
+
+        $storeResults = $response->getResults()[0]->getStoreResults();
+        // Written where the ID said, which is the documented precedence.
+        self::assertSame(2, $storeResults[0]->getStoreId());
+        self::assertSame(CategoryStoreResultInterface::STATUS_UPDATED, $storeResults[0]->getStatus());
+        self::assertStringContainsString('"de_de" (ID 1)', $storeResults[0]->getMessages()[0]);
+    }
+
+    /**
+     * The block used to be discarded whole because the ID half was stale, even
+     * though the code beside it named a live store view. IDs are local to an
+     * instance and go stale across a rebuild; codes travel.
+     */
+    public function testAStaleIdFallsBackToTheCodeInsteadOfLosingTheBlock(): void
+    {
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([self::ROOT_ID => ['Men' => [self::MEN_ID]]]);
+        $this->writer->method('update')->willReturn(true);
+
+        $definition = $this->definition('Default Category/Men')->setStoreValues([
+            (new CategoryStoreValues())->setStoreId(99)->setStoreViewCode('de_de')->setName('Herren'),
+        ]);
+        $response = $this->service->sync([$definition]);
+
+        $storeResults = $response->getResults()[0]->getStoreResults();
+        self::assertSame(1, $storeResults[0]->getStoreId());
+        self::assertSame(CategoryStoreResultInterface::STATUS_UPDATED, $storeResults[0]->getStatus());
+        self::assertStringContainsString('No store view with ID 99', $storeResults[0]->getMessages()[0]);
+    }
+
+    /** Neither half resolves: skipped, and the message names both forms. */
+    public function testAnUnresolvableBlockNamesBothFormsItWasGiven(): void
+    {
+        $this->categoryResource->method('getChildIdsByParentIds')
+            ->willReturn([self::ROOT_ID => ['Men' => [self::MEN_ID]]]);
+        $this->writer->method('update')->willReturn(true);
+
+        $definition = $this->definition('Default Category/Men')->setStoreValues([
+            (new CategoryStoreValues())->setStoreId(99)->setStoreViewCode('nope')->setName('Herren'),
+        ]);
+        $response = $this->service->sync([$definition]);
+
+        $storeResults = $response->getResults()[0]->getStoreResults();
+        self::assertSame(ScopeResultInterface::REASON_UNKNOWN_STORE, $storeResults[0]->getReason());
+        self::assertStringContainsString('ID 99, also named as "nope"', $storeResults[0]->getMessages()[0]);
     }
 
     public function testABlockPointedAtAStoreShowingAnotherTreeIsRefused(): void

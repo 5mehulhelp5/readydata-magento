@@ -108,6 +108,70 @@ class StoreWebsiteMapTest extends TestCase
     }
 
     /**
+     * IDs are local to an instance and go stale across a rebuild or a re-created
+     * store view; codes travel. A block carrying both has already given the
+     * answer, and discarding it because the ID half aged out threw that away.
+     */
+    public function testAStaleIdFallsBackToTheCodeSentBesideIt(): void
+    {
+        self::assertSame(5, $this->map->findScopeStoreId(99, 'fr_fr'));
+        // Neither half resolves: still nothing to write.
+        self::assertNull($this->map->findScopeStoreId(99, 'nope'));
+    }
+
+    /** The ID still wins whenever it resolves — the code is a fallback, not a vote. */
+    public function testTheIdWinsWhenItResolves(): void
+    {
+        self::assertSame(3, $this->map->findScopeStoreId(3, 'fr_fr'));
+    }
+
+    /**
+     * Resolution has one answer; whether the payload gave it twice, differently,
+     * is a separate question — asked separately so the answer can be reported
+     * instead of assumed.
+     */
+    public function testScopeMismatchIsSilentWhenThereIsNothingToDisagreeAbout(): void
+    {
+        self::assertNull($this->map->scopeMismatch(3, null));
+        self::assertNull($this->map->scopeMismatch(null, 'fr_fr'));
+        self::assertNull($this->map->scopeMismatch(null, null));
+        self::assertNull($this->map->scopeMismatch(3, ''));
+        // Both sent, both naming the same scope.
+        self::assertNull($this->map->scopeMismatch(5, 'fr_fr'));
+        // Neither resolves — the block is skipped, and describeScope names both.
+        self::assertNull($this->map->scopeMismatch(99, 'nope'));
+    }
+
+    public function testScopeMismatchNamesBothScopesAndWhichOneWasUsed(): void
+    {
+        $message = $this->map->scopeMismatch(3, 'fr_fr');
+
+        self::assertNotNull($message);
+        self::assertStringContainsString('ID 3', $message);
+        self::assertStringContainsString('"fr_fr" (ID 5)', $message);
+        self::assertStringContainsString('the ID was used', $message);
+    }
+
+    public function testScopeMismatchSaysWhenTheCodeWasUsedBecauseTheIdWasStale(): void
+    {
+        $message = $this->map->scopeMismatch(99, 'fr_fr');
+
+        self::assertNotNull($message);
+        self::assertStringContainsString('no store view with ID 99', $message);
+        self::assertStringContainsString('"fr_fr" (ID 5)', $message);
+        self::assertStringContainsString('older snapshot', $message);
+    }
+
+    public function testScopeMismatchReportsAnUnknownCodeAlongsideAUsableId(): void
+    {
+        $message = $this->map->scopeMismatch(3, 'nope');
+
+        self::assertNotNull($message);
+        self::assertStringContainsString('no such code', $message);
+        self::assertStringContainsString('ID 3', $message);
+    }
+
+    /**
      * 0 is not a store view, but it is a scope values can be written in, which
      * is what the callers are asking about.
      */
@@ -133,9 +197,11 @@ class StoreWebsiteMapTest extends TestCase
             'store view "nope"',
             $this->map->describeScope((new CategoryStoreValues())->setStoreViewCode('nope'))
         );
-        // ID wins over code, exactly as resolution does.
+        // Both, when the payload sent both. Reaching this message means NEITHER
+        // form resolved, and naming only the ID left the code out of the one
+        // message anybody was going to read about it.
         self::assertSame(
-            'store view ID 3',
+            'store view ID 3, also named as "fr_fr"',
             $this->map->describeScope((new ProductStoreValues())->setStoreId(3)->setStoreViewCode('fr_fr'))
         );
         self::assertSame(

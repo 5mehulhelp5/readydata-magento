@@ -10,6 +10,7 @@ use Magento\Framework\App\ResourceConnection;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
 use ReadyData\Import\Api\Data\ScopedValuesInterface;
+use ReadyData\Import\Api\Data\ScopeResultInterface;
 use ReadyData\Import\Api\Data\StoreResultInterface;
 use ReadyData\Import\Model\BatchContext;
 use ReadyData\Import\Model\Cache\AttributeMetadataCache;
@@ -125,10 +126,42 @@ class EavValueProcessorTest extends TestCase
         // The store views this fixture Magento has. Anything else resolves to
         // null, which is how a payload naming a store view that does not exist
         // reaches the processor.
+        $ids = [0, 2, 3, 4, 5];
+        $byCode = ['admin' => 0, 'de_de' => 3, 'fr_fr' => 5];
+        // Mirrors StoreWebsiteMap: the ID when it resolves, otherwise the code —
+        // see StoreWebsiteMapTest for the rules themselves.
         $this->storeWebsiteMap->method('findScopeStoreId')->willReturnCallback(
             static fn (?int $storeId, ?string $code): ?int => match (true) {
-                $storeId !== null => in_array($storeId, [0, 2, 3, 4, 5], true) ? $storeId : null,
-                default => ['de_de' => 3, 'fr_fr' => 5][$code] ?? null,
+                $storeId !== null && in_array($storeId, $ids, true) => $storeId,
+                (string)$code !== '' => $byCode[$code] ?? null,
+                default => null,
+            }
+        );
+        $this->storeWebsiteMap->method('scopeMismatch')->willReturnCallback(
+            static function (?int $storeId, ?string $code) use ($ids, $byCode): ?string {
+                if ($storeId === null || (string)$code === '') {
+                    return null;
+                }
+                $codeStoreId = $byCode[$code] ?? null;
+                if (in_array($storeId, $ids, true)) {
+                    return match (true) {
+                        $codeStoreId === null => sprintf('ID %d used; no such code "%s".', $storeId, $code),
+                        $codeStoreId !== $storeId => sprintf(
+                            'Names ID %d and "%s" (ID %d); the ID was used.',
+                            $storeId,
+                            $code,
+                            $codeStoreId
+                        ),
+                        default => null,
+                    };
+                }
+
+                return $codeStoreId === null ? null : sprintf(
+                    'No store view with ID %d; "%s" (ID %d) was used instead, from an older snapshot.',
+                    $storeId,
+                    $code,
+                    $codeStoreId
+                );
             }
         );
 
@@ -426,11 +459,142 @@ class EavValueProcessorTest extends TestCase
             ]]],
             $this->upserts
         );
+        // On the block's own result row, not among the product's messages: the
+        // payload named a scope, so it gets a row to be matched against, and the
+        // row has no store ID to be tagged by.
+        $scopes = $context->getScopeResults('SKU-1');
+        self::assertCount(1, $scopes);
+        self::assertNull($scopes[0]['store_id']);
+        self::assertSame(ScopeResultInterface::REASON_UNKNOWN_STORE, $scopes[0]['reason']);
         self::assertSame(
             ['Store values for store view ID 99 were skipped: no such store view.'],
-            $context->getMessages('SKU-1')
+            $scopes[0]['messages']
         );
         self::assertFalse($context->isFailed('SKU-1'));
+    }
+
+    /**
+     * The default scope is what the product itself writes. A block reaching it
+     * would overwrite the value every store view inherits, from inside a block
+     * that named one scope — and it only ever coincided with the product's own
+     * pass when the REQUEST was at default scope too, so in every other case it
+     * wrote a second, separate default-scope pass. Refused, as the category
+     * endpoint refuses it.
+     */
+    public function testABlockNamingTheDefaultScopeIsRefused(): void
+    {
+        $context = $this->createContext(
+            ['brand' => 'Acme'],
+            storeValues: [$this->block(0, ['store_note' => 'overwrite'])],
+            storeId: 3
+        );
+
+        $this->processor->process($context);
+
+        $scopes = $context->getScopeResults('SKU-1');
+        self::assertCount(1, $scopes);
+        self::assertNull($scopes[0]['store_id']);
+        self::assertSame(ScopeResultInterface::REASON_INVALID_DEFINITION, $scopes[0]['reason']);
+        self::assertStringContainsString('cannot name the default scope', $scopes[0]['messages'][0]);
+        self::assertFalse($context->isFailed('SKU-1'));
+    }
+
+    /**
+     * The refusal must not depend on the request's own scope: it used to merge
+     * into the base pass when the two coincided and write a separate
+     * default-scope pass when they did not, so the same block meant two
+     * different things depending on a setting elsewhere in the payload.
+     */
+    public function testABlockNamingTheDefaultScopeIsRefusedAtDefaultScopeToo(): void
+    {
+        $context = $this->createContext(
+            ['brand' => 'Acme'],
+            storeValues: [$this->block(0, ['store_note' => 'overwrite'])],
+            storeId: 0
+        );
+
+        $this->processor->process($context);
+
+        // Only the product's own value; nothing the block carried.
+        self::assertSame(
+            [['varchar', [
+                ['entity_id' => 10, 'attribute_id' => 81, 'store_id' => 0, 'value' => 'Acme'],
+            ]]],
+            $this->upserts
+        );
+        self::assertSame(
+            ScopeResultInterface::REASON_INVALID_DEFINITION,
+            $context->getScopeResults('SKU-1')[0]['reason']
+        );
+    }
+
+    /** `admin` is the default scope by another name, and takes the same refusal. */
+    public function testABlockNamingAdminIsRefusedLikeStoreZero(): void
+    {
+        $block = new ProductStoreValues();
+        $block->setStoreViewCode('admin');
+        $block->setName('overwrite');
+
+        $context = $this->createContext([], storeValues: [$block], storeId: 3);
+
+        $this->processor->process($context);
+
+        self::assertSame(
+            ScopeResultInterface::REASON_INVALID_DEFINITION,
+            $context->getScopeResults('SKU-1')[0]['reason']
+        );
+    }
+
+    /**
+     * A block naming both forms has told us the scope twice. Believing one of
+     * them silently writes a translation into a storefront the payload also
+     * named and nothing ever looked at.
+     */
+    public function testABlockWhoseIdAndCodeDisagreeSaysSo(): void
+    {
+        $block = new ProductStoreValues();
+        $block->setStoreId(3);
+        $block->setStoreViewCode('fr_fr');
+        $block->setCustomAttributes($this->customAttributes(['store_note' => 'Hallo']));
+
+        $context = $this->createContext([], storeValues: [$block]);
+
+        $this->processor->process($context);
+
+        // Written where the ID said, which is the documented precedence.
+        self::assertSame(
+            [['varchar', [
+                ['entity_id' => 10, 'attribute_id' => 80, 'store_id' => 3, 'value' => 'Hallo'],
+            ]]],
+            $this->upserts
+        );
+        $messages = $context->getScopeMessages('SKU-1', 3);
+        self::assertCount(1, $messages);
+        self::assertStringContainsString('"fr_fr" (ID 5)', $messages[0]);
+    }
+
+    /**
+     * The block used to be discarded whole because the ID half was stale, even
+     * though the code beside it named a live store view.
+     */
+    public function testAStaleIdFallsBackToTheCodeInsteadOfLosingTheBlock(): void
+    {
+        $block = new ProductStoreValues();
+        $block->setStoreId(99);
+        $block->setStoreViewCode('fr_fr');
+        $block->setCustomAttributes($this->customAttributes(['store_note' => 'Bonjour']));
+
+        $context = $this->createContext([], storeValues: [$block]);
+
+        $this->processor->process($context);
+
+        self::assertSame(
+            [['varchar', [
+                ['entity_id' => 10, 'attribute_id' => 80, 'store_id' => 5, 'value' => 'Bonjour'],
+            ]]],
+            $this->upserts
+        );
+        self::assertStringContainsString('older snapshot', $context->getScopeMessages('SKU-1', 5)[0]);
     }
 
     public function testGlobalAttributeInAScopedBlockIsRefusedInsteadOfWrittenAtDefaultScope(): void

@@ -132,6 +132,38 @@ class EavValueProcessor implements ProcessorInterface
                 );
                 continue;
             }
+            if ($storeId === 0) {
+                // Refused, as the category endpoint refuses it, and for the same
+                // reason: the default scope is what the product itself writes,
+                // and a block reaching it would overwrite the value every store
+                // view inherits from inside a block that named one scope. This
+                // list is exactly the scopes that are NOT the default one, so the
+                // row carries no store ID — 0 would name the very scope it is
+                // reporting the refusal of.
+                //
+                // It does not merge into the base pass either: the base pass sits
+                // at the REQUEST's scope, so a store-0 block only coincides with
+                // it when the request is itself at default scope. Merging in that
+                // one case and writing a separate default-scope pass in every
+                // other is the asymmetry this refusal removes.
+                $context->registerUnresolvedScope(
+                    $sku,
+                    ScopeResultInterface::REASON_INVALID_DEFINITION,
+                    'A store_values block cannot name the default scope; the product itself writes it.'
+                );
+                continue;
+            }
+
+            // Both halves named a scope and they disagree — reported against the
+            // scope that was actually used, so it travels with the values it
+            // explains rather than as a loose product-level warning.
+            $mismatch = $this->storeWebsiteMap->scopeMismatch(
+                $block->getStoreId(),
+                $block->getStoreViewCode()
+            );
+            if ($mismatch !== null) {
+                $context->addMessage($sku, $mismatch, $storeId);
+            }
 
             // No url_key generation, unlike the base pass: a generated key is
             // the product's identity on the storefront, not a per-store

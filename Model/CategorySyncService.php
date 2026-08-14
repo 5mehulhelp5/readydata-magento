@@ -712,6 +712,15 @@ class CategorySyncService
             // store-scoped name is invisible to it — see applyUpdate() and
             // CategoryWriter::findSiblingConflict().
             $messages = [];
+            // Ahead of the write so it reads first: it explains which of the two
+            // scopes the block named the values below were actually written in.
+            $mismatch = $this->storeWebsiteMap->scopeMismatch(
+                $block->getStoreId(),
+                $block->getStoreViewCode()
+            );
+            if ($mismatch !== null) {
+                $messages[] = $mismatch;
+            }
             $changed = $this->writer->update($entityId, $block->getName(), $block, null, $storeId, $messages);
 
             $storeResults[] = $this->storeResultFactory->create()

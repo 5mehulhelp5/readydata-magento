@@ -96,8 +96,13 @@ unknown code does.
 more, so a single request can carry the product's default-scope identity and
 every localized value set it has, instead of one request per store view.
 
-Each block addresses its store view by `store_id` or `store_view_code` (the ID
-wins) and carries what the product itself carries at the default scope: the
+Each block addresses its store view by `store_id` or `store_view_code` — the ID
+wins when it resolves, and the code is a **fallback** when it does not, since
+IDs are local to an instance and go stale across a rebuild while codes travel.
+A block carrying both that disagree is written where the ID says and says so on
+its result row; when neither resolves, the block is skipped and the message
+names both forms. A block carries what the product itself carries at the
+default scope: the
 value-bearing fields `name`, `price`, `status`, `visibility`, `weight`,
 `url_key`, plus `custom_attributes` and `clear_attributes`. Everything with no
 store dimension
@@ -115,10 +120,17 @@ Guards, each a per-product message (prefixed `[store N]`) and never fatal:
   dimension, the value would land at store 0 and overwrite the product's own
   default-scope value from inside a block that named one store view. Send them
   on the product.
+- **The default scope is refused in a block** (`store_id: 0` or
+  `store_view_code: "admin"`), reported as `invalid_definition` with a null
+  `store_id`, exactly as the category endpoint refuses it. The default scope is
+  what the product itself writes; a block reaching it would overwrite the value
+  every store view inherits. It is refused whatever `settings` names, so the
+  same block never means two different things depending on the request's scope.
 - **An unknown store view skips that block only** — one bad scope does not cost
   the product its other scopes, or its default-scope write.
-- **A block naming the request's own scope merges into it**, the block winning
-  per attribute; two blocks naming the same store view merge the same way, so
+- **A block naming the request's own scope merges into it** — when that scope is
+  a store view; naming the default scope is refused as above. The block wins per
+  attribute, and two blocks naming the same store view merge the same way, so
   the last one wins. Merging rather than writing twice keeps the result
   independent of statement ordering.
 
@@ -527,7 +539,9 @@ product does not abort the request.
         {"store_id": 5, "status": "skipped", "reason": null,
          "messages": ["Attribute \"special_price\" is global and has no store dimension; …"]},
         {"store_id": null, "status": "skipped", "reason": "unknown_store",
-         "messages": ["Store values for store view ID 99 were skipped: no such store view."]}
+         "messages": ["Store values for store view ID 99, also named as \"nope\", were skipped: …"]},
+        {"store_id": null, "status": "skipped", "reason": "invalid_definition",
+         "messages": ["A store_values block cannot name the default scope; …"]}
       ]
     }
   ]

@@ -72,11 +72,22 @@ class StoreWebsiteMap
      * for scopes that arrive per payload item: one unresolvable store view
      * there is that item's problem to report, not the whole request's to fail
      * on.
+     *
+     * ID first, for the reason {@see resolveScopeStoreId()} gives — but the code
+     * is a FALLBACK rather than ignored outright. A block carrying both names one
+     * scope twice, and when the ID no longer resolves the code is the half that
+     * survives: IDs are local to an instance and go stale across a rebuild or a
+     * re-created store view, codes travel. Discarding a block whose code named a
+     * live store view, because the ID beside it was old, threw away the answer
+     * the payload had already given.
+     *
+     * Whether the two halves agreed is a separate question, asked separately —
+     * see {@see scopeMismatch()}. This method only resolves.
      */
     public function findScopeStoreId(?int $storeId, ?string $storeViewCode): ?int
     {
-        if ($storeId !== null) {
-            return $this->hasStoreId($storeId) ? $storeId : null;
+        if ($storeId !== null && $this->hasStoreId($storeId)) {
+            return $storeId;
         }
         // A block that names no scope at all resolves to nothing, where an
         // omitted request-level scope means the default one — hence the guard
@@ -93,17 +104,87 @@ class StoreWebsiteMap
     }
 
     /**
+     * How a block's two ways of naming a scope disagree, or null when they agree
+     * — or when only one of them was sent, which cannot disagree with anything.
+     *
+     * Kept apart from {@see findScopeStoreId()} so that resolution stays a
+     * question with one answer, and reported rather than assumed: a block naming
+     * both an ID and a code has told us something twice, and when the two tellings
+     * differ, silently believing one of them writes a translation into a
+     * storefront the payload also named and we never looked at.
+     */
+    public function scopeMismatch(?int $storeId, ?string $storeViewCode): ?string
+    {
+        $code = (string)$storeViewCode;
+        if ($storeId === null || $code === '') {
+            return null;
+        }
+
+        try {
+            $codeStoreId = $this->resolveStoreId($code);
+        } catch (LocalizedException) {
+            $codeStoreId = null;
+        }
+
+        if ($this->hasStoreId($storeId)) {
+            if ($codeStoreId === null) {
+                return sprintf(
+                    'This block names store view ID %d and store view "%s"; there is no such code, so the ID was'
+                    . ' used. Send one of the two.',
+                    $storeId,
+                    $code
+                );
+            }
+            if ($codeStoreId !== $storeId) {
+                return sprintf(
+                    'This block names store view ID %d and store view "%s" (ID %d), which are different scopes;'
+                    . ' the ID was used. Send one of the two.',
+                    $storeId,
+                    $code,
+                    $codeStoreId
+                );
+            }
+
+            return null;
+        }
+
+        if ($codeStoreId !== null) {
+            return sprintf(
+                'There is no store view with ID %d; store view "%s" (ID %d), named on the same block, was used'
+                . ' instead. The ID is probably from an older snapshot of this instance.',
+                $storeId,
+                $code,
+                $codeStoreId
+            );
+        }
+
+        // Neither half resolves: the block is skipped, and describeScope() names
+        // both forms so the caller can see it sent two unusable ones.
+        return null;
+    }
+
+    /**
      * How a `store_values` block is named back to the caller when its scope
      * cannot be resolved — one wording for both endpoints, since the block shape
      * is the same ({@see ScopedValuesInterface}).
+     *
+     * Both forms when the block carried both: reaching here means neither
+     * resolved, and naming only the ID left the code out of the one message that
+     * was going to be read about it.
      */
     public function describeScope(ScopedValuesInterface $block): string
     {
-        if ($block->getStoreId() !== null) {
-            return sprintf('store view ID %d', $block->getStoreId());
+        $storeId = $block->getStoreId();
+        $code = (string)$block->getStoreViewCode();
+
+        if ($storeId !== null && $code !== '') {
+            return sprintf('store view ID %d, also named as "%s"', $storeId, $code);
         }
-        if ((string)$block->getStoreViewCode() !== '') {
-            return sprintf('store view "%s"', $block->getStoreViewCode());
+        if ($storeId !== null) {
+            return sprintf('store view ID %d', $storeId);
+        }
+        if ($code !== '') {
+            return sprintf('store view "%s"', $code);
         }
 
         return 'a block naming no store view';
