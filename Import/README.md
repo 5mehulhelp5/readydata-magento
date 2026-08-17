@@ -718,7 +718,9 @@ scoping both widen the window in which that can happen.
 A separate endpoint provisions the product attribute *definitions* a feed
 references. It is **standalone** — no product import is required before or
 after — and is normally called as a pre-flight step so the attributes exist
-before their values are imported. Off by default (see Configuration).
+before their values are imported. On by default; the ACL resource
+`ReadyData_Import::attributes` and a kill switch both gate it (see
+Configuration).
 
 ```
 POST /rest/all/V1/readydata/attributes
@@ -1466,9 +1468,11 @@ size, continue-on-error, option auto-creation, URL conflict strategy, media
 downloads, reindex mode, cache cleaning, event dispatch, logging.
 
 The **Attribute Definitions** group has a single switch, **Enable Attribute
-Definition Sync** (`readydata_import/attributes/auto_create`, default **off**),
-the kill switch for the `POST /V1/readydata/attributes` endpoint. When off, the
-endpoint is a no-op that reports every attribute as `skipped`/`disabled`. There
+Definition Sync** (`readydata_import/attributes/auto_create`, default **on**),
+the kill switch for the `POST /V1/readydata/attributes` endpoint. Turn it off to
+make the endpoint a no-op that reports every attribute as `skipped`/`disabled` —
+worth doing on a store where the catalog structure is owned by someone other than
+the feed, since the endpoint can create and alter attribute definitions. There
 is intentionally no attribute-shape config here — scope, flags and placement are
 supplied per attribute by the caller (the system of record).
 
@@ -1516,24 +1520,27 @@ third-party observers still react to imports:
   **after** the batch transaction commits, so a throwing observer is logged
   and swallowed rather than rolling the import back.
 - **Also Dispatch catalog_product_save_after** (`dispatch_save_after`,
-  default off) — additionally fire `catalog_product_save_after` per product
-  **inside** the batch transaction, mirroring core's save timing. This is
-  heavier than the commit-after events and, because it runs pre-commit, a
-  **throwing observer rolls the whole batch back**. Only enable it when a
-  specific third-party observer must run on this in-transaction event.
+  default on) — additionally fire `catalog_product_save_after` per product
+  **inside** the batch transaction, mirroring core's save timing. On by default
+  so an observer written against core's save timing fires where it expects to.
+  Two consequences worth knowing: it is heavier than the commit-after events,
+  and because it runs pre-commit a **throwing observer rolls the whole batch
+  back**. Turn it off if you would rather no observer be able to fail an
+  import, or if nothing on the store needs the in-transaction event.
   Depends on "Dispatch Product Save Events" being on.
 - **Include Media Gallery In Dispatched Events** (`hydrate_media`, default
-  off) — before dispatching, read the batch's galleries and image roles in
+  on) — before dispatching, read the batch's galleries and image roles in
   **two bulk queries** and put them on each dispatched product, so
   `getMediaGallery('images')`, `getMediaGalleryImages()` and
   `getMediaGalleryEntries()` (including each entry's `types` and
   `video_content`) return what a loaded product returns. Applies to **every**
   product in the batch, including ones whose payload carried no `media` block,
   and is **independent of "Enable Media Gallery Import"** — the gallery in the
-  database is the product's gallery whether or not this import wrote it. Off by
-  default because it changes what existing observers see; turn it on when a
-  media-aware observer needs to run on imports. Depends on "Dispatch Product
-  Save Events" being on.
+  database is the product's gallery whether or not this import wrote it. On by
+  default so a media-aware observer sees the same product a normal save would
+  hand it. Turn it off to save the two queries per batch, or to keep the
+  gallery off the object entirely where an observer calls `$product->save()`
+  (see the caveat below). Depends on "Dispatch Product Save Events" being on.
 
 Whenever product-save events are dispatched, the module suppresses Magento's
 own URL-rewrite and inventory save observers for the duration of the import
@@ -1777,14 +1784,14 @@ base for a step that should be registered but inert until it is written.
   import: files written to the local media directory would be invisible to the
   storefront. Media is refused with a clear per-product message.
 - Third-party product-save observers see the gallery **only with *Include Media
-  Gallery In Dispatched Events* on** (default off) — otherwise the lightweight
+  Gallery In Dispatched Events* on** (default on) — with it off, the lightweight
   product object the event dispatcher builds carries the payload's scalars only.
-  With it on, the gallery and image roles are read from the database, so a
+  On, the gallery and image roles are read from the database, so a
   product whose payload omitted `media` still reports its full gallery, but
   `label`, `position` and per-entry `disabled` are the **default-scope** values
   (an admin-authored store override is not reflected). Everything else on the
   object is still payload-only, not a database read. See "Events".
-- With that setting on, an observer that calls `$product->save()` makes
+- With that setting on — which is the default — an observer that calls `$product->save()` makes
   Magento's gallery save handler run. It cannot create or delete gallery rows
   and cannot move files (every hydrated entry carries its `value_id` and none is
   flagged `removed`), and the module **locks** `media_gallery` on the object so

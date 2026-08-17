@@ -171,7 +171,7 @@
                 </field>
                 <field id="dispatch_save_after" translate="label comment" type="select" sortOrder="20" showInDefault="1">
                     <label>Also Dispatch catalog_product_save_after</label>
-                    <comment>Additionally fire catalog_product_save_after per product, inside the batch transaction. Slower and heavier than the commit-after events above, and a throwing observer rolls the whole batch back. Only enable if a third-party observer must run on this in-transaction event. The native URL-rewrite/inventory observers are suppressed during import either way. Requires "Dispatch Product Save Events".</comment>
+                    <comment>Additionally fire catalog_product_save_after per product, inside the batch transaction, so observers written against core's save timing fire where they expect to. On by default. Slower and heavier than the commit-after events above, and because it runs pre-commit a throwing observer rolls the whole batch back — turn this off if you would rather no observer be able to fail an import. The native URL-rewrite/inventory observers are suppressed during import either way. Requires "Dispatch Product Save Events".</comment>
                     <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
                     <depends>
                         <field id="dispatch_product_events">1</field>
@@ -179,7 +179,7 @@
                 </field>
                 <field id="hydrate_media" translate="label comment" type="select" sortOrder="30" showInDefault="1">
                     <label>Include Media Gallery In Dispatched Events</label>
-                    <comment>Read each dispatched product's media gallery and image roles from the database (two extra queries per batch) so observers see the same media_gallery, getMediaGalleryImages() and getMediaGalleryEntries() data a loaded product has. Applies to every product in the batch, including ones whose payload carried no "media" block, and is independent of "Enable Media Gallery Import". Leave off if a third-party observer calls $product->save(): a populated gallery makes Magento's gallery save handler run. Requires "Dispatch Product Save Events".</comment>
+                    <comment>Read each dispatched product's media gallery and image roles from the database (two extra queries per batch) so observers see the same media_gallery, getMediaGalleryImages() and getMediaGalleryEntries() data a loaded product has. Applies to every product in the batch, including ones whose payload carried no "media" block, and is independent of "Enable Media Gallery Import". On by default. Turn it off to save the two queries per batch, or where a third-party observer calls $product->save(): a populated gallery makes Magento's gallery save handler run (the module locks media_gallery so it cannot write, but the handler still runs). Requires "Dispatch Product Save Events".</comment>
                     <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
                     <depends>
                         <field id="dispatch_product_events">1</field>

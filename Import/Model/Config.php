@@ -121,8 +121,14 @@ class Config
     /**
      * Whether to additionally fire the in-transaction catalog_product_save_after
      * event per product. Gated by {@see isDispatchProductEvents()} at the call
-     * site; heavier than the commit-after events and a throwing observer rolls
-     * the batch back.
+     * site.
+     *
+     * On by default: an observer written against core's save timing expects the
+     * in-transaction event, and an importer that skips it changes that
+     * contract silently. The cost is accepted deliberately — it is heavier than
+     * the commit-after events, and running pre-commit means a throwing observer
+     * rolls the batch back. Stores that would rather no third party be able to
+     * fail an import turn it off.
      */
     public function isDispatchSaveAfter(): bool
     {
@@ -134,8 +140,12 @@ class Config
      * roles, read back in bulk once per batch. Gated by
      * {@see isDispatchProductEvents()} at the call site, and deliberately
      * independent of {@see isMediaEnabled()}: the gallery in the database is the
-     * product's gallery whether or not this import wrote it. Costs two queries
-     * per batch, so it is opt-in.
+     * product's gallery whether or not this import wrote it.
+     *
+     * On by default, for the same reason as {@see isDispatchSaveAfter()}: an
+     * observer should see the product a normal save would hand it, and one that
+     * silently carries no gallery is the harder bug to find. Costs two queries
+     * per batch, which is what a store turns it off to save.
      */
     public function isHydrateEventMedia(): bool
     {
@@ -143,9 +153,17 @@ class Config
     }
 
     /**
-     * Master switch for the attribute-definition sync endpoint. Off by default:
-     * creating/updating attribute definitions is a catalog-structure change and
-     * must be opted into.
+     * Master switch for the attribute-definition sync endpoint. On by default:
+     * the endpoint is the supported way to provision the attributes a feed
+     * references, and a feed whose pre-flight step silently no-ops fails later
+     * and less legibly, when the product import skips every unknown code.
+     *
+     * It still creates and alters attribute definitions, which is a
+     * catalog-structure change — a store where that structure is owned by
+     * someone other than the feed turns this off, and the
+     * ReadyData_Import::attributes ACL resource gates it independently. Note
+     * this is NOT the same posture as {@see isCategorySyncEnabled()}, which
+     * stays off.
      */
     public function isAutoCreateAttributes(): bool
     {
