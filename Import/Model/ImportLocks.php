@@ -10,12 +10,15 @@ namespace ReadyData\Import\Model;
  * The named locks this module takes, in one place because three endpoints share
  * them and every one of them shares the timeouts.
  *
- * Each lock guards one **unkeyed read-then-create**: look for a row, not find
- * it, insert it — where the database has no unique key to catch a second
- * request doing the same thing at the same moment. They are separate names
- * rather than one because the payloads that reach them are largely disjoint: a
- * media-only feed and a category sync have no race with each other, and one
- * lock name would serialize them anyway.
+ * Each lock guards one write the database will not arbitrate for us. For four of
+ * them that is an **unkeyed read-then-create**: look for a row, not find it,
+ * insert it — where there is no unique key to catch a second request doing the
+ * same thing at the same moment. {@see URL_REWRITE} is the exception: the key
+ * exists, and this module deliberately writes THROUGH it, so what needs guarding
+ * is a read-then-overwrite. They are separate names rather than one because the
+ * payloads that reach them are largely disjoint: a media-only feed and a category
+ * sync have no race with each other, and one lock name would serialize them
+ * anyway.
  *
  * A lock is held from **before the miss-read until the COMMIT that makes the
  * insert visible** — releasing earlier would let the next holder read a state
@@ -89,12 +92,33 @@ final class ImportLocks
     public const MEDIA_GALLERY = 'readydata_media_gallery';
 
     /**
+     * Product URL rewrites — the odd one out. `url_rewrite` IS unique on
+     * `(request_path, store_id)`, so this does not guard an unkeyed create; it
+     * guards a read-then-**overwrite**. UrlRewriteProcessor reads the taken set
+     * with `findConflicts()` and then writes with
+     * `INSERT ... ON DUPLICATE KEY UPDATE`, which turns that unique key from a
+     * backstop into a silent last-writer-wins. Two batches that both read a path
+     * as free both claim it, and the loser's product silently resolves to the
+     * winner's. This lock is what keeps `findConflicts()`' answer true until the
+     * insert acting on it commits.
+     *
+     * A batch creating products already holds {@see PRODUCT_CREATE}, so two
+     * creating batches never raced. The pairing that does is a creating batch
+     * against one that merely MOVES an existing product's slug — two different
+     * lock names do not serialize — which is why both declare this one.
+     */
+    public const URL_REWRITE = 'readydata_url_rewrite';
+
+    /**
      * The order every holder acquires in. Two requests that want overlapping
      * sets would otherwise be able to take them in opposite orders and wait on
      * each other until both time out.
      *
      * The order itself is the pipeline's: options before product rows before the
-     * tree before the gallery, which is also the order a reader meets them in.
+     * tree before the gallery before the rewrites, which is also the order a
+     * reader meets them in. A new name is APPENDED rather than inserted, so the
+     * relative order of every existing name is untouched and a request already
+     * running the previous code cannot take a shared pair in the opposite order.
      */
     private const ORDER = [
         self::ATTRIBUTE_SYNC,
@@ -102,6 +126,7 @@ final class ImportLocks
         self::PRODUCT_CREATE,
         self::CATEGORY_TREE,
         self::MEDIA_GALLERY,
+        self::URL_REWRITE,
     ];
 
     /**

@@ -35,6 +35,7 @@ use ReadyData\Import\Model\ImportService;
 use ReadyData\Import\Model\ImportState;
 use ReadyData\Import\Model\Indexer\InvalidationHandler;
 use ReadyData\Import\Model\Processor\LockAwareInterface;
+use ReadyData\Import\Model\Processor\LockedPreparableInterface;
 use ReadyData\Import\Model\Processor\PreparableInterface;
 use ReadyData\Import\Model\Processor\ProcessorInterface;
 use ReadyData\Import\Model\ResourceModel\AttributeOption;
@@ -62,12 +63,18 @@ class ImportServiceTest extends TestCase
     /** @var string[] locks the context reported as held while a step was running */
     private array $heldDuringProcess = [];
 
+    /**
+     * @var string[] locks held when prepareUnderLocks() ran
+     */
+    private array $heldDuringLockedPreparation = [];
+
     protected function setUp(): void
     {
         $this->calls = [];
         $this->blockedLocks = [];
         $this->contextFactoryFailsOnCall = null;
         $this->heldDuringProcess = [];
+        $this->heldDuringLockedPreparation = [];
 
         $this->connection = $this->createMock(AdapterInterface::class);
         $this->connection->method('beginTransaction')->willReturnCallback(function (): AdapterInterface {
@@ -367,7 +374,7 @@ class ImportServiceTest extends TestCase
         // Declared in deliberately scrambled order, and across two steps, so the
         // canonical order cannot come from the pipeline's own sort order.
         $this->serviceWith([
-            $this->lockAware([ImportLocks::MEDIA_GALLERY, ImportLocks::ATTRIBUTE_OPTIONS], sortOrder: 100),
+            $this->lockAware([ImportLocks::URL_REWRITE, ImportLocks::MEDIA_GALLERY, ImportLocks::ATTRIBUTE_OPTIONS], sortOrder: 100),
             $this->lockAware([ImportLocks::CATEGORY_TREE, ImportLocks::PRODUCT_CREATE], sortOrder: 200),
         ])->import([$this->product('P1')]);
 
@@ -377,6 +384,8 @@ class ImportServiceTest extends TestCase
                 'lock:' . ImportLocks::PRODUCT_CREATE,
                 'lock:' . ImportLocks::CATEGORY_TREE,
                 'lock:' . ImportLocks::MEDIA_GALLERY,
+                'lock:' . ImportLocks::URL_REWRITE,
+                'unlock:' . ImportLocks::URL_REWRITE,
                 'unlock:' . ImportLocks::MEDIA_GALLERY,
                 'unlock:' . ImportLocks::CATEGORY_TREE,
                 'unlock:' . ImportLocks::PRODUCT_CREATE,
@@ -630,6 +639,164 @@ class ImportServiceTest extends TestCase
         return $processor;
     }
 
+    /**
+     * A step that must write through a repository — which opens a transaction of
+     * its own — runs here: after the locks, so its read-then-create is guarded,
+     * and before beginTransaction(), because a nested rollback flags the
+     * connection and leaves the batch's own COMMIT failing on an unrelated error.
+     *
+     * @return LockedPreparableInterface&ProcessorInterface&MockObject
+     */
+    private function lockedPreparable(int $sortOrder, bool $enabled = true): MockObject
+    {
+        $processor = $this->createMock(LockedPreparableProcessorStub::class);
+        $processor->method('isEnabled')->willReturn($enabled);
+        $processor->method('getSortOrder')->willReturn($sortOrder);
+        $processor->method('prepareUnderLocks')->willReturnCallback(
+            function (BatchContext $context) use ($sortOrder): void {
+                $this->calls[] = 'prepareUnderLocks:' . $sortOrder;
+                $this->heldDuringLockedPreparation = array_values(array_filter(
+                    ImportLocks::inAcquisitionOrder([
+                        ImportLocks::ATTRIBUTE_OPTIONS,
+                        ImportLocks::PRODUCT_CREATE,
+                        ImportLocks::CATEGORY_TREE,
+                        ImportLocks::MEDIA_GALLERY,
+                        ImportLocks::URL_REWRITE,
+                    ]),
+                    static fn (string $lock): bool => $context->holdsLock($lock)
+                ));
+            }
+        );
+        $processor->method('process')->willReturnCallback(function () use ($sortOrder): void {
+            $this->calls[] = 'process:' . $sortOrder;
+        });
+
+        return $processor;
+    }
+
+    /**
+     * The whole ordering in one assertion. Downloads happen before any lock is
+     * taken; the repository-mediated create happens after the locks but before
+     * the transaction; the pipeline runs inside it.
+     */
+    public function testTheFourPhasesRunInOrder(): void
+    {
+        $processor = $this->createMock(EveryPhaseProcessorStub::class);
+        $processor->method('isEnabled')->willReturn(true);
+        $processor->method('getSortOrder')->willReturn(700);
+        $processor->method('requiredLocks')->willReturn([ImportLocks::CATEGORY_TREE]);
+        $processor->method('prepare')->willReturnCallback(function (): void {
+            $this->calls[] = 'prepare:700';
+        });
+        $processor->method('prepareUnderLocks')->willReturnCallback(function (): void {
+            $this->calls[] = 'prepareUnderLocks:700';
+        });
+        $processor->method('process')->willReturnCallback(function (): void {
+            $this->calls[] = 'process:700';
+        });
+
+        $this->serviceWith([$processor])->import([$this->product('P1')]);
+
+        self::assertSame(
+            [
+                'prepare:700',
+                'lock:' . ImportLocks::CATEGORY_TREE,
+                'prepareUnderLocks:700',
+                'beginTransaction',
+                'process:700',
+                'commit',
+                'unlock:' . ImportLocks::CATEGORY_TREE,
+                'invalidate',
+            ],
+            $this->calls
+        );
+    }
+
+    /**
+     * The phase exists to run under the locks — that is what makes the
+     * read-then-create it performs safe.
+     */
+    public function testLockedPreparationSeesTheLocksTheBatchHolds(): void
+    {
+        $this->serviceWith([
+            $this->lockAware([ImportLocks::PRODUCT_CREATE, ImportLocks::CATEGORY_TREE]),
+            $this->lockedPreparable(700),
+        ])->import([$this->product('P1')]);
+
+        self::assertSame(
+            [ImportLocks::PRODUCT_CREATE, ImportLocks::CATEGORY_TREE],
+            $this->heldDuringLockedPreparation
+        );
+    }
+
+    /**
+     * A throw here happens before beginTransaction(), so there is nothing to roll
+     * back — but the locks are already held and must still come back.
+     */
+    public function testAThrowingLockedPreparationReleasesTheLocksAndOpensNoTransaction(): void
+    {
+        $processor = $this->createMock(LockedPreparableProcessorStub::class);
+        $processor->method('isEnabled')->willReturn(true);
+        $processor->method('getSortOrder')->willReturn(700);
+        $processor->method('prepareUnderLocks')
+            ->willThrowException(new \RuntimeException('category repository exploded'));
+
+        $response = $this->serviceWith([
+            $this->lockAware([ImportLocks::CATEGORY_TREE]),
+            $processor,
+        ])->import([$this->product('P1')]);
+
+        self::assertSame(
+            [
+                'lock:' . ImportLocks::CATEGORY_TREE,
+                'unlock:' . ImportLocks::CATEGORY_TREE,
+                'invalidate',
+            ],
+            $this->calls
+        );
+        self::assertSame(1, $response->getFailed());
+        // Saying "rolled back" would send a reader looking for a transaction that
+        // never existed.
+        self::assertStringContainsString(
+            'failed before its transaction opened',
+            $response->getResults()[0]->getMessages()[0]
+        );
+    }
+
+    public function testDisabledLockedPreparableIsNeitherPreparedNorRun(): void
+    {
+        $this->serviceWith([$this->lockedPreparable(700, enabled: false)])
+            ->import([$this->product('P1')]);
+
+        self::assertSame(['beginTransaction', 'commit', 'invalidate'], $this->calls);
+    }
+
+    public function testAPlainProcessorIsNotLockedPrepared(): void
+    {
+        $this->serviceWith([$this->lockAware([], 700)])->import([$this->product('P1')]);
+
+        self::assertNotContains('prepareUnderLocks:700', $this->calls);
+    }
+
+    public function testLockedPreparablesRunInSortOrder(): void
+    {
+        $this->serviceWith([$this->lockedPreparable(710), $this->lockedPreparable(700)])
+            ->import([$this->product('P1')]);
+
+        self::assertSame(
+            [
+                'prepareUnderLocks:700',
+                'prepareUnderLocks:710',
+                'beginTransaction',
+                'process:700',
+                'process:710',
+                'commit',
+                'invalidate',
+            ],
+            $this->calls
+        );
+    }
+
     public function testResponseEchoesTheScopeTheRequestActuallyRanIn(): void
     {
         // The caller cannot infer it: /rest/V1/... resolves against the default
@@ -874,5 +1041,24 @@ abstract class PreparableProcessorStub implements ProcessorInterface, Preparable
  * implementing LockAwareInterface, and one mock has to satisfy both.
  */
 abstract class LockAwareProcessorStub implements ProcessorInterface, LockAwareInterface
+{
+}
+
+/**
+ * A step opting into the phase that runs under the locks but before the
+ * transaction.
+ */
+abstract class LockedPreparableProcessorStub implements ProcessorInterface, LockedPreparableInterface
+{
+}
+
+/**
+ * A step in every phase at once, for asserting their relative order.
+ */
+abstract class EveryPhaseProcessorStub implements
+    ProcessorInterface,
+    PreparableInterface,
+    LockAwareInterface,
+    LockedPreparableInterface
 {
 }

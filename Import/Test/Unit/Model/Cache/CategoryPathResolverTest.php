@@ -6,6 +6,8 @@ declare(strict_types=1);
 
 namespace ReadyData\Import\Test\Unit\Model\Cache;
 
+use Magento\Framework\App\ResourceConnection;
+use Magento\Framework\DB\Adapter\AdapterInterface;
 use Magento\Framework\Exception\LocalizedException;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
@@ -22,6 +24,8 @@ class CategoryPathResolverTest extends TestCase
 
     private CategoryResource&MockObject $categoryResource;
     private CategoryWriter&MockObject $categoryWriter;
+    private AdapterInterface&MockObject $connection;
+    private ResourceConnection&MockObject $resourceConnection;
     private CategoryPathResolver $resolver;
 
     /**
@@ -43,11 +47,23 @@ class CategoryPathResolverTest extends TestCase
 
         $this->categoryWriter = $this->createMock(CategoryWriter::class);
 
-        $this->resolver = new CategoryPathResolver(
+        $this->connection = $this->createMock(AdapterInterface::class);
+        // Not in a transaction: resolvePaths() refuses to create inside one.
+        $this->connection->method('getTransactionLevel')->willReturn(0);
+        $this->resourceConnection = $this->createMock(ResourceConnection::class);
+        $this->resourceConnection->method('getConnection')->willReturn($this->connection);
+
+        $this->resolver = $this->buildResolver();
+    }
+
+    private function buildResolver(): CategoryPathResolver
+    {
+        return new CategoryPathResolver(
             $this->categoryResource,
             $this->categoryWriter,
             new RootCategoryRegistry($this->categoryResource),
-            $this->createMock(Logger::class)
+            $this->createMock(Logger::class),
+            $this->resourceConnection
         );
     }
 
@@ -124,19 +140,137 @@ class CategoryPathResolverTest extends TestCase
         self::assertSame(11, $result['Default Category/Men/Shirts']['id']);
     }
 
-    public function testCreationFailureIsRethrownRatherThanSwallowed(): void
+    /**
+     * A creation failure is reported against the path, not thrown. This used to
+     * throw, and had to: creation ran inside the caller's transaction, and a
+     * nested repository rollback leaves that transaction unusable, so the only
+     * safe move was to reach its rollback handler. Creation now happens before
+     * any transaction opens, so the failure can be handed back — which is what
+     * lets the product import warn on one path instead of losing the batch.
+     */
+    public function testACreationFailureIsReportedAgainstThePath(): void
     {
         $this->categoryResource->method('getChildrenByParentIds')->willReturn([]);
         $this->categoryWriter->method('createBare')
             ->willThrowException(new \RuntimeException('url key already exists'));
 
-        // Swallowing it would leave the caller's transaction flagged as
-        // partially rolled back, so its commit would fail with an unrelated
-        // "Partial rollback is not supported" instead of this message.
-        $this->expectException(LocalizedException::class);
-        $this->expectExceptionMessage('url key already exists');
+        $result = $this->resolver->resolvePaths(['Default Category/Men' => ['Default Category', 'Men']]);
 
-        $this->resolver->resolvePaths(['Default Category/Men' => ['Default Category', 'Men']]);
+        self::assertNull($result['Default Category/Men']['id']);
+        self::assertStringContainsString('url key already exists', $result['Default Category/Men']['message']);
+    }
+
+    /**
+     * The user-visible win: one bad path no longer costs the others their
+     * resolution. Every path in the call used to be lost to the throw, and with
+     * it the whole batch.
+     */
+    public function testAFailureOnOnePathLeavesTheOthersResolved(): void
+    {
+        $this->categoryResource->method('getChildrenByParentIds')->willReturn([
+            self::ROOT_ID => ['Men' => self::MEN_ID],
+        ]);
+        $this->categoryWriter->method('createBare')
+            ->willThrowException(new \RuntimeException('url key already exists'));
+
+        $result = $this->resolver->resolvePaths([
+            'Default Category/Men' => ['Default Category', 'Men'],
+            'Default Category/Women' => ['Default Category', 'Women'],
+        ]);
+
+        self::assertSame(self::MEN_ID, $result['Default Category/Men']['id']);
+        self::assertNull($result['Default Category/Women']['id']);
+    }
+
+    /**
+     * The precondition the per-path reporting above depends on. Inside a
+     * transaction, a nested repository save that fails writes no rollback SQL at
+     * all — it only flags the connection — so its partial rows stay live and the
+     * caller's COMMIT dies with an unrelated error. Reporting instead of throwing
+     * would make that silent, so the resolver refuses to run there.
+     */
+    public function testResolvePathsRefusesToRunInsideATransaction(): void
+    {
+        $this->connection = $this->createMock(AdapterInterface::class);
+        $this->connection->method('getTransactionLevel')->willReturn(1);
+        $this->resourceConnection = $this->createMock(ResourceConnection::class);
+        $this->resourceConnection->method('getConnection')->willReturn($this->connection);
+        $resolver = $this->buildResolver();
+
+        $this->categoryWriter->expects(self::never())->method('createBare');
+        $this->expectException(LocalizedException::class);
+
+        $resolver->resolvePaths(['Default Category/Men' => ['Default Category', 'Men']]);
+    }
+
+    /**
+     * A chain that fails halfway keeps what it created — those saves committed on
+     * their own, outside any transaction, so there is nothing to roll them back.
+     * A retry completes the chain rather than duplicating it.
+     */
+    public function testAPartiallyCreatedChainKeepsTheSegmentsItManagedToCreate(): void
+    {
+        $this->categoryResource->method('getChildrenByParentIds')->willReturn([]);
+        $created = [];
+        $this->categoryWriter->method('createBare')
+            ->willReturnCallback(function (int $parentId, string $name) use (&$created): int {
+                if ($name === 'Shirts') {
+                    throw new \RuntimeException('required attribute missing');
+                }
+                $created[] = $name;
+
+                return self::MEN_ID;
+            });
+
+        $result = $this->resolver->resolvePaths([
+            'Default Category/Men/Shirts' => ['Default Category', 'Men', 'Shirts'],
+        ]);
+        self::assertNull($result['Default Category/Men/Shirts']['id']);
+
+        // "Men" was created and cached, so asking for it alone resolves from the
+        // cache — no second create, which is what makes a retry converge.
+        $resolvedMen = $this->resolver->lookupPaths(['Default Category/Men' => ['Default Category', 'Men']]);
+        self::assertSame(self::MEN_ID, $resolvedMen['Default Category/Men']);
+        self::assertSame(['Men'], $created);
+    }
+
+    /**
+     * The common failure — two differently named siblings deriving one slug — is
+     * pre-checked, so it becomes a message naming the other category instead of a
+     * deep repository exception that names neither.
+     */
+    public function testASlugCollisionIsPreCheckedAndNamesTheOtherCategory(): void
+    {
+        $this->categoryResource->method('getChildrenByParentIds')->willReturn([]);
+        $this->categoryWriter->method('findNewChildConflict')
+            ->willReturn(['kind' => 'url_key', 'value' => 'men', 'category_id' => 77]);
+        $this->categoryWriter->expects(self::never())->method('createBare');
+
+        $result = $this->resolver->resolvePaths(['Default Category/Men' => ['Default Category', 'Men']]);
+
+        self::assertNull($result['Default Category/Men']['id']);
+        self::assertStringContainsString('category ID 77', $result['Default Category/Men']['message']);
+    }
+
+    /**
+     * A category created moments ago is empty, so nothing can collide beneath it.
+     * Asking anyway would cost one query per segment of every new chain.
+     */
+    public function testTheSlugPreCheckIsSkippedForParentsThisChainJustCreated(): void
+    {
+        $this->categoryResource->method('getChildrenByParentIds')->willReturn([]);
+        $this->categoryWriter->method('createBare')
+            ->willReturnCallback(static fn (int $parentId, string $name): int => $name === 'Men' ? 10 : 11);
+
+        $this->categoryWriter->expects(self::once())->method('findNewChildConflict')
+            ->with(self::ROOT_ID, 'Men')
+            ->willReturn(null);
+
+        $result = $this->resolver->resolvePaths([
+            'Default Category/Men/Shirts' => ['Default Category', 'Men', 'Shirts'],
+        ]);
+
+        self::assertSame(11, $result['Default Category/Men/Shirts']['id']);
     }
 
     /**

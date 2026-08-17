@@ -13,13 +13,16 @@ use ReadyData\Import\Model\Cache\AttributeMetadataCache;
 use ReadyData\Import\Model\Cache\StoreWebsiteMap;
 use ReadyData\Import\Model\Config;
 use ReadyData\Import\Model\Data\Product;
+use ReadyData\Import\Model\Data\ProductStoreValues;
 use ReadyData\Import\Model\Processor\EavValueProcessor;
 use ReadyData\Import\Model\Processor\EntityProcessor;
 use ReadyData\Import\Model\Processor\UrlRewrite\CategoryPathRewriteBuilder;
 use ReadyData\Import\Model\Processor\UrlRewriteProcessor;
 use ReadyData\Import\Model\Processor\WebsiteProcessor;
+use ReadyData\Import\Model\ImportLocks;
 use ReadyData\Import\Model\ResourceModel\CategoryLink;
 use ReadyData\Import\Model\ResourceModel\EavValue;
+use ReadyData\Import\Model\ResourceModel\ProductEntity;
 use ReadyData\Import\Model\ResourceModel\UrlRewrite;
 
 class UrlRewriteProcessorTest extends TestCase
@@ -31,6 +34,7 @@ class UrlRewriteProcessorTest extends TestCase
     private Config&MockObject $config;
     private CategoryLink&MockObject $categoryLink;
     private CategoryPathRewriteBuilder&MockObject $categoryPathRewriteBuilder;
+    private ProductEntity&MockObject $productEntity;
     private UrlRewriteProcessor $processor;
 
     /**
@@ -74,6 +78,8 @@ class UrlRewriteProcessorTest extends TestCase
         $this->categoryLink = $this->createMock(CategoryLink::class);
         $this->categoryPathRewriteBuilder = $this->createMock(CategoryPathRewriteBuilder::class);
 
+        $this->productEntity = $this->createMock(ProductEntity::class);
+
         $this->rebuildProcessor();
     }
 
@@ -91,7 +97,8 @@ class UrlRewriteProcessorTest extends TestCase
             $this->storeWebsiteMap,
             $this->config,
             $this->categoryLink,
-            $this->categoryPathRewriteBuilder
+            $this->categoryPathRewriteBuilder,
+            $this->productEntity
         );
     }
 
@@ -403,5 +410,247 @@ class UrlRewriteProcessorTest extends TestCase
         }
 
         return $context;
+    }
+
+    // ---------------------------------------------------------------------
+    // requiredLocks(): the probe runs BEFORE the transaction, so it reads the
+    // payload and the database directly rather than the context data bag.
+    // ---------------------------------------------------------------------
+
+    /**
+     * The property the whole probe exists for. A feed re-sending slugs it already
+     * sent claims only paths it already owns, so re-writing them is idempotent
+     * and there is nothing to serialize. If this ever starts taking the lock,
+     * every batch of every steady-state push serializes against every other
+     * import — which is what the per-batch probe design was built to avoid.
+     */
+    public function testAPayloadWhoseSlugsAllMatchTheStoredOnesTakesNoLock(): void
+    {
+        $this->stubUrlKeyMeta();
+        $this->productEntity->method('getExistingBySkus')
+            ->willReturn(['SKU-A' => ['entity_id' => 42, 'link_id' => 77]]);
+        $this->eavValue = $this->createMock(EavValue::class);
+        $this->eavValue->method('getValuesForStores')->willReturn([77 => [97 => [0 => 'white-shirt']]]);
+        $this->rebuildProcessor();
+
+        $context = $this->probeContext(['SKU-A' => 'white-shirt']);
+
+        self::assertSame([], $this->processor->requiredLocks($context));
+    }
+
+    public function testAChangedSlugTakesTheRewriteLock(): void
+    {
+        $this->stubUrlKeyMeta();
+        $this->productEntity->method('getExistingBySkus')
+            ->willReturn(['SKU-A' => ['entity_id' => 42, 'link_id' => 77]]);
+        $this->eavValue = $this->createMock(EavValue::class);
+        $this->eavValue->method('getValuesForStores')->willReturn([77 => [97 => [0 => 'white-shirt']]]);
+        $this->rebuildProcessor();
+
+        $context = $this->probeContext(['SKU-A' => 'cream-shirt']);
+
+        self::assertSame([ImportLocks::URL_REWRITE], $this->processor->requiredLocks($context));
+    }
+
+    /**
+     * A new product always claims a path — EavValueProcessor derives a url_key
+     * from the name when the payload omits one — so the answer is known without
+     * comparing anything. The EAV read must not happen: on a first-time import
+     * every batch is new, and that is the batch where an extra query costs most.
+     */
+    public function testANewSkuShortCircuitsWithoutReadingStoredKeys(): void
+    {
+        $this->productEntity->method('getExistingBySkus')->willReturn([]);
+        $this->eavValue = $this->createMock(EavValue::class);
+        $this->eavValue->expects(self::never())->method('getValuesForStores');
+        $this->rebuildProcessor();
+
+        $context = $this->probeContext(['SKU-A' => 'white-shirt']);
+
+        self::assertSame([ImportLocks::URL_REWRITE], $this->processor->requiredLocks($context));
+    }
+
+    /**
+     * A price or stock refresh names no slug at all, so it can claim nothing.
+     * One indexed read, no lock — the module's documented fast path.
+     */
+    public function testAPayloadWithNoUrlKeyAnywhereMakesNoEavReadAndTakesNoLock(): void
+    {
+        $this->productEntity->method('getExistingBySkus')
+            ->willReturn(['SKU-A' => ['entity_id' => 42, 'link_id' => 77]]);
+        $this->eavValue = $this->createMock(EavValue::class);
+        $this->eavValue->expects(self::never())->method('getValuesForStores');
+        $this->rebuildProcessor();
+
+        $context = new BatchContext([(new Product())->setSku('SKU-A')], 0);
+
+        self::assertSame([], $this->processor->requiredLocks($context));
+    }
+
+    /**
+     * url_key is store-scoped, so a request naming store 2 writes the store-2
+     * row — not store 0. Comparing against store 0 would call this a change.
+     */
+    public function testARequestScopedKeyIsComparedAgainstThatStoresOwnRow(): void
+    {
+        $this->stubUrlKeyMeta();
+        $this->productEntity->method('getExistingBySkus')
+            ->willReturn(['SKU-A' => ['entity_id' => 42, 'link_id' => 77]]);
+        $this->eavValue = $this->createMock(EavValue::class);
+        $this->eavValue->method('getValuesForStores')->willReturn([
+            77 => [97 => [0 => 'white-shirt', 2 => 'weisses-hemd']],
+        ]);
+        $this->rebuildProcessor();
+
+        $context = new BatchContext([(new Product())->setSku('SKU-A')->setUrlKey('weisses-hemd')], 2);
+
+        self::assertSame([], $this->processor->requiredLocks($context));
+    }
+
+    /**
+     * The other direction of the same rule: matching the store-0 row is NOT a
+     * match when the request addresses store 2 and store 2 has its own value.
+     */
+    public function testARequestScopedKeyMatchingOnlyTheDefaultRowIsAChange(): void
+    {
+        $this->stubUrlKeyMeta();
+        $this->productEntity->method('getExistingBySkus')
+            ->willReturn(['SKU-A' => ['entity_id' => 42, 'link_id' => 77]]);
+        $this->eavValue = $this->createMock(EavValue::class);
+        $this->eavValue->method('getValuesForStores')->willReturn([
+            77 => [97 => [0 => 'white-shirt', 2 => 'weisses-hemd']],
+        ]);
+        $this->rebuildProcessor();
+
+        $context = new BatchContext([(new Product())->setSku('SKU-A')->setUrlKey('white-shirt')], 2);
+
+        self::assertSame([ImportLocks::URL_REWRITE], $this->processor->requiredLocks($context));
+    }
+
+    /**
+     * A store with no override of its own resolves on the default value, so that
+     * is what a block's key is compared against — mirroring urlKeyFor(). Without
+     * this the probe would report a change for a block that changes nothing.
+     */
+    public function testABlockKeyFallsBackToTheDefaultRowWhenTheStoreHasNoOverride(): void
+    {
+        $this->stubUrlKeyMeta();
+        $this->productEntity->method('getExistingBySkus')
+            ->willReturn(['SKU-A' => ['entity_id' => 42, 'link_id' => 77]]);
+        $this->eavValue = $this->createMock(EavValue::class);
+        $this->eavValue->method('getValuesForStores')->willReturn([77 => [97 => [0 => 'white-shirt']]]);
+        $this->storeWebsiteMap = $this->createMock(StoreWebsiteMap::class);
+        $this->storeWebsiteMap->method('getStoreIdsForWebsites')->willReturn([1]);
+        $this->storeWebsiteMap->method('findScopeStoreId')->willReturn(2);
+        $this->rebuildProcessor();
+
+        $product = (new Product())->setSku('SKU-A');
+        $product->setStoreValues([(new ProductStoreValues())->setStoreId(2)->setUrlKey('white-shirt')]);
+        $context = new BatchContext([$product], 0);
+
+        self::assertSame([], $this->processor->requiredLocks($context));
+    }
+
+    /**
+     * The contention case for localized feeds: per-store slugs are re-sent on
+     * every push, and the store-scoped comparison is exact precisely so those
+     * batches stay lock-free. A conservative "carries a store url_key" predicate
+     * would lock every one of them.
+     */
+    public function testAChangedStoreScopedKeyTakesTheLock(): void
+    {
+        $this->stubUrlKeyMeta();
+        $this->productEntity->method('getExistingBySkus')
+            ->willReturn(['SKU-A' => ['entity_id' => 42, 'link_id' => 77]]);
+        $this->eavValue = $this->createMock(EavValue::class);
+        $this->eavValue->method('getValuesForStores')->willReturn([
+            77 => [97 => [0 => 'white-shirt', 2 => 'weisses-hemd']],
+        ]);
+        $this->storeWebsiteMap = $this->createMock(StoreWebsiteMap::class);
+        $this->storeWebsiteMap->method('getStoreIdsForWebsites')->willReturn([1]);
+        $this->storeWebsiteMap->method('findScopeStoreId')->willReturn(2);
+        $this->rebuildProcessor();
+
+        $product = (new Product())->setSku('SKU-A');
+        $product->setStoreValues([(new ProductStoreValues())->setStoreId(2)->setUrlKey('creme-hemd')]);
+        $context = new BatchContext([$product], 0);
+
+        self::assertSame([ImportLocks::URL_REWRITE], $this->processor->requiredLocks($context));
+    }
+
+    /**
+     * EavValueProcessor refuses both, so neither writes a value and neither can
+     * claim a path.
+     */
+    public function testBlocksThatWriteNothingAreNotClaims(): void
+    {
+        $this->stubUrlKeyMeta();
+        $this->productEntity->method('getExistingBySkus')
+            ->willReturn(['SKU-A' => ['entity_id' => 42, 'link_id' => 77]]);
+        $this->eavValue = $this->createMock(EavValue::class);
+        $this->eavValue->expects(self::never())->method('getValuesForStores');
+        $this->storeWebsiteMap = $this->createMock(StoreWebsiteMap::class);
+        $this->storeWebsiteMap->method('getStoreIdsForWebsites')->willReturn([1]);
+        // An unknown store view resolves to null; the default scope resolves to 0.
+        $this->storeWebsiteMap->method('findScopeStoreId')->willReturnOnConsecutiveCalls(null, 0);
+        $this->rebuildProcessor();
+
+        $product = (new Product())->setSku('SKU-A');
+        $product->setStoreValues([
+            (new ProductStoreValues())->setStoreViewCode('nope')->setUrlKey('whatever'),
+            (new ProductStoreValues())->setStoreId(0)->setUrlKey('whatever'),
+        ]);
+        $context = new BatchContext([$product], 0);
+
+        self::assertSame([], $this->processor->requiredLocks($context));
+    }
+
+    public function testAnEmptyBatchAsksTheDatabaseNothing(): void
+    {
+        $this->productEntity->expects(self::never())->method('getExistingBySkus');
+        $this->rebuildProcessor();
+
+        self::assertSame([], $this->processor->requiredLocks(new BatchContext([], 0)));
+    }
+
+    /**
+     * This step deliberately has no holdsLock() degradation, unlike every other
+     * lock-aware one. Skipping the write would leave the product with NO url at
+     * all, because replaceProductRewrites() deletes our own rows before
+     * inserting — strictly worse than a write that merely displaced someone
+     * else's. Pinned so the "missing" check is not added later.
+     */
+    public function testRewritesAreStillWrittenWhenTheBatchHoldsNoLock(): void
+    {
+        $context = $this->createContext(['SKU-A' => 42], urlKey: 'white-shirt');
+        $context->setHeldLocks([]);
+
+        $this->processor->process($context);
+
+        self::assertNotNull($this->replaced);
+        self::assertNotSame([], $this->replaced['rows']);
+    }
+
+    /**
+     * @param array<string, string> $urlKeyBySku
+     */
+    private function probeContext(array $urlKeyBySku, int $storeId = 0): BatchContext
+    {
+        $products = [];
+        foreach ($urlKeyBySku as $sku => $urlKey) {
+            $products[] = (new Product())->setSku((string)$sku)->setUrlKey($urlKey);
+        }
+
+        return new BatchContext($products, $storeId);
+    }
+
+    private function stubUrlKeyMeta(): void
+    {
+        $this->attributeMetadataCache = $this->createMock(AttributeMetadataCache::class);
+        $this->attributeMetadataCache->method('get')->willReturnCallback(
+            static fn (string $code): ?array => $code === 'url_key'
+                ? ['attribute_id' => 97, 'attribute_code' => 'url_key', 'backend_type' => 'varchar']
+                : null
+        );
     }
 }

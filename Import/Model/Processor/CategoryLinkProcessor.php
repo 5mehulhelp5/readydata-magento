@@ -39,14 +39,31 @@ use ReadyData\Import\Model\ResourceModel\CategoryLink;
  * Only path leaves are linked; is_anchor handles ancestor rollup. New links
  * get position 0, existing links keep their admin-set positions.
  *
+ * **Paths are resolved before the transaction opens**, in
+ * {@see prepareUnderLocks()}, because creating a category goes through the
+ * category repository and that opens a transaction of its own — which cannot
+ * nest inside the batch's without poisoning the connection. See
+ * {@see LockedPreparableInterface}. One consequence is worth stating plainly:
+ * entity IDs do not exist that early, so the resolution covers every path a
+ * VALID product references rather than only those of products the batch will
+ * actually write. A product EntityProcessor later rejects — unknown type,
+ * unknown attribute set, no name, EE staging — can therefore leave a category
+ * behind that nothing links to. That is the same trade the module already makes
+ * for media downloads, and it is bounded the same way: only paths that were
+ * already missing create anything, a product-less category is inert, and
+ * creation is idempotent, so a retry resolves rather than duplicates.
+ *
  * Publishes to the context data bag:
+ *  - "category_resolved_paths": path key => {id, message}, the resolution
+ *    prepareUnderLocks() performed; consumed by this step's own process().
  *  - "affected_category_ids": int[] category IDs whose product set changed;
  *    consumed by InvalidationHandler for FPC tag cleaning.
  *  - "affected_product_ids": int[] product IDs whose category links changed;
  *    consumed by ImportEventDispatcher for the category-changed event.
  */
-class CategoryLinkProcessor implements ProcessorInterface, LockAwareInterface
+class CategoryLinkProcessor implements ProcessorInterface, LockAwareInterface, LockedPreparableInterface
 {
+    public const CONTEXT_RESOLVED_PATHS = 'category_resolved_paths';
     public const CONTEXT_AFFECTED_CATEGORY_IDS = 'affected_category_ids';
     public const CONTEXT_AFFECTED_PRODUCT_IDS = 'affected_product_ids';
 
@@ -87,8 +104,48 @@ class CategoryLinkProcessor implements ProcessorInterface, LockAwareInterface
         }
 
         $resolved = $this->pathResolver->lookupPaths($collected['paths'], $context->getRootCategoryId());
+        if (count($resolved) === count($collected['paths'])) {
+            return [];
+        }
 
-        return count($resolved) === count($collected['paths']) ? [] : [ImportLocks::CATEGORY_TREE];
+        // The rewrite lock comes too, because creating a category is not only a
+        // tree write: the repository save makes core's category-rewrite observer
+        // write into `url_rewrite`, which the module's suppression plugin does
+        // not cover (it only silences the PRODUCT observer). Category and product
+        // URL suffixes are both ".html" by default, so a new category "Men/Shirts"
+        // claims `men/shirts.html` — the same request path as the category-path
+        // rewrite of a product slugged "shirts" under "Men".
+        return [ImportLocks::CATEGORY_TREE, ImportLocks::URL_REWRITE];
+    }
+
+    /**
+     * Resolve the batch's category paths — creating what is missing — under the
+     * batch's locks but before its transaction opens.
+     *
+     * This is here rather than in {@see process()} because
+     * {@see \ReadyData\Import\Model\Category\CategoryWriter::createBare()} goes
+     * through the category repository, which opens its own transaction; nested
+     * inside the batch's, a failure there flags the connection and the batch's
+     * COMMIT dies with an unrelated error instead of the real cause. Run first,
+     * the repository resolves cleanly and a failure is reportable against the
+     * product that caused it. See {@see LockedPreparableInterface}.
+     *
+     * $reportProblems is false: `process()` remains the one place a per-product
+     * message is recorded, or every warning in this step would be emitted twice.
+     *
+     * The bag key is set unconditionally, so a missing key means the phase did
+     * not run at all rather than that it found nothing.
+     */
+    public function prepareUnderLocks(BatchContext $context): void
+    {
+        $collected = $this->collectReferences($context, false);
+        if (!$collected['paths']) {
+            $context->set(self::CONTEXT_RESOLVED_PATHS, []);
+
+            return;
+        }
+
+        $context->set(self::CONTEXT_RESOLVED_PATHS, $this->resolvePaths($context, $collected['paths']));
     }
 
     public function process(BatchContext $context): void
@@ -97,9 +154,11 @@ class CategoryLinkProcessor implements ProcessorInterface, LockAwareInterface
 
         $refsBySku = [];
         foreach ($collected['refs'] as $sku => $refs) {
-            // Products whose row could not be resolved are dropped HERE rather
-            // than during collection, so their paths cannot pull a category
-            // into existence for a product this batch is not writing.
+            // Products whose row could not be resolved are dropped HERE, so no
+            // link is written for a product this batch is not writing. Note the
+            // paths of such a product were still RESOLVED — and possibly created
+            // — by prepareUnderLocks(), which runs before entity IDs exist; see
+            // the class docblock.
             $entityId = $context->getEntityId($sku);
             if ($entityId !== null) {
                 $refsBySku[$sku] = ['entity_id' => $entityId] + $refs;
@@ -121,8 +180,30 @@ class CategoryLinkProcessor implements ProcessorInterface, LockAwareInterface
             }
         }
 
-        $pathResults = $this->resolvePaths($context, $uniquePaths);
+        // Resolved by prepareUnderLocks(), before the transaction. The map is a
+        // superset of $uniquePaths — that phase collects from every valid
+        // product, this one from the subset with an entity row — but the
+        // fallback keeps a missing entry from being a fatal index error if the
+        // phase was ever skipped.
+        $pathResults = $context->get(self::CONTEXT_RESOLVED_PATHS, []);
+
         $validIds = $this->pathResolver->validateIds(array_keys($uniqueIds));
+
+        // Path IDs were resolved in an earlier phase, so a category deleted in
+        // between would otherwise reach the insert as a stale ID and fail the
+        // whole batch on a foreign key — the failure class splitting the phase
+        // exists to remove. Asked as "which of these are gone" rather than folded
+        // into validateIds(): that call answers a different question about the
+        // payload's own numeric references, and an unknown ID the caller sent is
+        // not the same event as a category that vanished under us.
+        $pathIds = [];
+        foreach ($pathResults as $result) {
+            if ($result['id'] !== null) {
+                $pathIds[$result['id']] = true;
+            }
+        }
+        $vanishedPathIds = $pathIds ? $this->pathResolver->findVanished(array_keys($pathIds)) : [];
+
         $currentAssignments = $this->categoryLink->getAssignments(
             array_column($refsBySku, 'entity_id')
         );
@@ -136,9 +217,21 @@ class CategoryLinkProcessor implements ProcessorInterface, LockAwareInterface
             $desired = [];
 
             foreach (array_keys($refs['paths']) as $key) {
-                $result = $pathResults[$key];
+                $result = $pathResults[$key] ?? [
+                    'id' => null,
+                    'message' => sprintf('Category "%s" was not resolved for this batch.', $key),
+                ];
                 if ($result['id'] === null) {
                     $context->addMessage($sku, $result['message']);
+                    $partial = true;
+                } elseif (isset($vanishedPathIds[$result['id']])) {
+                    // Resolved in the earlier phase, deleted before we could write
+                    // against it. Reported rather than written, because the insert
+                    // would fail on the foreign key and take the batch with it.
+                    $context->addMessage($sku, sprintf(
+                        'Category "%s" was removed before its links could be written; skipped.',
+                        $key
+                    ));
                     $partial = true;
                 } else {
                     $desired[$result['id']] = true;

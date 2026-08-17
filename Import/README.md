@@ -586,10 +586,11 @@ three localized value sets is one `created`.
 ### Concurrency
 
 Overlapping imports are only serialized where they could actually corrupt each
-other, and only for as long as it takes. What needs guarding is an **unkeyed
-read-then-create**: look for a row, not find it, insert it, where the database
-has no unique key to catch a second request doing the same thing at the same
-moment. There are four of those, and each has a **lock of its own**:
+other, and only for as long as it takes. What usually needs guarding is an
+**unkeyed read-then-create**: look for a row, not find it, insert it, where the
+database has no unique key to catch a second request doing the same thing at the
+same moment. There are four of those, plus one write where the key exists and
+this module deliberately writes *through* it — five locks in all:
 
 | Lock | Guards |
 | --- | --- |
@@ -597,6 +598,7 @@ moment. There are four of those, and each has a **lock of its own**:
 | `readydata_product_import` | **the category tree.** Missing path segments are created on demand, and nothing is unique on `(parent_id, name)` or on a category `url_key`. Two concurrent runs both miss and both insert, leaving a duplicate sibling — which makes that path permanently ambiguous — or a `url_rewrite` unique-key violation that fails whichever request loses. The category endpoint takes this same lock. (The name is the historical one, from when a single lock guarded only the tree; keeping it means a request still running the previous release serializes against this one on the least recoverable race.) |
 | `readydata_media_gallery` | **media gallery rows.** `catalog_product_entity_media_gallery` has no key on `(attribute_id, value)`, and its `value_id` is an autoincrement, so a fresh row cannot be re-selected by its own data at all. Two concurrent runs carrying the same file for one product both insert it and the image is listed twice. |
 | `readydata_attribute_options` | **attribute options.** With *Auto-Create Missing Attribute Options* on, missing select/multiselect options are created. `eav_attribute_option` has no key on the label, so two concurrent runs writing the same new option label both insert and the attribute ends up with two options of the same name. The attribute endpoint takes this same lock. |
+| `readydata_url_rewrite` | **product URL rewrites** — the odd one out. `url_rewrite` *is* unique on `(request_path, store_id)`, so nothing can be duplicated; but the rewrite step reads the taken set and then writes with `INSERT … ON DUPLICATE KEY UPDATE`, which turns that key from a backstop into a silent last-writer-wins. Two runs that both read a path as free both claim it, and the loser's product ends up without that rewrite. |
 
 Separate names matter because the payloads that reach them are largely disjoint:
 a media feed and a category sync cannot duplicate each other's work, so one lock
@@ -628,9 +630,16 @@ reading what is already there:
 | Step | Takes its lock when |
 | --- | --- |
 | `EntityProcessor` | a SKU in the batch is not in `catalog_product_entity`. |
-| `CategoryLinkProcessor` | a `categories` path does not resolve to a category that exists. Numeric IDs and `[]` never do. |
+| `CategoryLinkProcessor` | a `categories` path does not resolve to a category that exists. Numeric IDs and `[]` never do. Takes `readydata_url_rewrite` as well, because the repository save that creates a category makes core's *category* rewrite observer claim a request path in the same namespace — with the same default `.html` suffix — and only the *product* rewrite observer is suppressed during an import. |
 | `AttributeProcessor` | a `custom_attributes` label has no option on that attribute yet — after multiselect values are split and trimmed, so the check and the create agree on what a label is. Off entirely when option auto-creation is off. |
 | `MediaProcessor` | a `media` field is present at all — see below. |
+| `UrlRewriteProcessor` | a SKU in the batch is new, **or** a `url_key` the payload declares differs from the one stored for that scope. An existing product whose slug does not move claims only paths it already owns, so re-writing them is idempotent. |
+
+A `store_values` block's `url_key` is compared against **that store's own stored
+value** (falling back to the default-scope one where the store has no override),
+not merely noted as present. That exactness is what keeps a localized feed
+lock-free: such a feed re-sends per-store slugs on every push, and a
+"carries a store `url_key`" predicate would lock every batch of it.
 
 The distinction is the whole point. A feed sends `categories` and
 `custom_attributes` on every product of every push, while the tree and the
@@ -706,12 +715,33 @@ wait). No `Retry-After` header: the hint is in the body, where a non-HTTP caller
 can read it too. Match on `parameters.reason`, not on the status alone — a bare
 429 from a proxy in front of the store is somebody else's rate limiting.
 
-One race the locks still do **not** cover: `url_rewrite` is unique on
-`(request_path, store_id)`, so concurrent requests cannot duplicate a rewrite —
-but they read the conflict set before writing, which makes the `error` and
-`append` conflict strategies unreliable under concurrency and can leave the
-loser's request path pointing at the other product. Lock-free and per-batch
-scoping both widen the window in which that can happen.
+**URL rewrite ownership.** `url_rewrite` is unique on `(request_path, store_id)`
+and the rewrite step writes through that key, so a row can change hands. Whenever
+it does, the row is now rewritten **whole** — `entity_id` and `entity_type`
+included — so it can never claim one product while resolving to another. That
+mattered even without concurrency: a product adopting the slug of another product
+in the same batch that just went *not visible* used to produce such a row, and the
+not-visible cleanup that runs immediately afterwards deletes by `entity_id`, so it
+removed the URL the batch had just created. `readydata_url_rewrite` then serializes
+the concurrent case, and the `append` strategy checks its generated
+`<slug>-<id>` variant against both the database's taken set and the paths this
+batch has already claimed instead of assuming it is free.
+
+What remains, and is bounded to "the last writer owns the path, the other product
+simply has no rewrite there":
+
+- **non-ReadyData writers** — an admin product save, a CMS page save, core's own
+  rewrite generation in another process — do not take this lock;
+- two products with the **same effective slug** concurrently gaining the same
+  category can still collide on the shared category-path rewrite. Their canonical
+  paths already collided, so the catalog already contained a duplicate-slug pair;
+- during a **deploy**, a request running the previous release does not take this
+  lock at all;
+- an `append` variant can still collide with a row this batch never asked about,
+  since only the paths it queried are known to be taken.
+
+None of these can corrupt a row any more; the next import of the losing product
+regenerates its rewrite through the ordinary conflict path.
 
 ## Attribute definitions
 
@@ -1603,14 +1633,26 @@ removals of legacy junk rows whose stored path was NULL or a duplicate.
 ## Extending the pipeline
 
 No placeholder steps remain — every dimension in the pipeline is implemented.
-To add one: implement `ProcessorInterface` (plus `PreparableInterface` when the
-step needs network or filesystem access before the batch transaction opens, and
-`LockAwareInterface` when it performs an unkeyed read-then-create and therefore
-needs one of the named locks — see "Concurrency") and register it in `etc/di.xml`
+To add one: implement `ProcessorInterface` and register it in `etc/di.xml`
 (`ImportService`, argument `processors`). Position is `getSortOrder()`, not the
 order of the XML items; core steps use 100–750 with gaps left for third-party
 insertion. `AbstractPlaceholderProcessor` remains as the
 base for a step that should be registered but inert until it is written.
+
+Three optional interfaces opt a step into the phases a batch runs through, in
+this order:
+
+| Interface | Phase | For |
+| --- | --- | --- |
+| `PreparableInterface` | before the locks and the transaction | network and filesystem work, which must never happen while locks are held |
+| `LockAwareInterface` | asked before the locks are taken | a step that performs an unkeyed read-then-create and must declare which named lock covers it — see "Concurrency" |
+| `LockedPreparableInterface` | under the locks, before the transaction | a step whose write goes through a repository or model that opens a transaction of its own, which cannot nest inside the batch's |
+
+`LockedPreparableInterface` is the narrow one: work placed there runs while the
+batch's whole lock set is held, so a competing import waits for it. It exists for
+the transaction-nesting problem (`CategoryLinkProcessor` is the only user), not
+for work that merely wants to happen early. Note that entity IDs do not exist yet
+in either pre-transaction phase.
 
 ## Important caveats
 
@@ -1672,20 +1714,29 @@ base for a step that should be registered but inert until it is written.
   `delete_children: 1` is required before a non-empty category is removed, and a
   category some store group has adopted as its root is refused with `root_in_use`
   (core would throw "Can't delete root category." mid-batch instead).
-- **The sibling-collision guards are the category endpoint's, not the product
-  import's.** `CategoryPathResolver`'s on-demand subtree creation goes through
-  `CategoryWriter::createBare()` and is deliberately left unguarded: it has no
-  per-entry result row to report a refusal into, and its documented contract is
-  to throw so the batch rolls back with the real reason (see the next bullet). A
-  product feed referencing a path whose slug is taken therefore still fails its
-  batch rather than reporting `destination_url_key_taken`.
-- **Category creation now fails its batch instead of being reported per path.**
-  A category is created through the repository, which runs its own transaction;
-  when that fails inside the import's batch transaction the connection is left
-  flagged as partially rolled back, so every later write and the commit itself
-  would fail with an unrelated "Partial rollback is not supported". The failure
-  is therefore re-thrown so the batch rolls back cleanly and reports the real
-  reason (typically a URL-key conflict).
+- **Categories are created before the batch transaction opens**, not inside it. A
+  category is created through the repository, which runs a transaction of its own,
+  and Magento's adapter counts nesting rather than emitting savepoints: nested
+  inside the import's transaction, a failed save left the connection flagged and
+  the batch's own commit died with an unrelated "Partial rollback is not
+  supported". Creation therefore happens in its own phase — after the batch takes
+  its locks, before it opens its transaction. Three consequences:
+  - **a category that cannot be created is a per-product warning**, not a lost
+    batch. The product is applied additively (its existing links survive) and
+    every other product in the batch commits normally. The common cause — two
+    differently named siblings deriving the same slug — is checked up front, so
+    the message names the category holding it instead of surfacing as a deep
+    repository error naming neither.
+  - **a category created for a batch that later rolls back survives**, like a
+    downloaded image does. So does a partially created chain: if `Men` is created
+    and `Men/Shirts` then fails, `Men` remains, appears in navigation, and a retry
+    completes the chain rather than duplicating it. Nothing garbage-collects a
+    category left with no products.
+  - **a path is resolved for every product in the batch that passed validation,
+    not only for those the batch ends up writing.** Entity IDs do not exist that
+    early, so a product later rejected for an unknown type, an unknown attribute
+    set, a missing name or EE staging can still have caused its categories to be
+    created.
 - **Category creation is forced to default scope.** `CategoryRepository::save()`
   takes its store from the store manager and ignores `setStoreId()`, so calling
   `/rest/V1/...` instead of `/rest/all/V1/...` used to write the category name

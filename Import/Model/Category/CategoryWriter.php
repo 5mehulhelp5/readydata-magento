@@ -294,15 +294,22 @@ class CategoryWriter
      * refuses from deep inside the save with no indication of the other category.
      *
      * @param string $name the name the category will be created with
+     * @param CategoryDefinitionInterface|null $definition the definition the
+     *        category will be created from, for its optional explicit `url_key`.
+     *        Null for {@see createBare()}'s callers — the product import's
+     *        on-demand subtree creation — which carry no definition at all and
+     *        always get the slug derived from the name.
      * @return array{kind: string, value: string, category_id: int}|null
      */
     public function findNewChildConflict(
         int $parentId,
         string $name,
-        CategoryDefinitionInterface $definition
+        ?CategoryDefinitionInterface $definition = null
     ): ?array {
         $ignoredMessages = [];
-        $desired = $this->collectDesired($definition, $name, null, $ignoredMessages);
+        $desired = $definition !== null
+            ? $this->collectDesired($definition, $name, null, $ignoredMessages)
+            : [];
 
         // Inside the same store emulation the create itself runs in, so the slug
         // predicted here is byte-for-byte the one that would be written.

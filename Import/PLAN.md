@@ -45,7 +45,13 @@ Model\ImportService (orchestrator)
         │                    actually CREATE; acquire that set in a fixed global
         │                    order, all-or-nothing. Often empty (see §7)
         │
-        ├─ 3. transaction    ─────────────────────────────────────────────
+        ├─ 3. prepareUnderLocks()  LockedPreparableInterface steps — under the locks,
+        │                    still OUTSIDE the transaction. Today only
+        │                    CategoryLinkProcessor, which creates missing categories
+        │                    through the repository (its own transaction cannot nest
+        │                    inside ours — see §7)
+        │
+        ├─ 4. transaction    ─────────────────────────────────────────────
         │      Processor pipeline, ordered by getSortOrder(), pool in di.xml
         │      100  AttributeProcessor      resolve/auto-create option values
         │      200  EntityProcessor         catalog_product_entity rows
@@ -61,8 +67,8 @@ Model\ImportService (orchestrator)
         │      dispatchBeforeCommit()  →  catalog_product_save_after, if enabled
         │      COMMIT / ROLLBACK      ─────────────────────────────────────
         │
-        ├─ 4. release locks
-        └─ 5. dispatchAfterCommit()  catalog_product_save_commit_after +
+        ├─ 5. release locks
+        └─ 6. dispatchAfterCommit()  catalog_product_save_commit_after +
                                      the batch-level readydata_import_* events
         │
         ▼
@@ -86,10 +92,12 @@ Design rules:
   the held-lock set, and a free-form data bag processors use to hand each other results).
   Processors never loop-query; they bulk-read and bulk-write.
 - Adding functionality later = adding a processor to the `di.xml` pool. No orchestrator
-  changes. Two opt-in interfaces extend a step beyond `process()`:
-  **`PreparableInterface`** for work that must happen before the transaction opens
-  (network, filesystem), and **`LockAwareInterface`** for a step that performs an unkeyed
-  read-then-create and must declare which named lock covers it.
+  changes. Three opt-in interfaces extend a step beyond `process()`:
+  **`PreparableInterface`** for work that must happen before the locks and the transaction
+  (network, filesystem); **`LockAwareInterface`** for a step that performs an unkeyed
+  read-then-create and must declare which named lock covers it; and
+  **`LockedPreparableInterface`** for a step whose write goes through a repository that
+  opens a transaction of its own, which cannot nest inside the batch's.
 - Each batch is one DB transaction: a failed batch rolls back and is reported; other
   batches proceed (configurable: fail-fast vs. continue). The transaction spans **every
   scope** a product names, so `continue_on_error` resumes at the next batch, never at the
@@ -309,7 +317,7 @@ app/code/ReadyData/                        # package + git root
     │   ├── AttributeValidator.php         # shape + structural-change guards
     │   ├── CategoryValidator.php          #   "  (Magento-owned attributes)
     │   ├── BatchContext.php               # shared per-batch state + held locks
-    │   ├── ImportLocks.php                # the five lock names + acquisition order
+    │   ├── ImportLocks.php                # the six lock names + acquisition order
     │   ├── ImportState.php                # import-active flag, shared instance
     │   ├── Config.php                     # typed accessor for system config
     │   ├── UrlKeyGenerator.php
@@ -318,20 +326,21 @@ app/code/ReadyData/                        # package + git root
     │   │                                  #   AttributeValidation, CategoryValidation
     │   ├── Processor/
     │   │   ├── ProcessorInterface.php
-    │   │   ├── PreparableInterface.php    # opt-in pre-transaction phase
+    │   │   ├── PreparableInterface.php    # opt-in pre-lock, pre-transaction phase
     │   │   ├── LockAwareInterface.php     # opt-in "which lock will I need"
+    │   │   ├── LockedPreparableInterface.php  # opt-in locked, pre-transaction phase
     │   │   ├── AbstractPlaceholderProcessor.php   # base for inert steps; unused
     │   │   ├── AttributeProcessor.php     100
     │   │   ├── EntityProcessor.php        200
     │   │   ├── EavValueProcessor.php      300
     │   │   ├── WebsiteProcessor.php       400
     │   │   ├── StockProcessor.php         500
-    │   │   ├── CategoryLinkProcessor.php  700
+    │   │   ├── CategoryLinkProcessor.php  700  (LockAware + LockedPreparable)
     │   │   ├── MediaProcessor.php         710  (Preparable + LockAware)
     │   │   ├── LinkProcessor.php          720
     │   │   ├── ConfigurableProcessor.php  730
     │   │   ├── TierPriceProcessor.php     740
-    │   │   ├── UrlRewriteProcessor.php    750
+    │   │   ├── UrlRewriteProcessor.php    750  (LockAware)
     │   │   └── UrlRewrite/CategoryPathRewriteBuilder.php
     │   ├── ResourceModel/                 # all raw SQL — 14 classes
     │   │   ├── ProductEntity.php          # entity upserts, SKU→ID, link field, staging probe
@@ -417,6 +426,9 @@ Built since, and never described by this plan until now:
    the two observer-suppression plugins.
 6. **The lock layer** — `ImportLocks`, `LockAwareInterface`, per-batch
    probe-decided acquisition, and the typed 429 refusal.
+7. **The locked-preparation phase** — `LockedPreparableInterface`, which is what
+   decoupled category creation from the batch transaction; plus URL rewrite row
+   ownership and the `URL_REWRITE` lock. See §8.
 
 Still unbuilt: the delete endpoint, the async/queue mode and its status endpoint,
 and integration tests.
@@ -447,24 +459,32 @@ and integration tests.
   - **Categories are the exception to the whole architecture:** they are saved through
     the category model/repository, so category-save plugins and observers DO run — both
     for on-demand creation during a product import and for the category endpoint.
-- **Category writes are transaction-coupled to the batch.** `CategoryRepository::save()`
-  opens its own transaction inside the batch's; when it fails, the connection is left
-  partially rolled back and every subsequent statement — including the COMMIT — fails
-  with an unrelated "Partial rollback is not supported". The failure is therefore
-  re-thrown so the batch rolls back cleanly with the real reason. The consequence is that
-  a product feed naming a category path whose slug is taken **fails its whole batch**
-  instead of reporting that one product, and `CategoryPathResolver`'s on-demand creation
-  is deliberately left without the sibling-collision guards the category endpoint has (it
-  has no per-entry result row to report a refusal into). Decoupling this would mean
-  creating categories outside the batch transaction, which trades a clean rollback for
-  committed categories on a failed batch.
+- **Category creation is decoupled from the batch transaction** (was: transaction-coupled,
+  fixed in §8.2). `CategoryRepository::save()` opens its own transaction, and Magento's
+  adapter counts nesting rather than emitting savepoints — a nested `rollBack()` emits no
+  SQL at all, it flags the connection and decrements, so a failed save inside the batch's
+  transaction left its partial rows live and the COMMIT died with an unrelated "Partial
+  rollback is not supported". Creation therefore runs in its own phase
+  (`LockedPreparableInterface`): after the batch's locks, before its transaction. A
+  failure is now a per-product warning with the batch intact, and `createBare()` finally
+  carries the sibling-slug pre-check the category endpoint always had. What this bought is
+  paid for in two ways, both accepted:
+  - a rolled-back batch **leaves created categories behind**, and a partially created
+    chain persists — the same trade already made for downloaded media files, and nothing
+    garbage-collects either;
+  - the phase runs before entity IDs exist, so a path is resolved for every *valid*
+    product rather than only for those the batch writes. A product `EntityProcessor` later
+    rejects can still have caused its categories to be created. Reconstructing the old
+    filter was rejected: it covers one of six rejection reasons and puts the predicate
+    away from the code it guards.
 - **Concurrency:** two simultaneous imports of the same SKUs can corrupt each other
   wherever there is an unkeyed read-then-create. Guarded by named locks (via
-  `Magento\Framework\Lock\LockManagerInterface`, see `ImportLocks`): five names, four of
+  `Magento\Framework\Lock\LockManagerInterface`, see `ImportLocks`): six names, five of
   which the product pipeline can reach — options, product rows, the category tree, the
-  gallery — plus `ATTRIBUTE_SYNC`, held by the attribute endpoint alone. A set is acquired
-  all-or-nothing in one fixed order, per BATCH, held only for that batch's transaction —
-  never across image downloads, indexing or after-commit events.
+  gallery, the URL rewrites — plus `ATTRIBUTE_SYNC`, held by the attribute endpoint alone.
+  A set is acquired all-or-nothing in one fixed order, per BATCH, held only for that
+  batch's transaction and the locked-preparation phase immediately before it — never
+  across image downloads, indexing or after-commit events.
 
   What a batch takes is decided by `LockAwareInterface::requiredLocks()`, which probes
   what is actually **missing** rather than what the payload carries, so a steady-state
@@ -480,13 +500,21 @@ and integration tests.
   two-connection test harness this module does not have. And **`MediaProcessor`'s
   conservatism** is a measured 251 ms held on every batch carrying a `media` field,
   including `[]`.
-- **`url_rewrite` conflict resolution is not covered by any lock.** The table is unique on
-  `(request_path, store_id)`, so concurrency cannot duplicate a rewrite — but the
-  conflict set is read before the write, which makes the `error` and `append` strategies
-  unreliable under concurrency and can leave the loser's request path pointing at the
-  other product. Per-batch, probe-decided locking deliberately widened that window in
-  exchange for throughput. The fix is either a lock of its own or upsert-and-retry on the
-  unique key; neither is written.
+- **`url_rewrite` rows are now written whole** (was: a lost race produced a cross-wired
+  row, fixed in §8.1). The upsert overwrites `entity_id` and `entity_type` as well as the
+  target, so a row that changes hands can never claim one product while resolving to
+  another — which also removed a *deterministic* single-request bug, where a product
+  adopting a not-visible batch sibling's slug had its brand-new URL deleted by the
+  not-visible cleanup that follows. `URL_REWRITE` serializes the concurrent case on a
+  probe (new SKU, or a declared `url_key` differing from the stored one for that scope),
+  and `append` re-checks its generated variant against the taken and claimed sets.
+  Residual, all bounded to "the last writer owns the path and the loser simply has no
+  rewrite there", self-healing on that product's next import: non-ReadyData writers
+  (admin save, CMS page, core's own generation) take no lock; two products with identical
+  effective slugs concurrently gaining the same category can still collide on the shared
+  category-path rewrite; a deploy-overlap request takes no lock; and an `append` variant
+  can still hit a row the batch never queried — closing that last one needs the second
+  conflict lookup, which was deliberately deferred.
 - **Async mode:** for very large feeds, accept-and-queue (bulk API pattern with
   `operation` status endpoint) is still the planned expansion. Nothing of it exists yet —
   the `products/delete` and `import/:id/status` routes sit commented out in
@@ -539,165 +567,101 @@ and integration tests.
   the media `value_id` read-back and the isolation-level audit per-key locking needs —
   are explicitly blocked on a harness that does not exist.
 
-## 8. Planned fixes
+## 8. Shipped fixes
 
-Three of §7's risks have a concrete remedy. They are written up here rather than fixed in
-place because two of them move the lock layer, and the order they land in matters.
+§8 was a plan; this is what landed. Both risks it addressed turned out to be worse than
+§7 had recorded, and each fix is described where its behaviour now lives — §7 for the
+residuals, the README for what a caller sees. Kept here as the record of what was decided
+and what was deliberately left.
 
-### 8.1 `url_rewrite`: a lost race writes a cross-wired row
+### 8.1 `url_rewrite` ownership
 
-**What actually happens.** `url_rewrite` is unique on `(request_path, store_id)`, and
-`UrlRewrite::replaceProductRewrites()` upserts with the update list
-`['target_path', 'redirect_type', 'is_autogenerated', 'metadata']` — **`entity_id` is not
-in it**. So when two imports both read a path as free:
+**Shipped.** `UrlRewrite::REPLACE_UPDATE_COLUMNS` now overwrites `entity_id` and
+`entity_type` alongside the target columns, so a row that changes hands under the
+`(request_path, store_id)` unique key is rewritten whole and can never claim one product
+while resolving to another.
 
-| | |
-|---|---|
-| import A commits | `(P, S, entity_id = A, target = …/id/A)` |
-| import B commits | ON DUPLICATE fires → `target = …/id/B`, **`entity_id` stays A** |
+The investigation's finding was that this is not only a race. `findConflicts()` excludes
+every valid batch entity, while the pre-insert delete only clears `$touchedEntityIds` — and
+a product that went **not visible** in a store is in neither. So a product adopting such a
+sibling's slug landed on its still-live row, kept the sibling's `entity_id`, and the
+not-visible cleanup that runs immediately afterwards — which deletes by `entity_id` —
+removed the URL the batch had just created. Deterministic, single-request, no concurrency.
 
-The row now claims to belong to A and points at B. Three things follow, and the middle one
-is the bad one:
+`ImportLocks::URL_REWRITE` (appended **last** in `ORDER`, matching the pipeline convention
+and leaving every existing name's relative order untouched) serializes the concurrent case.
+`UrlRewriteProcessor::requiredLocks()` probes on two signals — any new SKU short-circuits,
+otherwise a declared `url_key` is compared against the stored value **for its own scope**,
+every scope arriving in one indexed read. That exactness is what keeps a localized feed
+lock-free. `CategoryLinkProcessor` declares the lock too, on the branch where it creates a
+category: core's *category* rewrite observer is not suppressed during an import and claims
+paths in the same namespace with the same default `.html` suffix.
 
-1. the storefront serves `P` as product B;
-2. A's next import calls `deleteAutogenerated([A], [S])`, which matches on `entity_id` and
-   **deletes B's live URL** — from a request that never mentioned B;
-3. `saveProductCategoryRelations()` reads `entity_id` and writes a category relation with
-   `product_id = A` for a rewrite that resolves to B.
+`resolveConflict()`'s `append` strategy now checks its generated `<slug>-<id>` variant
+against the taken and claimed sets and appends a bounded discriminator, rather than
+returning the one path this step wrote having asked nothing about it. Ownership made that
+urgent: a collision there used to cross-wire a row and would now take it over outright,
+including a CMS page's.
 
-This is concurrency-only. Within one request it cannot happen: `$claimed` blocks
-self-collision inside a batch, and a later batch sees the earlier batch's row through
-`findConflicts()`, because the exclusion list is only the *current* batch's entities.
+Deliberately **no `holdsLock()` degradation**, unlike every other lock-aware step, and the
+docblock says why: refusing the write would leave the product with no URL at all, because
+the step deletes its own rows before inserting.
 
-**Part 1 — make the row self-consistent.** Add `entity_id` to the update column list. A
-lost race then yields a coherent row wholly owned by the last writer: the loser simply has
-no rewrite in that store, which its next import regenerates through the ordinary conflict
-path. No cross-wired row, no cross-product delete, no bogus relation.
+**Declined:** the transitional double-lock for deploy overlap, and the second
+`findConflicts()` over appended paths. Both are residuals in §7.
 
-The only other way a duplicate can be hit is a preserved 301 row of *our own* entity whose
-`request_path` equals a path we are now claiming (the delete spares `redirect_type != 0`)
-— there `entity_id` is already ours and writing it changes nothing. So the new column
-affects the race and nothing else. One line, no behavioural change outside the race, ships
-first and independently.
+### 8.2 Category creation, decoupled
 
-**Part 2 — a probe-decided `URL_REWRITE` lock.** Add `ImportLocks::URL_REWRITE`
-(`readydata_url_rewrite`), last in `ORDER` — the order is the pipeline's, and
-`UrlRewriteProcessor` sorts at 750. Have the processor implement `LockAwareInterface`.
+**Shipped**, and not the way §8.2 proposed. The plan put creation in `prepare()`; it went
+into a new phase instead — `LockedPreparableInterface::prepareUnderLocks()`, run by
+`ImportService` after the locks are acquired and before `beginTransaction()`.
 
-The exact question ("will this batch claim a path it does not already own?") is not
-answerable at probe time: entity IDs for new products, `CONTEXT_WEBSITE_IDS` and
-`CONTEXT_LINK_IDS` do not exist until the transaction runs. The same wall `MediaProcessor`
-hit. So the probe is a sound over-approximation — take the lock when
+That placement is what makes the change a pure correctness fix: **zero** edits to
+`ImportLocks::ORDER`, `batchLocks()`, `requiredLocks()`, the deadlock argument or the 429
+contract, and a lock hold identical to before. The `prepare()` variant would have released
+`CATEGORY_TREE` before `MediaProcessor`'s downloads, opening a window in which a concurrent
+category sync — which holds that same lock name for its whole request — could delete a
+category the batch was about to link, an FK violation that rolls the batch back. That is
+the failure class being fixed, reappearing by another route.
 
-- any SKU in the batch is new (a new product always claims paths), **or**
-- a payload `url_key`, default-scope or store-scoped, differs from the stored one (one
-  bulk EAV read that `resolveUrlKeys()` largely performs anyway), **or**
-- the batch changes category assignments *and* the store has
-  `generate_category_product_rewrites` on;
+One correction to the plan's premise, which strengthened the case: Magento's adapter checks
+`_isRolledBack` only in `beginTransaction()` and `commit()`, so it is not true that every
+later statement fails. The nested `rollBack()` emits no SQL at all — it flags and
+decrements — which means a failed repository save left its partial rows **live** in the
+outer transaction. The old re-throw was mandatory, not merely prudent, and
+`CategoryPathResolver::resolvePaths()` now refuses outright to run at
+`getTransactionLevel() > 0` so dropping it cannot silently regress.
 
-otherwise skip. The fast paths stay lock-free: a price or stock refresh carries no
-`url_key` and no categories, and a steady-state feed echoing an unchanged `url_key`
-compares equal. That is the same "probe what is actually missing" reasoning
-`EntityProcessor` and `CategoryLinkProcessor` already use, and it preserves the contention
-win §7 describes.
+With creation outside the transaction, `createChain()` reports per path instead of throwing,
+which reaches the existing additive safety valve; `CategoryWriter::findNewChildConflict()`
+(now nullable-definition, gated on the parent being pre-existing) pre-checks the common
+slug collision; and `CategoryPathResolver::findVanished()` catches a category deleted
+between the two phases, which would otherwise be an FK violation costing the batch.
 
-**The residual is permanent.** A named lock serializes this module against itself only — a
-concurrent admin save or a core `UrlRewriteHandler` run can still take a path between our
-probe and our write. Part 1 is what makes that outcome non-corrupting, which is why it is
-worth doing even though Part 2 follows. Document it exactly as the media `value_id`
-residual is documented.
+Accepted with the user: a rolled-back batch leaves created categories, and the phase runs
+before entity IDs exist, so a path is resolved for every valid product rather than only for
+those the batch writes. Both are in §7 and the README.
 
-Rejected: catching the duplicate-key error and retrying. `insertOnDuplicate` never raises
-one, so detection would mean per-row `insert()` plus a 23000 catch — abandoning the bulk
-write on the module's hottest table to fix a race the two parts above already contain.
+### 8.3 Categories through the model
 
-### 8.2 Category creation: move it into `prepare()`
-
-**Why it fails a whole batch today.** `CategoryPathResolver::createChain()` calls
-`CategoryWriter::createBare()` → `CategoryRepository::save()`, which opens its own
-transaction *nested inside* the batch's. Magento's adapter counts nesting rather than
-emitting savepoints, so the inner `rollBack()` flags the connection partially-rolled-back
-and every later statement — the COMMIT included — dies with "Partial rollback is not
-supported" instead of the real cause. The re-throw is the only correct move once you are
-there; the cost is a batch lost to one bad path, and a `createBare()` that cannot carry
-the category endpoint's sibling-collision guards because it has no per-entry result row to
-refuse into.
-
-**The fix is an extension point the module already has.** `PreparableInterface` runs
-before the transaction opens, holds the `BatchContext`, reports per-product problems
-through `addMessage()`/`fail()`, and documents that a throw "fails the whole batch — but
-before any transaction exists, so it is reported without a rollback". That is precisely
-the contract this needs. Make `CategoryLinkProcessor` implement it and, in `prepare()`:
-
-1. collect the batch's paths — `collectReferences()` already does this for the lock probe;
-2. resolve them, and create the missing tails **at the top level**, where the repository's
-   transaction is outermost and resolves cleanly on its own;
-3. report a creation failure against the product: `fail()`, or the existing additive-mode
-   warning. The batch survives;
-4. stash the path→ID map on the context bag; `process()` consumes it instead of resolving
-   a second time.
-
-Three consequences, all to be stated rather than discovered:
-
-- **`CATEGORY_TREE` moves with it.** The lock must span the miss-read *and* the commit
-  that publishes the new row, and that commit now happens in `prepare()`. Take it there,
-  around the creation step only, and release it before the transaction-phase set is
-  acquired — no lock is ever held across both acquisitions, so the fixed-order deadlock
-  argument is untouched. `CATEGORY_TREE` then leaves `batchLocks()` and the
-  transaction-phase `ORDER`. The category endpoint's whole-request hold is unaffected.
-- **A rolled-back batch leaves created categories behind.** The same trade already made
-  for downloaded media files, with the same mitigation — creation is idempotent, so the
-  retry resolves them instead of duplicating them — and a product-less bare category is
-  inert. It earns a README line next to the orphan-media one.
-- **`createBare()` can finally be guarded.** With a per-product result row available,
-  `CategoryWriter::findNewChildConflict()` — already written, already used by the category
-  endpoint — runs before creating, turning today's batch-killing URL-key conflict into a
-  per-product warning. That closes the asymmetry the README currently documents as
-  deliberate.
-
-Ordering falls out for free: `prepareBatch()` walks preparables in `getSortOrder()`, and
-`CategoryLinkProcessor` (700) precedes `MediaProcessor` (710), so a category failure is
-found before the batch spends its downloads.
-
-Rejected: wrapping the repository call in a `SAVEPOINT`. The adapter counts nested
-transactions and emits no savepoints, so this means raw `SAVEPOINT` SQL around code that
-itself calls `beginTransaction()` — an interaction with the adapter's internal counter
-that is exactly the sort of thing a minor Magento upgrade breaks silently.
-
-### 8.3 Categories through the model: contain it, do not remove it
-
-Not a defect. `CategoryWriter`'s reasoning holds — path/level/`children_count`
+**Unchanged, deliberately.** `CategoryWriter`'s reasoning holds: path/level/`children_count`
 maintenance, `url_key`/`url_path` derivation and subtree rewrite cascades would be the
 riskiest SQL in the module, and category cardinality never justified the bulk-write
-argument. Keep the exception. Two things leak out of it, though:
+argument. 8.2 removed the harm that leaked out of it — a category-save observer now fires
+outside the batch transaction, so it fails products rather than rolling the batch back.
 
-- **The transaction coupling**, which is 8.2 and is the whole of the harm.
-- **The observer asymmetry.** Product-save events are ours to gate — the event layer has
-  a switch per event, and a store that cannot afford an in-transaction observer turns
-  `dispatch_save_after` off. A category save fires everything unconditionally, including
-  for a category a *product* import auto-created, with no switch anywhere. A store with
-  an expensive or throwing category-save observer therefore gets it invoked
-  mid-product-import, inside the batch transaction — the same hazard `dispatch_save_after`
-  carries, minus the ability to decline it.
-  8.2 downgrades it from "rolls back the batch" to "fails these products", which is a
-  second reason it is the right shape. The residual belongs in §7 and the README.
+Still open, low priority: `readydata_import/categories/auto_create`, to let an operator with
+heavy category observers turn on-demand creation off and require the category endpoint as a
+pre-flight step.
 
-Optional and low priority: `readydata_import/categories/auto_create` (default on), so an
-operator with heavy category observers can switch on-demand creation off entirely and make
-the category endpoint a required pre-flight step.
+### 8.4 What is not proven
 
-### 8.4 Order and provability
-
-1. **8.1 Part 1** — one line, independent, no lock changes. Ship first.
-2. **8.2** — the largest change; unlocks the `createBare()` guard.
-3. **8.1 Part 2** — after 8.2, because both edit `ImportLocks::ORDER` and 8.2 changes what
-   `batchLocks()` returns.
-4. **8.3** — documentation, plus the optional flag.
-
-Unit coverage extends to all of it: the update-column list is assertable directly, and
-8.2's per-product reporting is a throwing `CategoryWriter` double. **None of the race
-behaviour is provable without the integration harness §7 names as missing** — which is the
-argument for 8.1 Part 1 being unconditional rather than contingent on the lock landing.
+The unit suite pins the column list, the probe's scope arithmetic, the phase ordering and
+the per-path reporting. It cannot prove the ON DUPLICATE semantics themselves, last-row-wins
+within a chunk, the FK cascade, or that the probe and the write agree about what "unchanged"
+means — and none of the races. §7's missing two-connection integration harness is unchanged,
+and is the reason the ownership fix shipped unconditionally rather than contingent on the
+lock.
 
 > **Keeping this document honest.** §1–§6 were rewritten against the code on
 > 2026-08-17, after the `[P]` markers and the single-endpoint framing had drifted

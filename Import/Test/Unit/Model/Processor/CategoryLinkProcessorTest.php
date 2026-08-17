@@ -46,6 +46,22 @@ class CategoryLinkProcessorTest extends TestCase
     }
 
     /**
+     * Run both of the step's phases, in the order ImportService runs them.
+     *
+     * Path resolution moved out of process() and into prepareUnderLocks(), which
+     * runs under the batch's locks but before its transaction opens — creating a
+     * category goes through the repository, and that cannot nest inside the
+     * batch's transaction. Driving both here rather than seeding the resolved map
+     * onto each context by hand keeps every test exercising the real hand-off, so
+     * the map's shape cannot drift between the two phases unnoticed.
+     */
+    private function run(CategoryLinkProcessor $processor, BatchContext $context): void
+    {
+        $processor->prepareUnderLocks($context);
+        $processor->process($context);
+    }
+
+    /**
      * Builds the processor with a non-default replace scope. Separate from
      * setUp() because the Config stub cannot be re-stubbed once set.
      */
@@ -79,7 +95,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::once())->method('assign')
             ->with([['category_id' => 5, 'product_id' => 10, 'position' => 0]]);
 
-        $this->processor->process($context);
+        $this->run($this->processor, $context);
 
         self::assertSame([], $context->getMessages('SKU-1'));
         self::assertEqualsCanonicalizing(
@@ -103,7 +119,7 @@ class CategoryLinkProcessorTest extends TestCase
             ]);
         $this->categoryLink->expects(self::once())->method('assign')->with([]);
 
-        $this->processor->process($context);
+        $this->run($this->processor, $context);
     }
 
     public function testNullCategoriesTouchesNothing(): void
@@ -119,7 +135,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::never())->method('unassign');
         $this->categoryLink->expects(self::never())->method('assign');
 
-        $this->processor->process($context);
+        $this->run($this->processor, $context);
 
         self::assertNull($context->get(CategoryLinkProcessor::CONTEXT_AFFECTED_CATEGORY_IDS));
     }
@@ -138,7 +154,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::once())->method('assign')
             ->with([['category_id' => 5, 'product_id' => 10, 'position' => 0]]);
 
-        $this->processor->process($context);
+        $this->run($this->processor, $context);
 
         $messages = $context->getMessages('SKU-1');
         self::assertCount(2, $messages);
@@ -158,7 +174,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::once())->method('unassign')->with([]);
         $this->categoryLink->expects(self::once())->method('assign')->with([]);
 
-        $this->processor->process($context);
+        $this->run($this->processor, $context);
 
         $messages = $context->getMessages('SKU-1');
         self::assertCount(1, $messages);
@@ -173,7 +189,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->pathResolver->expects(self::never())->method('validateIds');
         $this->categoryLink->expects(self::never())->method('assign');
 
-        $this->processor->process($context);
+        $this->run($this->processor, $context);
     }
 
     public function testDuplicateAndEquivalentReferencesAreDeduplicated(): void
@@ -192,7 +208,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::once())->method('assign')
             ->with([['category_id' => 42, 'product_id' => 10, 'position' => 0]]);
 
-        $this->processor->process($context);
+        $this->run($this->processor, $context);
     }
 
     public function testEscapedSlashResolvesAsOneSegmentUnderTheCanonicalKey(): void
@@ -208,7 +224,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::once())->method('assign')
             ->with([['category_id' => 5, 'product_id' => 10, 'position' => 0]]);
 
-        $this->processor->process($context);
+        $this->run($this->processor, $context);
 
         self::assertSame([], $context->getMessages('SKU-1'));
     }
@@ -232,7 +248,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::once())->method('assign')
             ->with([['category_id' => 6, 'product_id' => 10, 'position' => 0]]);
 
-        $this->processor->process($context);
+        $this->run($this->processor, $context);
     }
 
     /**
@@ -257,7 +273,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::once())->method('assign')
             ->with([['category_id' => 30, 'product_id' => 10, 'position' => 0]]);
 
-        $this->processorWithScope(Config::REPLACE_SCOPE_PAYLOAD_ROOTS)->process($context);
+        $this->run($this->processorWithScope(Config::REPLACE_SCOPE_PAYLOAD_ROOTS), $context);
 
         self::assertStringContainsString(
             'limited to root categories 29; 1 existing assignment(s) outside them were kept',
@@ -281,7 +297,7 @@ class CategoryLinkProcessorTest extends TestCase
             ['category_id' => 31, 'product_id' => 10],
         ]);
 
-        $this->processor->process($context);
+        $this->run($this->processor, $context);
 
         self::assertSame([], $context->getMessages('SKU-1'));
     }
@@ -302,7 +318,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::once())->method('unassign')
             ->with([['category_id' => 21, 'product_id' => 10]]);
 
-        $this->processorWithScope(Config::REPLACE_SCOPE_PAYLOAD_ROOTS)->process($context);
+        $this->run($this->processorWithScope(Config::REPLACE_SCOPE_PAYLOAD_ROOTS), $context);
     }
 
     /**
@@ -320,7 +336,7 @@ class CategoryLinkProcessorTest extends TestCase
 
         $this->categoryLink->expects(self::once())->method('unassign')->with([]);
 
-        $this->processorWithScope(Config::REPLACE_SCOPE_PAYLOAD_ROOTS)->process($context);
+        $this->run($this->processorWithScope(Config::REPLACE_SCOPE_PAYLOAD_ROOTS), $context);
 
         self::assertStringContainsString(
             'limited to no root categories, so nothing was removed; 1 existing assignment(s) were kept',
@@ -339,7 +355,7 @@ class CategoryLinkProcessorTest extends TestCase
 
         $this->categoryLink->expects(self::once())->method('unassign')->with([]);
 
-        $this->processor->process($context);
+        $this->run($this->processor, $context);
     }
 
     public function testANonRootInTheScopeIsReportedAndIgnored(): void
@@ -357,7 +373,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::once())->method('unassign')
             ->with([['category_id' => 21, 'product_id' => 10]]);
 
-        $this->processor->process($context);
+        $this->run($this->processor, $context);
 
         self::assertStringContainsString(
             'Ignored 21 in categories_replace_scope: not a root category.',
@@ -383,7 +399,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::once())->method('unassign')
             ->with([['category_id' => 21, 'product_id' => 10]]);
 
-        $this->processor->process($context);
+        $this->run($this->processor, $context);
     }
 
     /**
@@ -404,7 +420,7 @@ class CategoryLinkProcessorTest extends TestCase
 
         $this->categoryLink->expects(self::once())->method('unassign')->with([]);
 
-        $this->processor->process($context);
+        $this->run($this->processor, $context);
 
         self::assertStringContainsString('applied additively', $context->getMessages('SKU-1')[1]);
     }
@@ -430,7 +446,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->pathResolver->method('validateIds')->willReturn([]);
         $this->categoryLink->method('getAssignments')->willReturn([]);
 
-        $this->processor->process($context);
+        $this->run($this->processor, $context);
     }
 
     /**
@@ -454,7 +470,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->pathResolver->method('validateIds')->willReturn([]);
         $this->categoryLink->method('getAssignments')->willReturn([]);
 
-        $this->processor->process($context);
+        $this->run($this->processor, $context);
 
         self::assertSame([], $context->getMessages('SKU-1'));
     }
@@ -490,7 +506,14 @@ class CategoryLinkProcessorTest extends TestCase
 
         $this->pathResolver->method('lookupPaths')->willReturn([]);
 
-        self::assertSame([ImportLocks::CATEGORY_TREE], $this->processor->requiredLocks($context));
+        // The rewrite lock comes with it: the repository save that creates a
+        // category makes core's category-rewrite observer claim a request path,
+        // in the same namespace and with the same default ".html" suffix as the
+        // product rewrites this import writes.
+        self::assertSame(
+            [ImportLocks::CATEGORY_TREE, ImportLocks::URL_REWRITE],
+            $this->processor->requiredLocks($context)
+        );
     }
 
     /**
@@ -543,11 +566,115 @@ class CategoryLinkProcessorTest extends TestCase
         // links it already has.
         $this->categoryLink->expects(self::once())->method('unassign')->with([]);
 
-        $this->processor->process($context);
+        $this->run($this->processor, $context);
 
         $messages = $context->getMessages('SKU-1');
         self::assertStringContainsString('stopped resolving', $messages[0]);
         self::assertFalse($context->isFailed('SKU-1'));
+    }
+
+    /**
+     * The defect this phase split exists to fix. A category that cannot be
+     * created — its derived slug is taken, a required attribute has no default —
+     * used to throw out of process(), which rolled the whole batch back and
+     * failed every other product in it. It is now one product's warning, applied
+     * additively, with the rest of the batch untouched.
+     */
+    public function testACreationFailureIsAPerProductWarningRatherThanABatchFailure(): void
+    {
+        $context = $this->createContext(
+            ['SKU-1' => ['Default Category/Men/New Thing'], 'SKU-2' => ['42']],
+            ['SKU-1' => 10, 'SKU-2' => 11]
+        );
+
+        $this->pathResolver->method('resolvePaths')->willReturn([
+            'Default Category/Men/New Thing' => [
+                'id' => null,
+                'message' => 'Category "Default Category/Men/New Thing" was not created:'
+                    . ' its URL key "new-thing" is already used by category ID 77.',
+            ],
+        ]);
+        $this->pathResolver->method('validateIds')->willReturn([42 => true]);
+        $this->categoryLink->method('getAssignments')->willReturn([10 => [7], 11 => []]);
+
+        // SKU-1 keeps the links it had; SKU-2 is written in full.
+        $this->categoryLink->expects(self::once())->method('unassign')->with([]);
+        $this->categoryLink->expects(self::once())->method('assign')
+            ->with([['category_id' => 42, 'product_id' => 11, 'position' => 0]]);
+
+        $this->run($this->processor, $context);
+
+        $messages = $context->getMessages('SKU-1');
+        self::assertStringContainsString('already used by category ID 77', $messages[0]);
+        self::assertStringContainsString('applied additively', $messages[1]);
+        self::assertFalse($context->isFailed('SKU-1'));
+        self::assertFalse($context->isFailed('SKU-2'));
+    }
+
+    /**
+     * Paths are resolved in the earlier phase, so a category can be deleted
+     * between the resolve and the write. Writing the stale ID would fail on the
+     * catalog_category_product foreign key and roll the batch back — the same
+     * failure class the split removes — so it is reported instead.
+     */
+    public function testACategoryThatVanishedBetweenThePhasesIsReportedNotWritten(): void
+    {
+        $context = $this->createContext(['SKU-1' => ['Default Category/Men']], ['SKU-1' => 10]);
+
+        $this->pathResolver->method('resolvePaths')
+            ->willReturn(['Default Category/Men' => ['id' => 5, 'message' => null]]);
+        $this->pathResolver->method('validateIds')->willReturn([]);
+        $this->pathResolver->method('findVanished')->with([5])->willReturn([5 => true]);
+        $this->categoryLink->method('getAssignments')->willReturn([10 => [7]]);
+
+        $this->categoryLink->expects(self::once())->method('assign')->with([]);
+        $this->categoryLink->expects(self::once())->method('unassign')->with([]);
+
+        $this->run($this->processor, $context);
+
+        $messages = $context->getMessages('SKU-1');
+        self::assertStringContainsString('was removed before its links could be written', $messages[0]);
+        self::assertFalse($context->isFailed('SKU-1'));
+    }
+
+    /**
+     * The resolution belongs to the phase that runs before the transaction;
+     * process() only reads it. If process() ever resolves again it would be doing
+     * so inside the transaction, which is what the resolver now refuses outright.
+     */
+    public function testProcessReadsTheResolutionRatherThanRepeatingIt(): void
+    {
+        $context = $this->createContext(['SKU-1' => ['Default Category/Men']], ['SKU-1' => 10]);
+
+        $this->pathResolver->expects(self::once())->method('resolvePaths')
+            ->willReturn(['Default Category/Men' => ['id' => 5, 'message' => null]]);
+        $this->pathResolver->method('validateIds')->willReturn([]);
+        $this->categoryLink->method('getAssignments')->willReturn([10 => []]);
+
+        $this->processor->prepareUnderLocks($context);
+        self::assertSame(
+            ['Default Category/Men' => ['id' => 5, 'message' => null]],
+            $context->get(CategoryLinkProcessor::CONTEXT_RESOLVED_PATHS)
+        );
+
+        $this->processor->process($context);
+
+        self::assertSame([], $context->getMessages('SKU-1'));
+    }
+
+    /**
+     * A payload that names no paths still marks the phase as having run, so a
+     * missing bag key can only ever mean the phase was skipped.
+     */
+    public function testThePhaseAlwaysPublishesItsResultEvenWhenThereIsNothingToResolve(): void
+    {
+        $context = $this->createContext(['SKU-1' => ['42']], ['SKU-1' => 10]);
+
+        $this->pathResolver->expects(self::never())->method('resolvePaths');
+
+        $this->processor->prepareUnderLocks($context);
+
+        self::assertSame([], $context->get(CategoryLinkProcessor::CONTEXT_RESOLVED_PATHS));
     }
 
     /**

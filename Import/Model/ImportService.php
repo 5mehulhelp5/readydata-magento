@@ -24,6 +24,7 @@ use ReadyData\Import\Model\Exception\ImportLockedException;
 use ReadyData\Import\Model\Indexer\InvalidationHandler;
 use ReadyData\Import\Model\Processor\CategoryLinkProcessor;
 use ReadyData\Import\Model\Processor\LockAwareInterface;
+use ReadyData\Import\Model\Processor\LockedPreparableInterface;
 use ReadyData\Import\Model\Processor\PreparableInterface;
 use ReadyData\Import\Model\Processor\ProcessorInterface;
 use ReadyData\Import\Model\ResourceModel\AttributeOption;
@@ -40,6 +41,19 @@ use ReadyData\Import\Model\ResourceModel\AttributeOption;
  * therefore waits for one transaction, and only if it is going to create the
  * same kind of thing. See {@see processBatch()}, {@see batchLocks()} and
  * {@see \ReadyData\Import\Model\Processor\LockAwareInterface}.
+ *
+ * A batch runs in four phases, and which of them a step takes part in is decided
+ * by the interfaces it implements:
+ *
+ * 1. {@see prepareBatch()} — PreparableInterface, outside the locks and the
+ *    transaction. Network and filesystem work.
+ * 2. {@see batchLocks()} then {@see acquireLocks()} — LockAwareInterface says
+ *    what this batch will actually create; the set is taken all-or-nothing.
+ * 3. {@see runLockedPreparation()} — LockedPreparableInterface, under the locks
+ *    but still outside the transaction. Writes that go through a repository
+ *    opening a transaction of its own, which cannot nest inside ours.
+ * 4. the transaction — ProcessorInterface::process() for every step, then
+ *    commit or rollback.
  */
 class ImportService
 {
@@ -200,10 +214,16 @@ class ImportService
         // Whether there is a transaction to roll back. beginTransaction() is
         // inside the try so a failure there still releases the locks, and calling
         // rollBack() after it would raise a second, misleading error on top of
-        // the real one.
+        // the real one. The locked-preparation phase below is inside the try for
+        // the same reason, and relies on the same flag.
         $opened = false;
 
         try {
+            // Under the locks, before the transaction: steps whose writes go
+            // through a repository that opens its own transaction, which cannot
+            // nest inside ours. See LockedPreparableInterface.
+            $this->runLockedPreparation($context);
+
             $connection->beginTransaction();
             $opened = true;
 
@@ -220,7 +240,18 @@ class ImportService
             if ($opened) {
                 $connection->rollBack();
             }
-            $context->failAll(sprintf('Batch %d rolled back: %s', $batchNumber + 1, $e->getMessage()));
+            $context->failAll(sprintf(
+                // Only say "rolled back" when there was something to roll back:
+                // a failure in the locked-preparation phase, or in
+                // beginTransaction() itself, happens before any transaction
+                // exists, and reporting a rollback that never occurred sends
+                // whoever reads this looking for the wrong thing.
+                $opened
+                    ? 'Batch %d rolled back: %s'
+                    : 'Batch %d failed before its transaction opened: %s',
+                $batchNumber + 1,
+                $e->getMessage()
+            ));
             $this->logger->error(
                 sprintf('Batch %d failed: %s', $batchNumber + 1, $e->getMessage()),
                 ['exception' => $e]
@@ -434,6 +465,29 @@ class ImportService
             $this->logger->error($message, ['exception' => $e]);
 
             return false;
+        }
+    }
+
+    /**
+     * The phase between the locks and the transaction: steps implementing
+     * LockedPreparableInterface write through code that opens a transaction of
+     * its own, which cannot nest inside the batch's.
+     *
+     * Deliberately does NOT catch. It runs inside {@see processBatch()}'s try, so
+     * a throw lands in the one handler that already knows whether a transaction
+     * was opened and releases the locks in its finally — catching here would
+     * duplicate that logic and lose the distinction.
+     *
+     * No assertConnectionAlive() either: {@see prepareBatch()} already probed,
+     * the locks were then taken on that live connection, and nothing idle has
+     * happened in between.
+     */
+    private function runLockedPreparation(BatchContext $context): void
+    {
+        foreach ($this->processors as $processor) {
+            if ($processor instanceof LockedPreparableInterface && $processor->isEnabled()) {
+                $processor->prepareUnderLocks($context);
+            }
         }
     }
 
