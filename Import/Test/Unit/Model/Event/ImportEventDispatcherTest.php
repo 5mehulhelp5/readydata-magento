@@ -163,7 +163,17 @@ class ImportEventDispatcherTest extends TestCase
     {
         $eventManager = $this->createMock(EventManager::class);
         $eventManager->method('dispatch')->willThrowException(new \RuntimeException('boom'));
-        $this->logger->expects(self::once())->method('error');
+
+        // Every dispatch throws, and each concern has a handler of its own, so
+        // both report: once for the per-product events and once for the
+        // batch-level custom ones. That separation is the point — one failing
+        // observer must not cost the other kind of event its dispatch — so the
+        // count is asserted per message rather than as a bare total.
+        $logged = [];
+        $this->logger->expects(self::exactly(2))->method('error')
+            ->willReturnCallback(function (string $message) use (&$logged): void {
+                $logged[] = $message;
+            });
 
         $dispatcher = new ImportEventDispatcher(
             $this->productFactory,
@@ -176,6 +186,14 @@ class ImportEventDispatcherTest extends TestCase
 
         // Must not throw.
         $dispatcher->dispatchAfterCommit($this->createContext(['SKU-A' => 1], existing: []));
+
+        self::assertStringContainsString('SKU-A', $logged[0]);
+        self::assertStringContainsString('boom', $logged[0]);
+        self::assertStringContainsString('Custom import event dispatch failed', $logged[1]);
+        // Never the outer "abandoned for the batch" handler: that one means
+        // buildProducts() failed and nothing was dispatched at all, which is a
+        // different event from an observer throwing.
+        self::assertStringNotContainsString('abandoned', $logged[0] . $logged[1]);
     }
 
     public function testCommitAfterObserverFailureDoesNotSkipOtherProducts(): void

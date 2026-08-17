@@ -188,7 +188,12 @@ class PooledDownloaderTest extends TestCase
         self::assertFalse($captured[0][RequestOptions::HTTP_ERRORS]);
         self::assertSame(3, $captured[0][RequestOptions::ALLOW_REDIRECTS]['max']);
         self::assertSame(['http', 'https'], $captured[0][RequestOptions::ALLOW_REDIRECTS]['protocols']);
-        self::assertIsResource($captured[0][RequestOptions::SINK]);
+        // A stream OBJECT, not the raw handle: every redirect hop reuses this one
+        // sink, and the options array is what keeps it alive for the whole
+        // transfer. Handing Guzzle a bare resource let it close the handle
+        // between hops, and the resulting "Invalid resource" came out of
+        // curl_multi_exec() where nothing in this module could catch it.
+        self::assertInstanceOf(StreamInterface::class, $captured[0][RequestOptions::SINK]);
     }
 
     public function testConcurrencyCapBoundsRequestsInFlight(): void

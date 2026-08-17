@@ -55,7 +55,7 @@ class CategoryLinkProcessorTest extends TestCase
      * onto each context by hand keeps every test exercising the real hand-off, so
      * the map's shape cannot drift between the two phases unnoticed.
      */
-    private function run(CategoryLinkProcessor $processor, BatchContext $context): void
+    private function resolveAndProcess(CategoryLinkProcessor $processor, BatchContext $context): void
     {
         $processor->prepareUnderLocks($context);
         $processor->process($context);
@@ -95,7 +95,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::once())->method('assign')
             ->with([['category_id' => 5, 'product_id' => 10, 'position' => 0]]);
 
-        $this->run($this->processor, $context);
+        $this->resolveAndProcess($this->processor, $context);
 
         self::assertSame([], $context->getMessages('SKU-1'));
         self::assertEqualsCanonicalizing(
@@ -119,7 +119,7 @@ class CategoryLinkProcessorTest extends TestCase
             ]);
         $this->categoryLink->expects(self::once())->method('assign')->with([]);
 
-        $this->run($this->processor, $context);
+        $this->resolveAndProcess($this->processor, $context);
     }
 
     public function testNullCategoriesTouchesNothing(): void
@@ -135,7 +135,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::never())->method('unassign');
         $this->categoryLink->expects(self::never())->method('assign');
 
-        $this->run($this->processor, $context);
+        $this->resolveAndProcess($this->processor, $context);
 
         self::assertNull($context->get(CategoryLinkProcessor::CONTEXT_AFFECTED_CATEGORY_IDS));
     }
@@ -154,7 +154,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::once())->method('assign')
             ->with([['category_id' => 5, 'product_id' => 10, 'position' => 0]]);
 
-        $this->run($this->processor, $context);
+        $this->resolveAndProcess($this->processor, $context);
 
         $messages = $context->getMessages('SKU-1');
         self::assertCount(2, $messages);
@@ -174,7 +174,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::once())->method('unassign')->with([]);
         $this->categoryLink->expects(self::once())->method('assign')->with([]);
 
-        $this->run($this->processor, $context);
+        $this->resolveAndProcess($this->processor, $context);
 
         $messages = $context->getMessages('SKU-1');
         self::assertCount(1, $messages);
@@ -189,7 +189,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->pathResolver->expects(self::never())->method('validateIds');
         $this->categoryLink->expects(self::never())->method('assign');
 
-        $this->run($this->processor, $context);
+        $this->resolveAndProcess($this->processor, $context);
     }
 
     public function testDuplicateAndEquivalentReferencesAreDeduplicated(): void
@@ -208,7 +208,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::once())->method('assign')
             ->with([['category_id' => 42, 'product_id' => 10, 'position' => 0]]);
 
-        $this->run($this->processor, $context);
+        $this->resolveAndProcess($this->processor, $context);
     }
 
     public function testEscapedSlashResolvesAsOneSegmentUnderTheCanonicalKey(): void
@@ -224,7 +224,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::once())->method('assign')
             ->with([['category_id' => 5, 'product_id' => 10, 'position' => 0]]);
 
-        $this->run($this->processor, $context);
+        $this->resolveAndProcess($this->processor, $context);
 
         self::assertSame([], $context->getMessages('SKU-1'));
     }
@@ -248,7 +248,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::once())->method('assign')
             ->with([['category_id' => 6, 'product_id' => 10, 'position' => 0]]);
 
-        $this->run($this->processor, $context);
+        $this->resolveAndProcess($this->processor, $context);
     }
 
     /**
@@ -273,7 +273,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::once())->method('assign')
             ->with([['category_id' => 30, 'product_id' => 10, 'position' => 0]]);
 
-        $this->run($this->processorWithScope(Config::REPLACE_SCOPE_PAYLOAD_ROOTS), $context);
+        $this->resolveAndProcess($this->processorWithScope(Config::REPLACE_SCOPE_PAYLOAD_ROOTS), $context);
 
         self::assertStringContainsString(
             'limited to root categories 29; 1 existing assignment(s) outside them were kept',
@@ -297,7 +297,7 @@ class CategoryLinkProcessorTest extends TestCase
             ['category_id' => 31, 'product_id' => 10],
         ]);
 
-        $this->run($this->processor, $context);
+        $this->resolveAndProcess($this->processor, $context);
 
         self::assertSame([], $context->getMessages('SKU-1'));
     }
@@ -318,7 +318,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::once())->method('unassign')
             ->with([['category_id' => 21, 'product_id' => 10]]);
 
-        $this->run($this->processorWithScope(Config::REPLACE_SCOPE_PAYLOAD_ROOTS), $context);
+        $this->resolveAndProcess($this->processorWithScope(Config::REPLACE_SCOPE_PAYLOAD_ROOTS), $context);
     }
 
     /**
@@ -336,7 +336,7 @@ class CategoryLinkProcessorTest extends TestCase
 
         $this->categoryLink->expects(self::once())->method('unassign')->with([]);
 
-        $this->run($this->processorWithScope(Config::REPLACE_SCOPE_PAYLOAD_ROOTS), $context);
+        $this->resolveAndProcess($this->processorWithScope(Config::REPLACE_SCOPE_PAYLOAD_ROOTS), $context);
 
         self::assertStringContainsString(
             'limited to no root categories, so nothing was removed; 1 existing assignment(s) were kept',
@@ -355,7 +355,7 @@ class CategoryLinkProcessorTest extends TestCase
 
         $this->categoryLink->expects(self::once())->method('unassign')->with([]);
 
-        $this->run($this->processor, $context);
+        $this->resolveAndProcess($this->processor, $context);
     }
 
     public function testANonRootInTheScopeIsReportedAndIgnored(): void
@@ -373,7 +373,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::once())->method('unassign')
             ->with([['category_id' => 21, 'product_id' => 10]]);
 
-        $this->run($this->processor, $context);
+        $this->resolveAndProcess($this->processor, $context);
 
         self::assertStringContainsString(
             'Ignored 21 in categories_replace_scope: not a root category.',
@@ -399,7 +399,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::once())->method('unassign')
             ->with([['category_id' => 21, 'product_id' => 10]]);
 
-        $this->run($this->processor, $context);
+        $this->resolveAndProcess($this->processor, $context);
     }
 
     /**
@@ -420,7 +420,7 @@ class CategoryLinkProcessorTest extends TestCase
 
         $this->categoryLink->expects(self::once())->method('unassign')->with([]);
 
-        $this->run($this->processor, $context);
+        $this->resolveAndProcess($this->processor, $context);
 
         self::assertStringContainsString('applied additively', $context->getMessages('SKU-1')[1]);
     }
@@ -446,7 +446,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->pathResolver->method('validateIds')->willReturn([]);
         $this->categoryLink->method('getAssignments')->willReturn([]);
 
-        $this->run($this->processor, $context);
+        $this->resolveAndProcess($this->processor, $context);
     }
 
     /**
@@ -470,7 +470,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->pathResolver->method('validateIds')->willReturn([]);
         $this->categoryLink->method('getAssignments')->willReturn([]);
 
-        $this->run($this->processor, $context);
+        $this->resolveAndProcess($this->processor, $context);
 
         self::assertSame([], $context->getMessages('SKU-1'));
     }
@@ -566,7 +566,7 @@ class CategoryLinkProcessorTest extends TestCase
         // links it already has.
         $this->categoryLink->expects(self::once())->method('unassign')->with([]);
 
-        $this->run($this->processor, $context);
+        $this->resolveAndProcess($this->processor, $context);
 
         $messages = $context->getMessages('SKU-1');
         self::assertStringContainsString('stopped resolving', $messages[0]);
@@ -602,7 +602,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::once())->method('assign')
             ->with([['category_id' => 42, 'product_id' => 11, 'position' => 0]]);
 
-        $this->run($this->processor, $context);
+        $this->resolveAndProcess($this->processor, $context);
 
         $messages = $context->getMessages('SKU-1');
         self::assertStringContainsString('already used by category ID 77', $messages[0]);
@@ -630,7 +630,7 @@ class CategoryLinkProcessorTest extends TestCase
         $this->categoryLink->expects(self::once())->method('assign')->with([]);
         $this->categoryLink->expects(self::once())->method('unassign')->with([]);
 
-        $this->run($this->processor, $context);
+        $this->resolveAndProcess($this->processor, $context);
 
         $messages = $context->getMessages('SKU-1');
         self::assertStringContainsString('was removed before its links could be written', $messages[0]);

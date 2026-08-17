@@ -364,7 +364,8 @@ class CategoryPathResolverTest extends TestCase
             $categoryResource,
             $this->categoryWriter,
             new RootCategoryRegistry($categoryResource),
-            $this->createMock(Logger::class)
+            $this->createMock(Logger::class),
+            $this->resourceConnection
         );
     }
 
@@ -460,7 +461,8 @@ class CategoryPathResolverTest extends TestCase
             $categoryResource,
             $this->categoryWriter,
             $registry = new RootCategoryRegistry($categoryResource),
-            $this->createMock(Logger::class)
+            $this->createMock(Logger::class),
+            $this->resourceConnection
         );
 
         $paths = ['Default Category/Men' => ['Default Category', 'Men']];

@@ -295,15 +295,7 @@ class UrlRewriteProcessorTest extends TestCase
             static fn (string $type, int $attrId, array $linkIds, int $storeId = 0): array =>
                 $type === 'int' && $attrId === 77 && $storeId === 0 ? [99 => 1] : []
         );
-        $this->processor = new UrlRewriteProcessor(
-            $this->urlRewriteResource,
-            $this->eavValue,
-            $this->attributeMetadataCache,
-            $this->storeWebsiteMap,
-            $this->config,
-            $this->categoryLink,
-            $this->categoryPathRewriteBuilder
-        );
+        $this->rebuildProcessor();
 
         $context = $this->createContext(['SKU-A' => 42], urlKey: 'white-shirt', linkIds: ['SKU-A' => 99]);
         $this->processor->process($context);
