@@ -246,31 +246,99 @@ the body, flip the flag.
 ## 7. Known risks / decisions to revisit
 
 - **EE (`row_id`) vs CE (`entity_id`):** always go through `MetadataPool` for the link
-  field; staging-aware writes are out of scope initially (documented limitation).
-- **Direct DB writes skip plugins/observers** other modules attach to product save —
-  by design, but must be a documented, loud caveat in README.
+  field — `ProductEntity::getLinkField()` and `Category::getLinkField()` are the only
+  two places that ask, and every other table write resolves through them. Staging-aware
+  writes remain out of scope, and the posture is now explicit rather than merely
+  documented: `EntityProcessor` refuses to **create** a product when
+  `ProductEntity::isStagingEnvironment()` is true (a per-product error, not a batch
+  failure), because a new row on a staged catalog needs `sequence_product` plus
+  `created_in`/`updated_in` handling. Updates work, since the row already exists. Media
+  and every satellite table are written against the product's *current* row with no
+  staging-update awareness.
+- **Direct DB writes skip plugins/observers** other modules attach to product save. Still
+  true at the write layer and still a loud README caveat, but no longer the whole story:
+  `ImportEventDispatcher` re-emits `catalog_product_save_commit_after` (default on) and
+  optionally `catalog_product_save_after` (default off) per product, plus four batch-level
+  `readydata_import_*` events. Two decisions that come with it are worth revisiting:
+  - the dispatched product is a **notification carrier** — no `origData`, no attribute
+    set, so `dataHasChangedFor()` reports everything changed and saving it corrupts.
+    Read-only by contract, enforced by nothing;
+  - `dispatch_save_after` runs **inside** the batch transaction, which hands a third
+    party the ability to roll back an import. Off by default for that reason.
+  - **Categories are the exception to the whole architecture:** they are saved through
+    the category model/repository, so category-save plugins and observers DO run — both
+    for on-demand creation during a product import and for the category endpoint.
+- **Category writes are transaction-coupled to the batch.** `CategoryRepository::save()`
+  opens its own transaction inside the batch's; when it fails, the connection is left
+  partially rolled back and every subsequent statement — including the COMMIT — fails
+  with an unrelated "Partial rollback is not supported". The failure is therefore
+  re-thrown so the batch rolls back cleanly with the real reason. The consequence is that
+  a product feed naming a category path whose slug is taken **fails its whole batch**
+  instead of reporting that one product, and `CategoryPathResolver`'s on-demand creation
+  is deliberately left without the sibling-collision guards the category endpoint has (it
+  has no per-entry result row to report a refusal into). Decoupling this would mean
+  creating categories outside the batch transaction, which trades a clean rollback for
+  committed categories on a failed batch.
 - **Concurrency:** two simultaneous imports of the same SKUs can corrupt each other
-  wherever there is an unkeyed read-then-create. Guarded by four named locks (via
-  `Magento\Framework\Lock\LockManagerInterface`, see `ImportLocks`), each taken per
-  BATCH and only by the batches whose payload can reach it — never across image
-  downloads or indexing. The remaining step is per-KEY exclusion instead of named
-  locks, which would let overlapping imports of disjoint SKUs stop contending
-  altogether; it needs an isolation-level audit (gap locks do not exist under READ
-  COMMITTED) and a two-connection test harness this module does not have. Async
-  queue-based imports remain the other future path.
+  wherever there is an unkeyed read-then-create. Guarded by named locks (via
+  `Magento\Framework\Lock\LockManagerInterface`, see `ImportLocks`): five names, four of
+  which the product pipeline can reach — options, product rows, the category tree, the
+  gallery — plus `ATTRIBUTE_SYNC`, held by the attribute endpoint alone. A set is acquired
+  all-or-nothing in one fixed order, per BATCH, held only for that batch's transaction —
+  never across image downloads, indexing or after-commit events.
+
+  What a batch takes is decided by `LockAwareInterface::requiredLocks()`, which probes
+  what is actually **missing** rather than what the payload carries, so a steady-state
+  push whose categories and options all exist takes nothing at all and runs fully
+  concurrently. `MediaProcessor` is the one step still on payload presence — being exact
+  there needs a desired-vs-existing diff against link IDs that do not exist yet at lock
+  time. Because the probes read before the lock, a create the batch never reserved for is
+  reported rather than performed; the retry's probe sees the gap.
+
+  Two things remain open. **Per-KEY exclusion** instead of named locks would let
+  overlapping imports of disjoint SKUs stop contending altogether; it needs an
+  isolation-level audit (gap locks do not exist under READ COMMITTED) and a
+  two-connection test harness this module does not have. And **`MediaProcessor`'s
+  conservatism** is a measured 251 ms held on every batch carrying a `media` field,
+  including `[]`.
+- **`url_rewrite` conflict resolution is not covered by any lock.** The table is unique on
+  `(request_path, store_id)`, so concurrency cannot duplicate a rewrite — but the
+  conflict set is read before the write, which makes the `error` and `append` strategies
+  unreliable under concurrency and can leave the loser's request path pointing at the
+  other product. Per-batch, probe-decided locking deliberately widened that window in
+  exchange for throughput. The fix is either a lock of its own or upsert-and-retry on the
+  unique key; neither is written.
 - **Async mode:** for very large feeds, accept-and-queue (bulk API pattern with
-  `operation` status endpoint) is the planned expansion — hence the status endpoint
-  placeholder.
+  `operation` status endpoint) is still the planned expansion. Nothing of it exists yet —
+  the `products/delete` and `import/:id/status` routes sit commented out in
+  `etc/webapi.xml` with no interfaces behind them.
 - **Media `value_id` read-back:** a gallery row has no natural key, so the watermark
-  re-select is not provably unambiguous — a concurrent admin product save can interleave
-  its own rows. Guarded by three stacked predicates plus a positional `value` comparison
-  that THROWS rather than guessing, which rolls the batch back: the rows are already
-  inserted and cannot be identified, so degrading would commit unbound orphan gallery
-  rows that every retry would duplicate. If it ever fires in the field, the escalation is
-  per-row `insert()` + `lastInsertId()` for new files only.
+  re-select is not provably unambiguous — a concurrent **admin** product save can still
+  interleave its own rows (the `MEDIA_GALLERY` lock only serializes this module against
+  itself; core does not take it). Guarded by three stacked predicates —
+  `value_id > watermark`, matching `attribute_id`, no `_value_to_entity` binding — plus a
+  positional `value` comparison that THROWS rather than guessing, which rolls the batch
+  back: the rows are already inserted and cannot be identified, so degrading would commit
+  unbound orphan gallery rows that every retry would duplicate. If it ever fires in the
+  field, the escalation is per-row `insert()` + `lastInsertId()` for new files only.
 - **Orphan media files:** a rolled-back batch leaves whatever `prepare()` downloaded in
-  `pub/media`. Deterministic target paths make retries converge on the same file instead
-  of accumulating copies, but nothing garbage-collects the unreferenced ones.
-- **Media downloads are synchronous**, bounded per batch and capped by *Download
-  Concurrency*. The async path above is also the answer for large first-time image
-  imports.
+  `pub/media`. Deterministic target paths (sanitised name + a digest of the URL) make
+  retries converge on the same file instead of accumulating copies, but nothing
+  garbage-collects the unreferenced ones. Likewise `removed_files` on the media event is
+  "detached from the products in this batch", not "safe to delete" — a disk-level GC
+  needs its own reference check.
+- **Media downloads are per-request**, bounded per batch and run concurrently up to
+  *Download Concurrency* (default 4). The async path above is still the answer for large
+  first-time image imports; until then `batch_size` and `max_execution_time` are what
+  keep a request inside its timeout.
+- **Image URLs are fetched by the store.** With *Allowed Download Hosts* empty, a
+  compromised feed can make the store request any URL it can reach. Extension filtering,
+  signature verification, size/timeout/redirect caps and per-hop allow-list enforcement
+  are all in place; **DNS rebinding and IP-literal hosts are not solved**. The default
+  being an empty allow-list is the decision to revisit.
+
+> **Section drift:** the `[P]` markers in §1, §5 and §6 are stale. Every pipeline step is
+> implemented — `CategoryLinkProcessor`, `LinkProcessor` and `ConfigurableProcessor`
+> included — and the module has grown two endpoints the plan never described (attribute
+> definitions, category sync) plus an Amasty writer, an event layer and two suppression
+> plugins. `AbstractPlaceholderProcessor` survives as a base class with no subclasses.
