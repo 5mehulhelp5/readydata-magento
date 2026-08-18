@@ -15,6 +15,7 @@ use ReadyData\Import\Model\ResourceModel\ProductEntity;
 class EavValue
 {
     private const INSERT_CHUNK = 1000;
+    private const READ_CHUNK = 1000;
 
     public const BACKEND_TYPES = ['varchar', 'int', 'decimal', 'text', 'datetime'];
 
@@ -88,6 +89,54 @@ class EavValue
         }
 
         return $values;
+    }
+
+    /**
+     * Narrow a set of values to those still stored for any of the given
+     * attributes, in ANY store scope and on ANY product.
+     *
+     * The inverse direction of {@see getValues()}: that one asks "what do these
+     * products have", this one asks "does anything still hold these values". It
+     * exists for the media reference check, where an image role attribute pointing
+     * at a file is a reference just as much as a gallery row is, and the products
+     * doing the pointing are precisely the ones the caller does not know about.
+     *
+     * No liveness join is needed: the value tables' FK onto catalog_product_entity
+     * is ON DELETE CASCADE, so a surviving row names a surviving product. (The
+     * media gallery's main table is the one place in the schema where that is not
+     * true — see ProductMediaGallery::findReferencedFiles().)
+     *
+     * @param string $backendType one of BACKEND_TYPES
+     * @param int[] $attributeIds
+     * @param string[] $values
+     * @return string[] the subset still stored, as a list
+     */
+    public function findValuesInUse(string $backendType, array $attributeIds, array $values): array
+    {
+        if (!$attributeIds || !$values) {
+            return [];
+        }
+        if (!in_array($backendType, self::BACKEND_TYPES, true)) {
+            throw new \InvalidArgumentException(sprintf('Unsupported EAV backend type "%s".', $backendType));
+        }
+
+        $connection = $this->resourceConnection->getConnection();
+        $table = $this->resourceConnection->getTableName('catalog_product_entity_' . $backendType);
+        $inUse = [];
+
+        foreach (array_chunk(array_values($values), self::READ_CHUNK) as $chunk) {
+            $select = $connection->select()
+                ->distinct()
+                ->from($table, ['value'])
+                ->where('attribute_id IN (?)', $attributeIds)
+                ->where('value IN (?)', $chunk);
+
+            foreach ($connection->fetchCol($select) as $value) {
+                $inUse[] = (string)$value;
+            }
+        }
+
+        return $inUse;
     }
 
     /**

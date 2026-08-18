@@ -1630,6 +1630,47 @@ Two things it does not report: a re-download that replaced the **bytes** behind
 an existing path (the path is unchanged — see *Re-Download Existing Files*), and
 removals of legacy junk rows whose stored path was NULL or a duplicate.
 
+### Checking whether a media file is still referenced
+
+`removed_files` keeps the meaning above, so `ReadyData\Import\Api\MediaReferenceCheckerInterface`
+is the supported way to turn it into a decision. Pass the whole array — it is
+batched on purpose:
+
+```php
+$deletable = $this->mediaReferenceChecker->getUnreferenced($event->getData('removed_files'));
+```
+
+It counts two kinds of reference: a gallery row **bound** to a product, and a
+value of any configured image role attribute (`image`, `small_image`,
+`thumbnail`, `swatch_image`) in **any** store scope — a role can point at a file
+whose gallery row belongs to a different product. A store with a role attribute
+of its own adds its code to `roleAttributeCodes` in `etc/di.xml`; a role holding
+a path is a reference, and one left off the list is one the check cannot see.
+
+Requiring the *binding* is what separates this from core's
+`Gallery::countImageUses()`, which counts rows in
+`catalog_product_entity_media_gallery` by path alone. Core never cleans up after
+a product delete — `Magento\Catalog\Model\Product\Gallery\DeleteHandler` exists
+but is not wired into the entity manager's `delete` actions — so a deleted
+product leaves its gallery row behind, unbound, still carrying the path. Counted
+naively, those dead rows report every such file as in use forever.
+
+Two limits worth knowing before deleting anything on the strength of it. Only
+**product** references are visible: CMS pages and blocks, `{{media url=...}}` in
+a description, category images and third-party tables are not checked, so
+"unreferenced" is not "provably unused store-wide". And the answer is a
+point-in-time read taken outside any transaction — a concurrent import or admin
+save can add a reference immediately after. Core's admin path has the same blind
+spot and deletes anyway, but it does so one image at a time on a human's
+decision, where a batch can detach thousands; leaving a grace period rather than
+acting the instant the event fires is the safer shape. Note also that deleting a
+source file leaves its resized renditions under
+`pub/media/catalog/product/cache` behind (core purges those separately, via
+`Magento\Catalog\Model\Product\Image\RemoveDeletedImagesFromCache`).
+
+The module itself never deletes a media file — see *Orphan media files* in
+`PLAN.md` for why that is a scoping decision rather than an omission.
+
 ## Extending the pipeline
 
 No placeholder steps remain — every dimension in the pipeline is implemented.

@@ -528,12 +528,48 @@ and integration tests.
   back: the rows are already inserted and cannot be identified, so degrading would commit
   unbound orphan gallery rows that every retry would duplicate. If it ever fires in the
   field, the escalation is per-row `insert()` + `lastInsertId()` for new files only.
-- **Orphan media files:** a rolled-back batch leaves whatever `prepare()` downloaded in
-  `pub/media`. Deterministic target paths (sanitised name + a digest of the URL) make
-  retries converge on the same file instead of accumulating copies, but nothing
-  garbage-collects the unreferenced ones. Likewise `removed_files` on the media event is
-  "detached from the products in this batch", not "safe to delete" — a disk-level GC
-  needs its own reference check.
+- **Orphan media files are accepted, and the module deletes nothing from `pub/media`.**
+  This is a scoping decision, not a missing feature, and it rests on where the orphans
+  actually come from.
+
+  A rolled-back batch leaves whatever `prepare()` downloaded on disk, because downloads
+  run before the transaction opens and a file write cannot be rolled back. But
+  deterministic target paths (sanitised name + a digest of the URL) make that
+  self-healing: the retry resolves to the same path, `skip-if-present` adopts the file
+  without a request, and the gallery diff matches the stored row. The orphan only
+  persists if the SKU is never pushed again.
+
+  The larger pile is not ours and cannot be. **Core never cleans up after a product
+  delete** — `Magento\Catalog\Model\Product\Gallery\DeleteHandler` exists but is not
+  wired into the entity manager's `delete` actions (`ExtensionPool` in
+  `module-catalog/etc/di.xml` registers gallery handlers under `read`/`create`/`update`
+  only) — so deleting a product cascades away its `_value` and `_value_to_entity` rows,
+  leaves the **main gallery row** behind (its only FK is on `attribute_id`), and leaves
+  the file and its `catalog/product/cache` renditions untouched. Ordinary admin churn
+  adds more. A GC scoped to what this module recorded could never collect any of it, so
+  it would buy the module's first `db_schema.xml` and `crontab.xml` while the dominant
+  source kept growing. The tool that would address disk usage is a store-wide
+  mark-and-sweep, which is a different piece of software and has to be opt-in and
+  report-only by default: WYSIWYG content, category images and third-party tables all
+  reference media that no gallery query can see.
+
+  What *is* implemented is the primitive every one of those options needs:
+  `Api\MediaReferenceCheckerInterface` (see the README), so a consumer of
+  `removed_files` can decide safely instead of guessing. Note that core's own
+  `Gallery::countImageUses()` cannot serve this purpose — it counts rows by path with no
+  regard for binding, so the dead rows a product delete leaves behind report every such
+  file as permanently in use. Requiring the `_value_to_entity` binding is the fix.
+
+  Two follow-ups, both deliberately not written. An **opt-in "delete detached files"
+  setting**, matching what core's admin path already does on a gallery edit
+  (`UpdateHandler::removeDeletedImages()`, gated on `countImageUses() <= 1`, plus the
+  cache purge) — the reason it is a flag and not the default is blast radius: admin
+  detaches one image on a human's decision, a batch can detach thousands. It would have
+  to run **after** the commit, on the same hook as the media event, since a rolled-back
+  batch must not have deleted anything. And a **quarantine table with a grace period**,
+  which is what makes such a delete safe against the point-in-time nature of the
+  reference check; it earns its schema once a store reports a problem the flag causes,
+  not before.
 - **Media downloads are per-request**, bounded per batch and run concurrently up to
   *Download Concurrency* (default 4). The async path above is still the answer for large
   first-time image imports; until then `batch_size` and `max_execution_time` are what

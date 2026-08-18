@@ -26,6 +26,9 @@ class ProductMediaGalleryTest extends TestCase
     private ProductEntity&MockObject $productEntity;
     private ProductMediaGallery $resource;
 
+    /** @var array<int, array{0: string, 1: array<int, mixed>}> every Select call made, in order */
+    private array $selectCalls = [];
+
     protected function setUp(): void
     {
         $this->connection = $this->createMock(AdapterInterface::class);
@@ -284,6 +287,63 @@ class ProductMediaGalleryTest extends TestCase
         $this->resource->removeEntries([['value_id' => 501, 'link_id' => 10]]);
     }
 
+    public function testFindReferencedFilesReturnsOnlyWhatIsStillBoundToAProduct(): void
+    {
+        $this->connection->expects(self::once())->method('fetchCol')->willReturn(['/a/a/one.jpg']);
+
+        $referenced = $this->resource->findReferencedFiles(['/a/a/one.jpg', '/b/b/two.jpg']);
+
+        self::assertSame(['/a/a/one.jpg'], $referenced);
+        self::assertSame([[['g' => self::T_GALLERY], ['value']]], $this->recordedCalls('from'));
+        self::assertSame([['g.value IN (?)', ['/a/a/one.jpg', '/b/b/two.jpg']]], $this->recordedCalls('where'));
+    }
+
+    /**
+     * The binding join is the entire difference from core's countImageUses(): a
+     * gallery row with no _value_to_entity row is what a product delete leaves
+     * behind, and treating it as a use makes the file permanently un-collectable.
+     * An INNER join is what excludes it — joinLeft here would be the core bug.
+     */
+    public function testFindReferencedFilesRequiresTheBindingWithAnInnerJoin(): void
+    {
+        $this->connection->method('fetchCol')->willReturn([]);
+
+        $this->resource->findReferencedFiles(['/a/a/one.jpg']);
+
+        self::assertSame([[['b' => self::T_BIND], 'b.value_id = g.value_id', []]], $this->recordedCalls('join'));
+        self::assertSame([], $this->recordedCalls('joinLeft'));
+    }
+
+    public function testFindReferencedFilesQueriesNothingForAnEmptySet(): void
+    {
+        $this->connection->expects(self::never())->method('fetchCol');
+
+        self::assertSame([], $this->resource->findReferencedFiles([]));
+    }
+
+    /**
+     * The IN list is bounded, so a whole batch's removed_files cannot be sent as
+     * one statement.
+     */
+    public function testFindReferencedFilesChunksLargeInputs(): void
+    {
+        $files = [];
+        for ($i = 0; $i < 2001; $i++) {
+            $files[] = sprintf('/a/a/f%d.jpg', $i);
+        }
+
+        $this->connection->expects(self::exactly(3))->method('fetchCol')->willReturn([]);
+
+        self::assertSame([], $this->resource->findReferencedFiles($files));
+        self::assertSame(
+            [1000, 1000, 1],
+            array_map(
+                static fn (array $args): int => count($args[1]),
+                $this->recordedCalls('where')
+            )
+        );
+    }
+
     public function testGetGalleryUsesTheLinkFieldAndMapsRows(): void
     {
         $productEntity = $this->createMock(ProductEntity::class);
@@ -415,13 +475,47 @@ class ProductMediaGalleryTest extends TestCase
         ];
     }
 
+    /**
+     * Chainable Select stub that also records what was built on it, so a test can
+     * assert on the query shape as well as on the mapped result.
+     */
     private function passthroughSelect(): Select&MockObject
     {
         $select = $this->createMock(Select::class);
-        foreach (['from', 'join', 'joinLeft', 'columns', 'where', 'order', 'limit'] as $method) {
-            $select->method($method)->willReturnSelf();
+        foreach (['from', 'join', 'joinLeft', 'columns', 'where', 'order', 'limit', 'distinct'] as $method) {
+            $select->method($method)->willReturnCallback(
+                function (...$args) use ($select, $method): Select&MockObject {
+                    $this->selectCalls[] = [$method, $args];
+
+                    return $select;
+                }
+            );
         }
 
         return $select;
+    }
+
+    /**
+     * Trailing nulls are dropped: a mocked method hands the callback its FULL
+     * signature, so Select::from($name, $cols, $schema) records a third null the
+     * caller never passed. Only the arguments actually supplied are of interest.
+     *
+     * @param string $method Select method to collect the arguments of
+     * @return array<int, array<int, mixed>> argument lists, in call order
+     */
+    private function recordedCalls(string $method): array
+    {
+        $calls = [];
+        foreach ($this->selectCalls as [$called, $args]) {
+            if ($called !== $method) {
+                continue;
+            }
+            while ($args !== [] && end($args) === null) {
+                array_pop($args);
+            }
+            $calls[] = $args;
+        }
+
+        return $calls;
     }
 }

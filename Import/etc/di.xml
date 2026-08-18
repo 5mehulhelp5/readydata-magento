@@ -81,6 +81,33 @@
         </arguments>
     </type>
 
+    <!--
+        "Is this media file still referenced?", for consumers of
+        readydata_import_product_media_changed acting on removed_files.
+
+        The role list is what makes the check complete for a given store: a custom
+        image role attribute holding a path is a reference, and appending its code
+        here is how the check learns about it. Removing one narrows the check and
+        makes false "unreferenced" answers more likely.
+
+        It defaults to the same four codes as MediaProcessor::ROLE_CODES but is a
+        separate list on purpose: that one is "roles the importer writes", this one
+        is "roles that count as a reference", and a store's own role attribute
+        belongs in the second without belonging in the first.
+    -->
+    <preference for="ReadyData\Import\Api\MediaReferenceCheckerInterface"
+                type="ReadyData\Import\Model\Media\MediaReferenceChecker"/>
+    <type name="ReadyData\Import\Model\Media\MediaReferenceChecker">
+        <arguments>
+            <argument name="roleAttributeCodes" xsi:type="array">
+                <item name="image" xsi:type="string">image</item>
+                <item name="small_image" xsi:type="string">small_image</item>
+                <item name="thumbnail" xsi:type="string">thumbnail</item>
+                <item name="swatch_image" xsi:type="string">swatch_image</item>
+            </argument>
+        </arguments>
+    </type>
+
     <!-- Dedicated log file: var/log/readydata_import.log -->
     <type name="ReadyData\Import\Logger\Logger">
         <arguments>

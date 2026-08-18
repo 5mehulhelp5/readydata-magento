@@ -161,6 +161,49 @@ class ProductMediaGallery
     }
 
     /**
+     * Narrow a set of stored paths to those a product still has in its gallery.
+     *
+     * The INNER JOIN onto _value_to_entity is the whole point of this method, and
+     * the one difference from core's Gallery::countImageUses(), which counts rows
+     * in the main table by path alone. A product delete cascades the _value and
+     * _value_to_entity rows away but leaves the main gallery row — its only FK is
+     * on attribute_id — so counting unjoined rows reports a deleted product's
+     * leftovers as live uses. Requiring the binding also needs no separate
+     * liveness check: _value_to_entity's FK onto catalog_product_entity is
+     * ON DELETE CASCADE, so a binding that exists names a product that exists.
+     *
+     * @param string[] $files stored paths ("/a/b/file.jpg")
+     * @return string[] the subset still bound to a product, as a list
+     */
+    public function findReferencedFiles(array $files): array
+    {
+        if (!$files) {
+            return [];
+        }
+
+        $connection = $this->resourceConnection->getConnection();
+        $referenced = [];
+
+        foreach (array_chunk(array_values($files), self::CHUNK) as $chunk) {
+            $select = $connection->select()
+                ->distinct()
+                ->from(['g' => $this->resourceConnection->getTableName(self::T_GALLERY)], ['value'])
+                ->join(
+                    ['b' => $this->resourceConnection->getTableName(self::T_VALUE_TO_ENTITY)],
+                    'b.value_id = g.value_id',
+                    []
+                )
+                ->where('g.value IN (?)', $chunk);
+
+            foreach ($connection->fetchCol($select) as $value) {
+                $referenced[] = (string)$value;
+            }
+        }
+
+        return $referenced;
+    }
+
+    /**
      * Insert gallery rows and return their generated value_ids, keyed exactly as
      * $rows was.
      *
