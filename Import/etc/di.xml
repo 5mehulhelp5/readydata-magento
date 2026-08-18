@@ -108,6 +108,34 @@
         </arguments>
     </type>
 
+    <!--
+        The read-only orphan-media report (PLAN.md §9.1). Same four role codes as
+        MediaReferenceChecker above — the two lists answer the same question and
+        must stay in step; a single shared value object would be the cleaner fix
+        if phase two ever ships.
+    -->
+    <type name="ReadyData\Import\Model\ResourceModel\MediaOrphanScan">
+        <arguments>
+            <argument name="roleAttributeCodes" xsi:type="array">
+                <item name="image" xsi:type="string">image</item>
+                <item name="small_image" xsi:type="string">small_image</item>
+                <item name="thumbnail" xsi:type="string">thumbnail</item>
+                <item name="swatch_image" xsi:type="string">swatch_image</item>
+            </argument>
+        </arguments>
+    </type>
+
+    <!-- CLI -->
+    <type name="Magento\Framework\Console\CommandListInterface">
+        <arguments>
+            <argument name="commands" xsi:type="array">
+                <item name="readydata_import_media_report_orphans" xsi:type="object">
+                    ReadyData\Import\Console\ReportOrphanMediaCommand
+                </item>
+            </argument>
+        </arguments>
+    </type>
+
     <!-- Dedicated log file: var/log/readydata_import.log -->
     <type name="ReadyData\Import\Logger\Logger">
         <arguments>
