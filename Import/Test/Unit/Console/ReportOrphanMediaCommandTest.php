@@ -133,23 +133,48 @@ class ReportOrphanMediaCommandTest extends TestCase
     }
 
     /**
-     * media_gallery_asset never holds product images on a stock store, because
-     * Magento_MediaGalleryCatalog excludes catalog/product from synchronisation.
-     * Reported as "by design" — an alarm that fires everywhere is not an alarm —
-     * but the CMS blind spot it leaves open still has to be said out loud.
+     * The same miss rate that condemns the report above is benign when the files
+     * that ARE present matched: the conventions agree and the misses are images
+     * this environment does not have. A staging copy with a production database
+     * and a pruned media directory looks exactly like this, and reading it as a
+     * normalisation failure — which the first version of this guard did — makes
+     * the alarm useless everywhere it matters.
      */
-    public function testAnEmptyContentSourceIsExplainedRatherThanFlaggedAsBroken(): void
+    public function testAHighMissRateWithMatchesIsReportedAsMissingMediaAndStillSucceeds(): void
     {
         $this->scanner->method('scan')->willReturn($this->report(
-            assetRowsUnderBasePath: 0,
-            mediaGalleryCatalogEnabled: true
+            scannedFiles: 2,
+            referencesLoaded: [MediaOrphanScan::SOURCE_GALLERY => 16614],
+            referencedCandidates: [MediaOrphanScan::SOURCE_GALLERY => 2],
+            missingReferences: [MediaOrphanScan::SOURCE_GALLERY => 16612]
         ));
 
-        $display = $this->runCommand()->getDisplay();
+        $tester = $this->runCommand();
 
-        self::assertStringContainsString('excludes catalog/product', $display);
-        self::assertStringContainsString('upper bound', $display);
+        self::assertSame(Command::SUCCESS, $tester->getStatusCode());
+        $display = $tester->getDisplay();
         self::assertStringNotContainsString('DO NOT TRUST', $display);
+        self::assertStringContainsString('16612 gallery references point at files that are not on disk', $display);
+        self::assertStringContainsString('images this environment does not have', $display);
+    }
+
+    /**
+     * The condemning case is specifically "files were present and none of them
+     * matched", not "the rate is high".
+     */
+    public function testAnEmptyMediaDirectoryIsNotTreatedAsBroken(): void
+    {
+        $this->scanner->method('scan')->willReturn($this->report(
+            scannedFiles: 0,
+            referencesLoaded: [MediaOrphanScan::SOURCE_GALLERY => 16614],
+            missingReferences: [MediaOrphanScan::SOURCE_GALLERY => 16614],
+            orphansByAge: ['>180d' => ['files' => 0, 'bytes' => 0]]
+        ));
+
+        $tester = $this->runCommand();
+
+        self::assertSame(Command::SUCCESS, $tester->getStatusCode());
+        self::assertStringNotContainsString('DO NOT TRUST', $tester->getDisplay());
     }
 
     public function testUnboundGalleryRowsAreSurfacedAsCoresLeftovers(): void
@@ -221,29 +246,23 @@ class ReportOrphanMediaCommandTest extends TestCase
         int $scannedFiles = 10,
         int $scannedBytes = 100,
         array $excluded = [],
-        int $dispersedFiles = 10,
         ?array $skipped = null,
         array $referencesLoaded = [],
         array $referencedCandidates = [],
         array $missingReferences = [],
         array $orphansByAge = [],
         int $unboundGalleryRows = 0,
-        int $assetRowsUnderBasePath = 0,
-        bool $mediaGalleryCatalogEnabled = false
     ): OrphanReport {
         return new OrphanReport(
             $scannedFiles,
             $scannedBytes,
             $excluded ?: ['cache' => ['files' => 0, 'bytes' => 0]],
-            $dispersedFiles,
             $skipped ?? ['too_long' => 0, 'vanished' => 0, 'unreadable' => 0, 'outside_tree' => 0],
             $referencesLoaded ?: [MediaOrphanScan::SOURCE_GALLERY => 10],
             $referencedCandidates,
             $missingReferences,
             $orphansByAge ?: ['>180d' => ['files' => 1, 'bytes' => 10]],
-            $unboundGalleryRows,
-            $assetRowsUnderBasePath,
-            $mediaGalleryCatalogEnabled
+            $unboundGalleryRows
         );
     }
 }

@@ -59,17 +59,11 @@ class MediaOrphanScan
 
     private const T_GALLERY = 'catalog_product_entity_media_gallery';
     private const T_VALUE_TO_ENTITY = 'catalog_product_entity_media_gallery_value_to_entity';
-    private const T_GALLERY_ASSET = 'media_gallery_asset';
-    private const T_CONTENT_ASSET = 'media_content_asset';
 
     public const SOURCE_GALLERY = 1;
     public const SOURCE_ROLE = 2;
-    public const SOURCE_CONTENT = 3;
 
     private const CHUNK = 1000;
-
-    /** @var array<string, bool> memoised isTableExists() answers */
-    private array $tableExists = [];
 
     /**
      * @param string[] $roleAttributeCodes image role attributes whose value is
@@ -79,7 +73,6 @@ class MediaOrphanScan
     public function __construct(
         private readonly ResourceConnection $resourceConnection,
         private readonly AttributeMetadataCache $attributeMetadataCache,
-        private readonly MediaPathNormalizer $normalizer,
         private readonly Logger $logger,
         private readonly array $roleAttributeCodes = []
     ) {
@@ -170,7 +163,6 @@ class MediaOrphanScan
         return [
             self::SOURCE_GALLERY => $this->loadGalleryReferences(),
             self::SOURCE_ROLE => $this->loadRoleReferences(),
-            self::SOURCE_CONTENT => $this->loadContentReferences(),
         ];
     }
 
@@ -225,47 +217,6 @@ class MediaOrphanScan
         }
 
         return $inserted;
-    }
-
-    /**
-     * Media-gallery content links: CMS pages, blocks and descriptions that
-     * reference an asset.
-     *
-     * Expect ZERO on a stock store. Magento_MediaGalleryCatalog's directory.xml
-     * excludes /^catalog\/product/ from gallery synchronisation, so no product
-     * image ever gets an asset row and nothing can link to one. The pass is
-     * still run because it is one indexed insert and it is correct on a store
-     * that removed the exclusion or carries a pre-existing asset table — but a
-     * zero here means "excluded by design", not "sync is broken", and the
-     * caller must present it that way. See countAssetRowsUnderBasePath().
-     *
-     * The prefix is stripped by the configured base path's real length rather
-     * than a literal, so a store whose base path is not catalog/product does
-     * not silently produce paths cut in the wrong place.
-     */
-    private function loadContentReferences(): int
-    {
-        if (!$this->hasTable(self::T_GALLERY_ASSET) || !$this->hasTable(self::T_CONTENT_ASSET)) {
-            return 0;
-        }
-
-        $connection = $this->resourceConnection->getConnection();
-        $offset = $this->normalizer->basePathLength() + 1;
-        $select = $connection->select()
-            ->distinct()
-            ->from(['a' => $this->resourceConnection->getTableName(self::T_GALLERY_ASSET)], [])
-            ->join(
-                ['c' => $this->resourceConnection->getTableName(self::T_CONTENT_ASSET)],
-                'c.asset_id = a.id',
-                []
-            )
-            ->columns([
-                'path' => new \Zend_Db_Expr(sprintf('SUBSTRING(a.path, %d)', $offset)),
-                'source' => new \Zend_Db_Expr((string)self::SOURCE_CONTENT),
-            ])
-            ->where('a.path LIKE ?', $this->normalizer->basePath() . '/%');
-
-        return $this->insertIgnoreFromSelect($select);
     }
 
     /**
@@ -426,27 +377,6 @@ class MediaOrphanScan
     }
 
     /**
-     * Asset rows under the product media path. Context for the content
-     * source's zero: none here means the media gallery excludes catalog/product
-     * (the stock configuration), not that synchronisation has failed.
-     */
-    public function countAssetRowsUnderBasePath(): int
-    {
-        if (!$this->hasTable(self::T_GALLERY_ASSET)) {
-            return 0;
-        }
-
-        $connection = $this->resourceConnection->getConnection();
-        $select = $connection->select()
-            ->from($this->resourceConnection->getTableName(self::T_GALLERY_ASSET), [
-                'total' => new \Zend_Db_Expr('COUNT(*)'),
-            ])
-            ->where('path LIKE ?', $this->normalizer->basePath() . '/%');
-
-        return (int)$connection->fetchOne($select);
-    }
-
-    /**
      * INSERT IGNORE, so a path already recorded for the same source is dropped
      * on the primary key rather than aborting the pass.
      *
@@ -470,7 +400,7 @@ class MediaOrphanScan
      */
     private function fetchCountsBySource(Select $select): array
     {
-        $counts = [self::SOURCE_GALLERY => 0, self::SOURCE_ROLE => 0, self::SOURCE_CONTENT => 0];
+        $counts = [self::SOURCE_GALLERY => 0, self::SOURCE_ROLE => 0];
         foreach ($this->resourceConnection->getConnection()->fetchAll($select) as $row) {
             $counts[(int)$row['source']] = (int)$row['total'];
         }
@@ -514,17 +444,6 @@ class MediaOrphanScan
 
             throw $e;
         }
-    }
-
-    private function hasTable(string $table): bool
-    {
-        if (!isset($this->tableExists[$table])) {
-            $this->tableExists[$table] = $this->resourceConnection->getConnection()->isTableExists(
-                $this->resourceConnection->getTableName($table)
-            );
-        }
-
-        return $this->tableExists[$table];
     }
 
     /**

@@ -9,7 +9,6 @@ namespace ReadyData\Import\Model\Media\Cleanup;
 use Magento\Framework\App\Filesystem\DirectoryList;
 use Magento\Framework\Exception\LocalizedException;
 use Magento\Framework\Filesystem;
-use Magento\Framework\Module\ModuleListInterface;
 use Magento\MediaStorage\Helper\File\Storage\Database as StorageDatabase;
 use ReadyData\Import\Logger\Logger;
 use ReadyData\Import\Model\ResourceModel\MediaOrphanScan;
@@ -31,7 +30,6 @@ use ReadyData\Import\Model\ResourceModel\MediaOrphanScan;
  */
 class OrphanScanner
 {
-    private const MEDIA_GALLERY_CATALOG_MODULE = 'Magento_MediaGalleryCatalog';
     private const ORPHAN_PAGE_SIZE = 1000;
 
     private const DAY = 86400;
@@ -43,7 +41,6 @@ class OrphanScanner
         private readonly MediaOrphanScan $scan,
         private readonly StorageDatabase $storageDatabase,
         private readonly Filesystem $filesystem,
-        private readonly ModuleListInterface $moduleList,
         private readonly Logger $logger
     ) {
     }
@@ -134,15 +131,12 @@ class OrphanScanner
                 $totals['included']['files'],
                 $totals['included']['bytes'],
                 $totals['excluded'],
-                $totals['dispersed'],
                 $totals['skipped'],
                 $referencesLoaded,
                 $this->scan->countReferencedCandidates(),
                 $this->scan->countMissingReferences(),
                 $this->scan->aggregateOrphansByAge($this->ageBoundaries(), self::BUCKET_OLDEST, self::BUCKET_UNKNOWN),
-                $this->scan->countUnboundGalleryRows(),
-                $this->scan->countAssetRowsUnderBasePath(),
-                $this->moduleList->has(self::MEDIA_GALLERY_CATALOG_MODULE)
+                $this->scan->countUnboundGalleryRows()
             );
 
             if ($onOrphanPath !== null) {

@@ -6,7 +6,6 @@ declare(strict_types=1);
 
 namespace ReadyData\Import\Test\Unit\Model\ResourceModel;
 
-use Magento\Catalog\Model\Product\Media\Config as MediaConfig;
 use Magento\Framework\App\ResourceConnection;
 use Magento\Framework\DB\Adapter\AdapterInterface;
 use Magento\Framework\DB\Ddl\Table;
@@ -15,7 +14,6 @@ use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
 use ReadyData\Import\Logger\Logger;
 use ReadyData\Import\Model\Cache\AttributeMetadataCache;
-use ReadyData\Import\Model\Media\Cleanup\MediaPathNormalizer;
 use ReadyData\Import\Model\ResourceModel\MediaOrphanScan;
 
 class MediaOrphanScanTest extends TestCase
@@ -37,9 +35,6 @@ class MediaOrphanScanTest extends TestCase
     /** @var array<string, array<int, array{0: string, 1: string, 2: int|null, 3: array<string, mixed>}>> */
     private array $columns = [];
 
-    /** @var array<string, bool> */
-    private array $tablesPresent = [];
-
     protected function setUp(): void
     {
         $this->connection = $this->createMock(AdapterInterface::class);
@@ -50,8 +45,6 @@ class MediaOrphanScanTest extends TestCase
         $this->connection->method('quoteIdentifier')->willReturnCallback(static fn (string $c): string => "`$c`");
         $this->connection->method('quote')->willReturnCallback(static fn ($v): string => "'" . $v . "'");
         $this->connection->method('select')->willReturnCallback(fn (): Select => $this->passthroughSelect());
-        $this->connection->method('isTableExists')
-            ->willReturnCallback(fn (string $t): bool => $this->tablesPresent[$t] ?? true);
         $this->connection->method('newTable')->willReturnCallback(fn (string $n): Table => $this->tableMock($n));
         $this->connection->method('dropTemporaryTable')->willReturnCallback(function (string $n): bool {
             $this->ddlCalls[] = ['drop', $n];
@@ -171,42 +164,6 @@ class MediaOrphanScanTest extends TestCase
         self::assertSame([], $this->recordedCalls('joinLeft'));
     }
 
-    /**
-     * media_gallery_asset.path carries the base path; the gallery form does
-     * not. Slicing at a hardcoded offset would work on a default store and
-     * silently mismatch on any other.
-     */
-    public function testTheContentQueryStripsThePrefixByTheConfiguredBasePathLength(): void
-    {
-        $this->connection->method('query')->willReturn($this->statementMock());
-
-        $this->scan('media/products')->loadReferences();
-
-        $expressions = [];
-        foreach ($this->recordedCalls('columns') as $args) {
-            foreach ((array)$args[0] as $column) {
-                $expressions[] = (string)$column;
-            }
-        }
-
-        // strlen('media/products') === 14, and SUBSTRING is 1-indexed, so the
-        // slice must start at 15 to land on the leading slash.
-        self::assertContains('SUBSTRING(a.path, 15)', $expressions);
-    }
-
-    public function testTheContentSourceIsSkippedWhenTheAssetTablesAreAbsent(): void
-    {
-        $this->tablesPresent = ['media_gallery_asset' => false, 'media_content_asset' => false];
-        $this->connection->method('query')->willReturn($this->statementMock());
-
-        $loaded = $this->scan()->loadReferences();
-
-        self::assertSame(0, $loaded[MediaOrphanScan::SOURCE_CONTENT]);
-        foreach ($this->recordedCalls('from') as $args) {
-            self::assertNotSame(['a' => 'media_gallery_asset'], $args[0]);
-        }
-    }
-
     public function testRoleAttributesAreGroupedByTheirBackendType(): void
     {
         $this->stubRoles(
@@ -258,11 +215,7 @@ class MediaOrphanScanTest extends TestCase
         $counts = $this->scan()->countReferencedCandidates();
 
         self::assertSame(
-            [
-                MediaOrphanScan::SOURCE_GALLERY => 120,
-                MediaOrphanScan::SOURCE_ROLE => 80,
-                MediaOrphanScan::SOURCE_CONTENT => 0,
-            ],
+            [MediaOrphanScan::SOURCE_GALLERY => 120, MediaOrphanScan::SOURCE_ROLE => 80],
             $counts
         );
         self::assertSame(
@@ -344,15 +297,11 @@ class MediaOrphanScanTest extends TestCase
         self::assertContains(['b.value_id IS NULL'], $this->recordedCalls('where'));
     }
 
-    private function scan(string $basePath = 'catalog/product'): MediaOrphanScan
+    private function scan(): MediaOrphanScan
     {
-        $mediaConfig = $this->createMock(MediaConfig::class);
-        $mediaConfig->method('getBaseMediaPath')->willReturn($basePath);
-
         return new MediaOrphanScan(
             $this->resourceConnection,
             $this->attributeMetadataCache,
-            new MediaPathNormalizer($mediaConfig),
             $this->createMock(Logger::class),
             self::ALL_ROLES
         );

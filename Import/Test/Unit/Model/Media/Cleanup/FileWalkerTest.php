@@ -49,7 +49,6 @@ class FileWalkerTest extends TestCase
 
         self::assertSame(['/a/b/one.jpg', '/a/b/two.jpg'], $emitted);
         self::assertSame(['files' => 2, 'bytes' => 300], $totals['included']);
-        self::assertSame(2, $totals['dispersed']);
     }
 
     public function testExcludedDirectoriesAreSizedButProduceNoCandidates(): void
@@ -118,7 +117,6 @@ class FileWalkerTest extends TestCase
 
         self::assertSame(['/a/b/c/deep.jpg', '/a/mid.jpg', '/loose.jpg'], $emitted);
         self::assertSame(3, $totals['included']['files']);
-        self::assertSame(0, $totals['dispersed']);
     }
 
     /**

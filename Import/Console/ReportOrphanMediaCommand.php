@@ -33,7 +33,6 @@ class ReportOrphanMediaCommand extends Command
     private const SOURCE_LABELS = [
         MediaOrphanScan::SOURCE_GALLERY => 'Gallery rows (bound)',
         MediaOrphanScan::SOURCE_ROLE => 'Image role attributes',
-        MediaOrphanScan::SOURCE_CONTENT => 'Media gallery content links',
     ];
 
     public function __construct(
@@ -186,26 +185,39 @@ class ReportOrphanMediaCommand extends Command
             $output->writeln('');
             $output->writeln(sprintf(
                 '<error>DO NOT TRUST THESE NUMBERS. %.1f%% of gallery references point at files that are not'
-                . ' on disk. That is what a broken path normalisation looks like from the inside, and if it is'
-                . ' the cause then the unreferenced count above is meaningless.</error>',
+                . ' on disk, and NONE of the %d files that are present matched a reference. Nothing lines up,'
+                . ' which is what broken path normalisation looks like from the inside — so the unreferenced'
+                . ' count above is meaningless.</error>',
+                $report->galleryMissRate() * 100,
+                $report->scannedFiles
+            ));
+        } elseif ($report->hasIncompleteMedia()) {
+            // The same high miss rate, but the files present DID match, so the
+            // conventions agree. Typical of a staging copy with a production
+            // database and a pruned media directory — and a real finding for a
+            // production store, where it means missing images.
+            $output->writeln('');
+            $output->writeln(sprintf(
+                '<comment>%d gallery references point at files that are not on disk (%.1f%% of them). The'
+                . ' files that are present did match, so paths are being compared correctly — these are'
+                . ' images this environment does not have. Expected on a copy with pruned media; on'
+                . ' production it means missing images. The unreferenced count below is unaffected.</comment>',
+                $report->missingGalleryFiles(),
                 $report->galleryMissRate() * 100
             ));
         }
 
         $output->writeln('');
-        if ($report->assetRowsUnderBasePath === 0 && $report->mediaGalleryCatalogEnabled) {
-            $output->writeln(
-                '<comment>Content links found nothing because Magento_MediaGalleryCatalog excludes'
-                . ' catalog/product from media gallery synchronisation. That is the stock configuration, not a'
-                . ' fault — but it does mean a {{media url=...}} reference in a CMS page or block is invisible'
-                . ' here, so the unreferenced count is an upper bound.</comment>'
-            );
-        } else {
-            $output->writeln(
-                '<comment>Only product references are checked. CMS pages, blocks, category images and'
-                . ' third-party tables are not, so the unreferenced count is an upper bound.</comment>'
-            );
-        }
+        // Unconditional, because it cannot be checked rather than because it
+        // happened to come back empty: Magento_MediaGalleryCatalog excludes
+        // catalog/product from media gallery synchronisation, so a
+        // {{media url=...}} reference to a product image leaves no row in
+        // media_gallery_asset for anything to find.
+        $output->writeln(
+            '<comment>Only product references are checked. A {{media url=...}} reference in a CMS page or'
+            . ' block leaves no queryable row for a product image, and category images and third-party'
+            . ' tables are not checked either, so the unreferenced count is an upper bound.</comment>'
+        );
 
         if ($report->unboundGalleryRows > 0) {
             $output->writeln(sprintf(

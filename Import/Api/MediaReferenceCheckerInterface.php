@@ -41,9 +41,16 @@ namespace ReadyData\Import\Api;
  * wiring this to a delete.
  *
  * The answer is also a point-in-time read, taken outside any transaction: a
- * concurrent import or admin save can add a reference immediately afterwards.
- * Callers that delete on the strength of it should leave a grace period rather
- * than acting the instant the event fires.
+ * concurrent import can adopt a file moments after this reports it unreferenced,
+ * by resolving it to the same deterministic path and skipping the download. A
+ * caller that deletes on the strength of this can therefore leave a committed
+ * gallery row pointing at a file that is gone.
+ *
+ * That window is seconds wide and repairs itself — the next import of that SKU
+ * finds the path absent and downloads it again — so the mitigation is to accept
+ * one product missing one image until its next feed run, not to invent a delay.
+ * A caller for whom that is unacceptable needs its own quarantine, and should
+ * know it is buying protection against something that already heals.
  *
  * Resized renditions under pub/media/catalog/product/cache are a separate
  * concern; deleting a source file leaves them behind (core purges them via

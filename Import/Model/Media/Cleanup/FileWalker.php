@@ -83,7 +83,6 @@ class FileWalker
      * @return array{
      *     included: array{files: int, bytes: int},
      *     excluded: array<string, array{files: int, bytes: int}>,
-     *     dispersed: int,
      *     skipped: array{too_long: int, vanished: int, unreadable: int, outside_tree: int}
      * }
      */
@@ -92,7 +91,6 @@ class FileWalker
         $totals = [
             'included' => ['files' => 0, 'bytes' => 0],
             'excluded' => [],
-            'dispersed' => 0,
             'skipped' => ['too_long' => 0, 'vanished' => 0, 'unreadable' => 0, 'outside_tree' => 0],
         ];
         foreach (self::EXCLUDED_DIRECTORIES as $name) {
@@ -291,10 +289,6 @@ class FileWalker
 
         $totals['included']['files']++;
         $totals['included']['bytes'] += $size;
-        if ($this->normalizer->isDispersedShape($canonical)) {
-            $totals['dispersed']++;
-        }
-
         $batch[] = ['path' => $canonical, 'size' => $size, 'mtime' => $mtime];
         if (count($batch) >= $batchSize) {
             $onBatch($batch);

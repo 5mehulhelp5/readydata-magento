@@ -11,20 +11,16 @@ use Magento\Catalog\Model\Product\Media\Config as MediaConfig;
 /**
  * The one place the filesystem's idea of a media path and the database's meet.
  *
- * Three conventions have to converge on one canonical form before anything can
- * be compared:
+ * Two conventions have to meet:
  *
  *  - the filesystem, via the media directory, yields "catalog/product/a/b/x.jpg";
  *  - catalog_product_entity_media_gallery.value and the image role attributes
- *    store "/a/b/x.jpg" — base path stripped, leading slash kept;
- *  - media_gallery_asset.path stores "catalog/product/a/b/x.jpg", being the path
- *    handed to getAbsolutePath() at sync time.
+ *    store "/a/b/x.jpg" — base path stripped, leading slash kept.
  *
- * Canonical is the DB gallery form, "/a/b/x.jpg", because that is what the join
- * has to match and converting the other way would mean rewriting two columns
- * instead of one. The third case is stripped in SQL rather than here, by
- * {@see basePathLength()} — the offset that method returns is the single number
- * that, if wrong, makes every content link miss silently.
+ * Canonical is the database form, because that is what the join has to match and
+ * converting the other way would mean rewriting two columns instead of one. So
+ * the only conversion here is disk-to-database, and it is the single place a
+ * mistake would make every referenced file look like an orphan.
  *
  * Pure: no I/O, no database, nothing to mock but the config.
  */
@@ -50,21 +46,6 @@ class MediaPathNormalizer
     public function basePath(): string
     {
         return trim($this->mediaConfig->getBaseMediaPath(), '/');
-    }
-
-    /**
-     * Byte length of the base path, for the SQL that strips it from
-     * media_gallery_asset.path.
-     *
-     * Deliberately derived rather than hardcoded: SUBSTRING() is 1-indexed, so
-     * callers want basePathLength() + 1 to land on the leading slash of the
-     * canonical form, and a store whose base path is not "catalog/product"
-     * would otherwise produce paths cut in the wrong place — with no error,
-     * just a source that never matches anything.
-     */
-    public function basePathLength(): int
-    {
-        return strlen($this->basePath());
     }
 
     /**
@@ -110,21 +91,6 @@ class MediaPathNormalizer
     public function exceedsColumnLimit(string $canonical): bool
     {
         return strlen($canonical) > self::MAX_PATH_LENGTH;
-    }
-
-    /**
-     * Whether a canonical path has the two-level dispersed shape that
-     * Uploader::getDispersionPath() produces, "/x/y/name.ext".
-     *
-     * Informational only — never a filter. A gallery row's `value` may be any
-     * relative path (M1 migrations and third-party modules do put files
-     * elsewhere), so skipping non-dispersed files would report referenced files
-     * as missing. Callers use this to describe what they found, not to decide
-     * what to look at.
-     */
-    public function isDispersedShape(string $canonical): bool
-    {
-        return preg_match('#^/[^/]/[^/]/[^/]+$#', $canonical) === 1;
     }
 
     private function collapseSlashes(string $path): string

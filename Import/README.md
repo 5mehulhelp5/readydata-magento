@@ -1659,17 +1659,91 @@ Two limits worth knowing before deleting anything on the strength of it. Only
 **product** references are visible: CMS pages and blocks, `{{media url=...}}` in
 a description, category images and third-party tables are not checked, so
 "unreferenced" is not "provably unused store-wide". And the answer is a
-point-in-time read taken outside any transaction — a concurrent import or admin
-save can add a reference immediately after. Core's admin path has the same blind
-spot and deletes anyway, but it does so one image at a time on a human's
-decision, where a batch can detach thousands; leaving a grace period rather than
-acting the instant the event fires is the safer shape. Note also that deleting a
-source file leaves its resized renditions under
-`pub/media/catalog/product/cache` behind (core purges those separately, via
+point-in-time read taken outside any transaction. A concurrent import can adopt a
+file moments after this reports it unreferenced, by resolving it to the same
+deterministic path and skipping the download, so a caller that deletes on the
+strength of it can leave a committed gallery row pointing at a file that is gone.
+That window is seconds wide and repairs itself — the next import of that SKU finds
+the path absent and fetches it again — so the consequence is one product missing
+one image until its next feed run. Note also that deleting a source file leaves
+its resized renditions under `pub/media/catalog/product/cache` behind (core purges
+those separately, via
 `Magento\Catalog\Model\Product\Image\RemoveDeletedImagesFromCache`).
 
 The module itself never deletes a media file — see *Orphan media files* in
 `PLAN.md` for why that is a scoping decision rather than an omission.
+
+## Reporting unreferenced media
+
+```
+bin/magento readydata:media:report-orphans
+```
+
+Reports how much of `pub/media/catalog/product` nothing points at, and how old it
+is. **Read-only** — it deletes nothing and installs nothing, using two MySQL
+temporary tables that exist only for the duration of a run.
+
+| Option | Effect |
+|---|---|
+| `--list-orphans`, `-l` | Write every unreferenced path to **stdout**, one per line, with the summary on stderr. Redirect stdout to capture the list. |
+| `--skip-excluded-sizing` | Do not visit `cache/`, `watermark/` and `placeholder/` to size them. Faster, but drops the comparison that usually answers the question. |
+| `--allow-remote-storage` | Run against remote storage anyway. See the refusals below before using it. |
+
+### Read the `cache/` line first
+
+The *Disk* table separates product images from `cache/`, and that comparison is
+the point. Renditions under `cache/` are **derived** — they regenerate on request,
+and `catalog:images:resize` pre-warms them — so if the bytes are mostly there, the
+answer is to delete that directory in a maintenance window and resize. No
+reference check, no cleanup feature, nothing else in this section applies.
+
+Only if the *unreferenced* bytes are large, and mostly in the oldest age bucket,
+is there a real orphan problem. Recent files are frequently an import still in
+flight: they are unreferenced only until their batch commits.
+
+### The two things the reference table can tell you
+
+The *Reference sources* table ends with **Candidates matched** and **No file on
+disk**, and those two together — not either alone — say whether the report can be
+believed.
+
+A high "No file on disk" count is ambiguous by itself. A staging copy with a
+production database and a pruned media directory produces one near 100%, and so
+does genuinely broken path handling. The command distinguishes them:
+
+- **Some candidates matched** → the disk and database path conventions agree, and
+  the misses are simply images this environment does not have. You get an
+  informational note and **exit 0**; the unreferenced count is unaffected. On a
+  production store this is a real finding in its own right: those are missing
+  images.
+- **No candidates matched, with files present** → nothing lines up. You get a
+  `DO NOT TRUST THESE NUMBERS` banner and **exit 1**. Do not act on any figure in
+  the report until that is resolved.
+
+The non-zero exit makes the command safe to script: a run whose numbers are
+meaningless fails rather than returning a confident, wrong answer.
+
+### What it cannot see
+
+Only **product** references are checked — bound gallery rows and the image role
+attributes. A `{{media url="catalog/product/..."}}` reference in a CMS page or
+block leaves no queryable row for a product image, and category images and
+third-party tables are not checked either. **The unreferenced count is therefore
+an upper bound**, and the command says so on every run.
+
+It also reports gallery rows with no product binding. Those are what core leaves
+behind when a product is deleted — its `Gallery\DeleteHandler` is never wired into
+the entity manager's delete actions — and the module only counts them.
+
+### When it refuses
+
+It exits non-zero without scanning if **database media storage** is enabled, since
+the files on disk would not be the files the storefront serves. It also refuses on
+**remote storage** unless `--allow-remote-storage` is passed: reading each file's
+size and modification time is a request to the remote *and* a write into the
+Magento cache backend, which on a large catalogue can evict the live configuration
+and block caches. An operator on S3 is better served by an inventory report for
+the disk half of the question.
 
 ## Extending the pipeline
 

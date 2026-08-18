@@ -36,15 +36,12 @@ final class OrphanReport
         public readonly int $scannedFiles,
         public readonly int $scannedBytes,
         public readonly array $excluded,
-        public readonly int $dispersedFiles,
         public readonly array $skipped,
         public readonly array $referencesLoaded,
         public readonly array $referencedCandidates,
         public readonly array $missingReferences,
         public readonly array $orphansByAge,
-        public readonly int $unboundGalleryRows,
-        public readonly int $assetRowsUnderBasePath,
-        public readonly bool $mediaGalleryCatalogEnabled
+        public readonly int $unboundGalleryRows
     ) {
     }
 
@@ -63,19 +60,11 @@ final class OrphanReport
         return $this->scannedFiles - $this->orphanFiles();
     }
 
-    public function excludedFiles(): int
-    {
-        return array_sum(array_column($this->excluded, 'files'));
-    }
-
-    public function excludedBytes(): int
-    {
-        return array_sum(array_column($this->excluded, 'bytes'));
-    }
-
     /**
-     * The share of gallery references whose file is not on disk. The report's
-     * own confidence measure — see {@see TRUST_THRESHOLD}.
+     * The share of gallery references whose file is not on disk.
+     *
+     * High on its own is ambiguous — see {@see isTrustworthy()} for the
+     * discriminator that gives it a meaning.
      */
     public function galleryMissRate(): float
     {
@@ -87,8 +76,57 @@ final class OrphanReport
         return ($this->missingReferences[MediaOrphanScan::SOURCE_GALLERY] ?? 0) / $loaded;
     }
 
+    /**
+     * Whether the unreferenced figures mean anything.
+     *
+     * A high miss rate alone does NOT decide this, and treating it as if it did
+     * was wrong: a staging copy with a full database and a pruned media
+     * directory produces a miss rate near 100% while working perfectly. That is
+     * indistinguishable from broken path normalisation by rate alone.
+     *
+     * The discriminator is whether the files that ARE on disk matched. If any
+     * did, the disk and database conventions agree and the misses are simply
+     * images this environment does not have — the orphan count is then correct,
+     * because it is computed from the files actually present. If NONE matched
+     * while files were present and references exist, nothing lines up and every
+     * figure is fiction.
+     */
     public function isTrustworthy(): bool
     {
+        if ($this->scannedFiles === 0) {
+            // Nothing on disk means no orphan claim to distrust.
+            return true;
+        }
+        if (($this->referencesLoaded[MediaOrphanScan::SOURCE_GALLERY] ?? 0) === 0) {
+            // No gallery rows at all: an empty catalogue, not a mismatch.
+            return true;
+        }
+        if (($this->referencedCandidates[MediaOrphanScan::SOURCE_GALLERY] ?? 0) > 0) {
+            return true;
+        }
+
         return $this->galleryMissRate() <= self::TRUST_THRESHOLD;
+    }
+
+    /**
+     * The benign half of a high miss rate: the conventions agree, but the media
+     * directory holds fewer files than the database expects. Worth reporting in
+     * its own right — those are missing images — without discrediting the
+     * orphan count.
+     */
+    public function hasIncompleteMedia(): bool
+    {
+        // Requires a match, not merely trustworthiness: the message this drives
+        // asserts that the files present DID line up, and with nothing on disk
+        // there is no such evidence to cite. An empty media directory says
+        // nothing about either conclusion, and the candidate count of zero
+        // already speaks for itself.
+        return ($this->referencedCandidates[MediaOrphanScan::SOURCE_GALLERY] ?? 0) > 0
+            && $this->galleryMissRate() > self::TRUST_THRESHOLD;
+    }
+
+    public function missingGalleryFiles(): int
+    {
+        return $this->missingReferences[MediaOrphanScan::SOURCE_GALLERY] ?? 0;
     }
 }

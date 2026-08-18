@@ -443,11 +443,12 @@ Built since, and never described by this plan until now:
    of `removed_files` can decide safely instead of guessing. Not a route; a PHP
    contract for event observers. See §7's orphan-media entry and §9.
 9. **The orphan-media report** — §9.1, the module's first console command. Read-only:
-   it answers how much of `pub/media/catalog/product` nothing points at, so that
-   whether to build §9.2 is a decision with a number behind it.
+   it answers how much of `pub/media/catalog/product` nothing points at, which is both
+   the audit that §9.2's assumption still holds and the number that decides whether the
+   existing backlog is worth clearing.
 
 Still unbuilt: the delete endpoint, the async/queue mode and its status endpoint,
-integration tests, and the media cleanup deleter of §9.2.
+integration tests, and the media cleanup of §9.2.
 
 ## 7. Known risks / decisions to revisit
 
@@ -561,35 +562,26 @@ integration tests, and the media cleanup deleter of §9.2.
   `module-catalog/etc/di.xml` registers gallery handlers under `read`/`create`/`update`
   only) — so deleting a product cascades away its `_value` and `_value_to_entity` rows,
   leaves the **main gallery row** behind (its only FK is on `attribute_id`), and leaves
-  the file and its `catalog/product/cache` renditions untouched. Ordinary admin churn
-  adds more. A GC scoped to what this module recorded could never collect any of it, so
-  it would buy the module's first `db_schema.xml` and `crontab.xml` while the dominant
-  source kept growing. The tool that would address disk usage is a store-wide
-  mark-and-sweep, which is a different piece of software and has to be opt-in and
-  report-only by default: WYSIWYG content, category images and third-party tables all
-  reference media that no gallery query can see.
+  the file and its `catalog/product/cache` renditions untouched.
 
-  What *is* implemented is the primitive every one of those options needs:
+  What *is* implemented is the primitive every cleanup option needs:
   `Api\MediaReferenceCheckerInterface` (see the README), so a consumer of
   `removed_files` can decide safely instead of guessing. Note that core's own
   `Gallery::countImageUses()` cannot serve this purpose — it counts rows by path with no
   regard for binding, so the dead rows a product delete leaves behind report every such
-  file as permanently in use. Requiring the `_value_to_entity` binding is the fix.
+  file as permanently in use. Requiring the `_value_to_entity` binding is the fix, and it
+  is also what makes core's unwired handler worth wiring rather than reimplementing.
 
-  Two follow-ups. An **opt-in "delete detached files" setting**, matching what core's
-  admin path already does on a gallery edit (`UpdateHandler::removeDeletedImages()`,
-  gated on `countImageUses() <= 1`, plus the cache purge) — the reason it is a flag and
-  not the default is blast radius: admin detaches one image on a human's decision, a
-  batch can detach thousands. It would have to run **after** the commit, on the same hook
-  as the media event, since a rolled-back batch must not have deleted anything. Still
-  unwritten, and note that it does **not** address disk usage: it only ever sees what a
-  batch detached, which is not where the bytes are.
-
-  The second is the store-wide sweep, and it is no longer hypothetical — disk usage is
-  the stated driver, which reverses the argument above about a quarantine table not
-  earning its schema. That argument was against a quarantine fed by *this module's*
-  detach events, which structurally cannot see core's leftovers. A quarantine fed by a
-  **sweep** sees everything on disk. Specified in §9.
+  **Deleting anything is out of scope for this bullet and specified in §9.** The reasoning
+  moved twice while that section was written, and the record is worth keeping because both
+  turns were driven by facts rather than taste. It first argued for a store-wide sweep with
+  a quarantine table and cron, on the grounds that a cleanup scoped to what this module
+  recorded could never collect core's product-delete leftovers. That holds only while the
+  catalogue has other writers. Told that this importer owns `pub/media/catalog/product`
+  outright, the quarantine, the cron and the schema all fall away: every orphan then comes
+  from an event the module itself performed, and can be cleaned up on the post-commit hook
+  that already exists. §9.2 is the result; §9.1, the read-only report, shipped first and
+  remains the audit that proves the assumption is still true.
 - **Media downloads are per-request**, bounded per batch and run concurrently up to
   *Download Concurrency* (default 4). The async path above is still the answer for large
   first-time image imports; until then `batch_size` and `max_execution_time` are what
@@ -721,11 +713,14 @@ lock.
 
 ## 9. Planned: media cleanup
 
-Nothing here is written. The driver is **disk usage**, and the shape follows from one
-constraint: an unattended process that deletes files must never be the first thing to
-form an opinion about which files are dead. So it splits into a report that ships first
-and answers whether the work is worth doing, and a deleter that only ever acts on what
-the report has been saying for weeks.
+The driver is **disk usage**. §9.1 is built; §9.2 is not. They answer two different
+questions and only one of them is gated on the other.
+
+**§9.2 prevents new orphans; §9.1 measures the ones already there.** Prevention is worth
+doing whether or not the disk figure is alarming, because the alternative is a pile that
+only grows — and on a store where the importer owns the catalogue it is cheap, because the
+module already knows the moment a file stops being referenced. Clearing the existing
+*backlog* is the part that is gated: if §9.1 reports little, leave it.
 
 **Check two things before building any of it.** `pub/media/catalog/product/cache` is
 *derived* — renditions regenerate on request, and `catalog:images:resize` pre-warms them.
@@ -738,27 +733,27 @@ which this module never writes, but a store that ever used core import may have 
 `pub/media/tmp` and `var/`. "Orphaned source images are the problem" is a hypothesis;
 phase one confirms or kills it.
 
-**Not tied to the import.** A whole-tree walk hung off a request that already fights
-`max_execution_time` and `batch_size` is the wrong budget, import time is when the file
-set is most in flux (downloaded-but-uncommitted files are legitimately unreferenced right
-up until they are not), and it would make an import request responsible for deleting
-files unrelated to its payload. Cleanup runs on its own schedule. The import-adjacent
-option is the flag in §7, which is a different, smaller thing.
+**The whole-tree scan is not tied to the import.** A walk of the entire media directory hung
+off a request that already fights `max_execution_time` and `batch_size` is the wrong budget,
+and it would make an import request responsible for files unrelated to its payload. That is
+why §9.1 is a console command. §9.2's per-batch cleanup is the opposite case: it acts only on
+the files the batch in front of it just detached, which is bounded by the payload.
 
 ### 9.1 Phase one: report only
 
 Answers one question with numbers — **how much of `pub/media/catalog/product` is
 unreferenced, and how old is it** — and deletes nothing, adds no schema, schedules no cron
 and adds no configuration. (Two MySQL `TEMPORARY` tables exist for the duration of a run;
-nothing is installed.) Its output decides whether 9.2 gets written.
+nothing is installed.) Its output decides whether the existing **backlog** is worth clearing;
+§9.2's prevention of new orphans does not wait on it.
 
 Under `Model/Media/Cleanup/`: `OrphanScanner` (orchestrator), `MediaPathNormalizer`,
 `FileWalker`, `OrphanReport`, plus `Model/ResourceModel/MediaOrphanScan` for the SQL —
 every other class in this module that talks to the database lives there and this is not
 the one to make an exception of. Entry point is a console command,
 `readydata:media:report-orphans`, registered via `Magento\Framework\Console\CommandList`
-— a new `Console/` directory, which 9.2 reuses from a cron, so the work is not thrown
-away.
+— a new `Console/` directory, which §9.2's backlog mode extends with a `--delete` flag
+rather than duplicating.
 
 **Walk the disk first, read references second.** This ordering is load-bearing, not
 incidental: references then only ever grow relative to the candidate snapshot, so the skew
@@ -791,36 +786,33 @@ the correct semantics for a Linux filesystem: the `_ci` default would treat `/a/
 and `/a/b/foo.jpg` as one path. The reference PK must lead with `path`, not `source`, or
 the anti-join cannot use it.
 
-Three sources:
+Two sources:
 
 | Source | Query | Stored form |
 |---|---|---|
 | Bound gallery rows | `..._media_gallery g INNER JOIN ..._value_to_entity b ON b.value_id = g.value_id`, no `WHERE` | `/a/b/x.jpg` |
 | Role attributes | `catalog_product_entity_varchar WHERE attribute_id IN (roles)` | `/a/b/x.jpg` |
-| Content links | `media_gallery_asset a INNER JOIN media_content_asset c ON c.asset_id = a.id` | `catalog/product/a/b/x.jpg` |
 
-The third convention differs: `media_gallery_asset.path` is media-directory-relative and
-carries the `catalog/product` prefix with no leading slash, being the path handed to
-`getAbsolutePath()` at sync time. Strip it by the real length of
-`MediaConfig::getBaseMediaPath()`, never a hardcoded 15. Normalising all three onto one
-canonical form is the most bug-prone part of this component, deserves its own tested class
-(`MediaPathNormalizer`), and fails in the direction that hurts — a mismatch reports
-referenced files as orphans.
+Both store the canonical form already, so normalisation only has to reconcile the disk
+against it. That is still the most bug-prone part of this component — it deserves its own
+tested class (`MediaPathNormalizer`) and it fails in the direction that hurts, a mismatch
+reporting referenced files as orphans.
 
-**The content-links source is empty on a stock store, and that is not a fault.**
-`Magento_MediaGalleryCatalog`'s `etc/directory.xml` excludes `/^catalog\/product/` from
-media-gallery synchronisation, enforced in `FetchMediaStorageFileBatches::isApplicable()`,
-so `media_gallery_asset` holds no rows for product images and `media_content_asset` can
-only link assets that exist. Two consequences. The CMS/WYSIWYG blind spot documented on
-`MediaReferenceCheckerInterface` is **not** closed for product images by this source or any
-other — a `{{media url="catalog/product/a/b/x.jpg"}}` in a CMS block produces no reference
-row anywhere, so the orphan count is an upper bound with a real hole in it, and the command
-must say so in its own output rather than only in a docblock. And zero from this source
-must be reported as "excluded by design", alongside the count of
-`media_gallery_asset` rows under `catalog/product` and whether the module is enabled — an
-alarm that fires on every healthy store is not an alarm. The pass is still worth running:
-it costs one indexed insert and is correct on a store that removed the exclusion or
-carries a pre-existing asset table.
+**There was a third source, and removing it is the point worth recording.** A pass over
+`media_gallery_asset INNER JOIN media_content_asset` would find CMS pages and blocks that
+reference an image. It was written, then removed, because it cannot do the job on this
+configuration: `Magento_MediaGalleryCatalog`'s `etc/directory.xml` excludes
+`/^catalog\/product/` from media-gallery synchronisation, enforced in
+`FetchMediaStorageFileBatches::isApplicable()`, so `media_gallery_asset` never holds a
+product image and `media_content_asset` can only link assets that exist. It would not have
+returned zero because there are no CMS references — it would return zero either way, which
+is worse than not asking.
+
+The consequence stands whether or not the pass exists, and the command says it
+unconditionally rather than only in a docblock: a `{{media url="catalog/product/..."}}`
+reference in a CMS page or block leaves no queryable row, so **the unreferenced count is an
+upper bound**. §9.2's ownership assumption is what makes that acceptable rather than
+alarming.
 
 **`FileWalker`** descends `catalog/product` one directory at a time through the media
 directory's driver, never PHP filesystem primitives, so remote storage works (the rule
@@ -871,14 +863,26 @@ a loop inside `catalog/product` never terminates.
 - **Per-source overlap counts** — how many candidates each source accounts for. Overlap,
   not "rows eliminated by this pass", which would depend on the order the passes ran in and
   report near-zero for every source after the first.
-- **References whose file is not on disk, per source.** The trust guard, and the single
-  most valuable line here. If path normalisation is broken this is ~100% of the gallery
-  source and every other number is garbage; a loud banner and a non-zero exit above a small
-  threshold turns the one silent failure mode into a screaming one. Below that threshold it
-  is the missing-image count, useful in its own right.
-- Count of unbound gallery rows — core's product-delete leftovers, quantified.
-- `media_gallery_asset` rows under `catalog/product` and whether `Magento_MediaGalleryCatalog`
-  is enabled, so the content source's zero is interpretable.
+- **References whose file is not on disk, per source, AND how many candidates matched.** The
+  trust guard, and the single most valuable pair of numbers here. If path normalisation is
+  broken, the miss rate is ~100% of the gallery source and every other figure is garbage.
+
+  The rate alone cannot say that, though, and treating it as if it could was the guard's
+  first mistake: a staging copy with a production database and a pruned media directory
+  produces the same ~100%. Measured on this repo's own checkout — 16,614 gallery references,
+  2 files on disk, both matched — a rate-only guard condemned a report that was entirely
+  correct.
+
+  **The discriminator is whether any candidate matched.** Some matches mean the two
+  conventions agree and the misses are files this environment does not have, so the orphan
+  count stands: report it as missing media, exit zero. No matches while files *were* present
+  means nothing lines up: loud banner, non-zero exit. Neither claim is available when the
+  media directory is empty, and the guard says nothing then rather than citing evidence it
+  does not have.
+- Count of unbound gallery rows — core's product-delete leftovers, quantified. Once §9.2
+  wires core's `Gallery\DeleteHandler` this doubles as the regression check that the
+  registration is working: the number should stop growing.
+- The upper-bound caveat, unconditionally.
 
 **Guards:** refuse outright when database media storage is enabled
 (`StorageDatabase::checkDbUsage()`), matching `FileResolver`. Refuse on remote storage
@@ -897,28 +901,163 @@ treatment as `ProductMediaGallery::findReferencedFiles()`.
 Roughly two days with tests. Non-destructive throughout, so it can go onto production and
 answer the question within a day of merging.
 
-### 9.2 Phase two: sketch
+### 9.2 Phase two: prevention at source
 
-Contingent on what 9.1 reports. Two crons over a quarantine table: a weekly sweep that
-*records* candidates (`path`, `first_seen_at`, `last_confirmed_at`, `size`) and drops
-rows whose path became referenced again, and a daily deleter that removes only candidates
-continuously unreferenced across N sweeps spanning a grace period, with an mtime gate,
-purging each file's `cache/` renditions alongside. Multiple independent observations days
-apart are what dissolve the point-in-time race that makes §7's flag uncomfortable.
+Not written. It rests on an assumption the operator asserts rather than one the module
+infers: **nothing but this importer writes to `pub/media/catalog/product`.** Where that
+holds, an orphan is never a mystery to be discovered by sweeping — it is the direct result
+of an event the module itself just performed, and can be cleaned up in the same breath. One
+config flag, named after the assumption it encodes, enables the two hooks below; a store
+that starts uploading product images in admin turns it off.
 
-The rail that matters most for unattended deletion is a **per-run cap** on both file
-count and bytes. The failure mode of automation is not deleting one wrong file, it is
-deleting everything in one night because the referenced set came back empty — so also
-abort when the referenced set is implausibly small against the previous run, which is
-what an unsynced gallery or a half-restored database looks like from the inside. Off by
-default, dry-run mode, and a log or event of exactly what was deleted so it can be
-alerted on. The same pass can clear the unbound gallery rows 9.1 counts, which makes
-every future reference check both cheaper and honest.
+That assumption is why this phase has **no quarantine table, no cron, no admin UI and no
+schema at all**. Those exist to buy confidence that a file found by a sweep is really dead.
+A hook firing immediately after the batch that detached the file does not need to buy that
+confidence — it already knows.
 
-Those settings are the first configuration this feature needs, and they belong in a group
-of their own rather than the existing `media` one: every field there depends on media
-*import* being enabled, and a store that turned import off still wants its disk cleaned
-up.
+One shared `MediaCleanupService` behind every hook — and there are three callers, not two:
+the batch's post-commit phase, the batch's rollback path, and the product-delete observer.
+That alone rules out putting the logic in any one of them.
+
+It also has to be a service rather than an observer for a reason that outlives this section:
+the module writes products by direct SQL, so a future `products/delete` endpoint (§7,
+unbuilt) will very likely delete by direct SQL too, and no model event will fire. If the
+logic lives in a service the endpoint calls it and inherits the behaviour; if it lives inside
+an observer the endpoint silently reintroduces the problem this was written to solve.
+
+#### The reference check stays load-bearing
+
+Tempting to drop — if we own every file and we just detached this one, why ask? Because
+target paths are a deterministic function of the source URL, so two SKUs fed the same image
+URL **share one file on disk**. Detaching from product A must never delete what product B
+still displays. Every deletion below therefore goes through
+`MediaReferenceCheckerInterface` first, and that is the justification for having built it as
+a primitive of its own.
+
+#### Case 1 — images detached by the importer
+
+Everything needed is already in place: `MediaProcessor` computes the exact per-SKU `removed`
+set, the checker answers whether anything else still holds the file, and `ImportService`
+already has a post-commit phase. Cleanup runs there, never inside the batch transaction — a
+file delete cannot be rolled back.
+
+**Hook `ImportService`'s `if ($committed)` block directly, as a sibling of
+`dispatchAfterCommit()` — not the media event, and not inside `ImportEventDispatcher`.**
+That method opens with `if (!$this->config->isDispatchProductEvents()) { return; }`, so an
+implementation that rides it inherits a flag about *third-party observers*. A store that
+turns product events off — a legitimate thing to do — would then silently stop cleaning up
+its media, with no symptom but the disk growing again. Two unrelated concerns must not be
+joined by an implementation detail, least of all one that fails quietly.
+
+There is a second reason to sit beside the dispatch rather than inside it. The dispatch is
+internally guarded so that an observer's failure cannot fail the import, because an observer
+is someone else's code doing an unknown amount of work. The cleanup is *ours*: it should not
+hide behind a guard written for strangers, and a third party should not be able to reorder
+or suppress it.
+
+Feed it `removed_files`, not the per-SKU `removed`. The batch-level union already excludes a
+file that one product dropped while another in the same payload kept or gained it; the
+per-SKU list is deliberately unfiltered and would delete a sibling's image. The `partial`
+safety valve then falls out for free: `MediaProcessor` computes
+`$removedFiles = $partial ? [] : array_keys($goneByFile)`, so a product whose desired set was
+incomplete contributes nothing to either list and a batch that withheld removals deletes
+nothing.
+
+#### Case 1b — batches that roll back
+
+The post-commit hook only fires when the batch committed. A batch that rolled back has
+downloaded files and bound nothing, so there is no detach to react to and prevention would
+miss it — the one remaining way this module can leak a file.
+
+`FileResolver` already knows exactly which files it created: everything it actually fetched,
+as opposed to the ones skip-if-present adopted. Reporting that set back lets `ImportService`
+delete it from the `catch` block that rolls the batch back, which closes the gap and makes
+prevention complete — detach, product delete and rollback being the only three ways an
+orphan can originate here.
+
+This was rejected once, as a compensating delete that might remove a file a *concurrent*
+batch had adopted in the meantime. That rejection does not survive alongside the rest of this
+section: the detach path accepts exactly the same race and justifies it by the repair
+described below. The same justification applies unchanged, so either both are acceptable or
+neither is — and the repair argument holds for both.
+
+#### Case 2 — product deleted
+
+Two mechanisms, both verified against core.
+
+**The orphaned rows are a one-line fix using core's own code.** `Gallery\DeleteHandler`
+exists but is registered nowhere; `DeleteExtensions::execute()` reads
+`extensionPool->getActions($entityType, 'delete')`, and `ResourceModel\Product::delete()`
+does route through `EntityManager`. So adding a `delete` key to `ExtensionPool`'s
+`extensionActions` for `ProductInterface` in this module's `di.xml` activates it. Nothing
+supplies `media_attribute_codes` on delete, so only `deleteGallery()` runs — and nothing is
+lost, because `catalog_product_entity_varchar` cascades on `entity_id` anyway.
+
+**The files need a post-commit hook, and there is a clean one.**
+`ResourceModel\Product::delete()` dispatches `catalog_product_delete_after_done` *after*
+`EntityManager::delete()` has returned, i.e. after its transaction committed. Capture the
+product's gallery paths on `catalog_product_delete_before`, then check and delete on
+`..._after_done`. Note `catalog_product_delete_after` is **not** the hook: it is dispatched
+inside the EntityManager transaction.
+
+#### The one race, and why it needs no grace period
+
+Total ownership makes this *more* likely rather than less, because concurrent imports of one
+catalogue are precisely what this module is built for.
+
+Batch A detaches file X; its post-commit cleanup deletes it. Batch B, running concurrently,
+resolved X moments earlier, found it on disk, skipped the download, and is about to bind a
+gallery row to it. B commits a row pointing at a file that is gone. Re-checking references
+immediately before unlinking narrows the window to seconds but cannot close it — B has not
+committed its row yet. The rollback path in 1b has the identical shape, with A discarding
+what it downloaded instead of what it detached.
+
+Left open deliberately, because it repairs itself. On that SKU's next import
+`FileResolver::resolve()` finds `isExist()` false for the same deterministic target path and
+downloads it again. The consequence is one product missing one image until its next feed run.
+The deterministic-path decision, made to stop two suppliers' `hero.jpg` colliding, is what
+turns a permanent inconsistency into a temporary one — and it is why a quarantine would be
+buying protection against something that already heals.
+
+#### Also required
+
+Purge each deleted file's renditions with core's
+`RemoveDeletedImagesFromCache::removeDeletedImagesFromCache()`, which resolves the frontend
+view config itself (`getViewConfig(['area' => AREA_FRONTEND])`) and so does not depend on the
+caller's area. It covers only image types **currently configured in `view.xml`**; renditions
+for dimensions no longer configured are untouched by it or anything else here, which is why
+wholesale deletion of `cache/` remains a separate and better answer for that disk.
+
+A failed deletion must not fail anything — the batch or the product delete has already
+committed. Log it and move on, as `FileResolver::discard()` already does for part files.
+
+#### The backlog
+
+Files predating the flag. Gated on §9.1's number: if it is small, leave them. If not,
+`--delete` on `readydata:media:report-orphans`, with the reference re-verify, an mtime age
+gate and a per-run cap, run once. §9.1's trust guard must be a hard **refusal** in that mode
+rather than the warning it is in report mode — clearing a backlog against a half-restored
+database is as wrong as any cron doing it.
+
+Only the broken branch refuses, though. The missing-media branch must not: a store with some
+images absent from disk is ordinary, and refusing on it would mean a backlog can never be
+cleared anywhere it matters. That is precisely why the two cases had to be told apart rather
+than sharing one rate threshold.
+
+#### What it still will not see
+
+A `{{media url="catalog/product/..."}}` reference in a CMS page or block produces no row any
+reference source can see (§9.1). Under this section's assumption that requires someone to
+have discovered a feed-generated path and pasted it, which is why it is accepted rather than
+engineered around — but it is the reason the flag exists as a flag.
+
+And §9.1 keeps a job after §9.2 ships: it is the audit that proves prevention is holding. If
+its unreferenced count stops growing, the flag is doing what it claims. If it climbs,
+something is writing to `catalog/product` that the assumption says should not be.
+
+Roughly a day and a half with tests, plus half a day for the rollback path of 1b — which is
+optional only in the sense that without it §9.1's backlog mode has to keep clearing up after
+rolled-back batches forever.
 
 > **Keeping this document honest.** §1–§6 were rewritten against the code on
 > 2026-08-17, after the `[P]` markers and the single-endpoint framing had drifted

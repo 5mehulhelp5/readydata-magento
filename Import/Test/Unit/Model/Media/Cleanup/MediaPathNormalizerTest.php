@@ -95,32 +95,16 @@ class MediaPathNormalizerTest extends TestCase
     }
 
     /**
-     * The offset the content-link SQL slices at. Hardcoding 15 would work on a
-     * default store and silently cut every path in the wrong place on any
-     * other, producing a source that matches nothing.
+     * A store whose base path is not catalog/product must still canonicalise
+     * correctly — the length is derived, never assumed.
      */
-    public function testBasePathLengthFollowsTheConfiguredBasePath(): void
+    public function testANonDefaultBasePathIsStrippedCorrectly(): void
     {
-        self::assertSame(15, $this->normalizer()->basePathLength());
-        self::assertSame(14, $this->normalizer('media/products')->basePathLength());
         self::assertSame(
             '/a/b/x.jpg',
             $this->normalizer('media/products')->fromMediaRelative('media/products/a/b/x.jpg')
         );
-    }
-
-    /**
-     * Informational, never a filter — but the report describes what it found
-     * with it, so it has to mean what it says.
-     */
-    public function testDispersedShapeIsExactlyTwoSingleCharacterLevels(): void
-    {
-        $normalizer = $this->normalizer();
-
-        self::assertTrue($normalizer->isDispersedShape('/a/b/x.jpg'));
-        self::assertFalse($normalizer->isDispersedShape('/a/x.jpg'));
-        self::assertFalse($normalizer->isDispersedShape('/a/b/c/x.jpg'));
-        self::assertFalse($normalizer->isDispersedShape('/ab/c/x.jpg'));
+        self::assertNull($this->normalizer('media/products')->fromMediaRelative('catalog/product/a/b/x.jpg'));
     }
 
     /**

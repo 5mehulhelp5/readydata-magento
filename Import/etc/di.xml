@@ -129,9 +129,9 @@
     <type name="Magento\Framework\Console\CommandListInterface">
         <arguments>
             <argument name="commands" xsi:type="array">
-                <item name="readydata_import_media_report_orphans" xsi:type="object">
-                    ReadyData\Import\Console\ReportOrphanMediaCommand
-                </item>
+                <!-- Class name must stay on one line: the object interpreter uses the node
+                     value verbatim, so surrounding whitespace becomes part of the class name. -->
+                <item name="readydata_media_report_orphans" xsi:type="object">ReadyData\Import\Console\ReportOrphanMediaCommand</item>
             </argument>
         </arguments>
     </type>
