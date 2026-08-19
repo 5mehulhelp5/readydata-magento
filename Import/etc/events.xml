@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<!--
+    Product-delete media cleanup. Both observers do nothing unless the store has
+    asserted ReadyData owns product media (readydata_import/media_cleanup).
+
+    The pairing is forced by transaction boundaries, not by preference:
+    catalog_product_delete_before still has the gallery rows but is inside the
+    delete's transaction, while catalog_product_delete_after_done is dispatched
+    by ResourceModel\Product::delete() AFTER EntityManager::delete() has
+    committed. Reading has to happen in the first, deleting in the second.
+
+    Note catalog_product_delete_after is NOT the event to use: it fires inside
+    the transaction, so a file removed there could not be restored if the delete
+    subsequently rolled back.
+-->
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:framework:Event/etc/events.xsd">
+    <event name="catalog_product_delete_before">
+        <observer name="readydata_import_capture_product_media"
+                  instance="ReadyData\Import\Observer\CaptureProductMediaOnDelete"/>
+    </event>
+    <event name="catalog_product_delete_after_done">
+        <observer name="readydata_import_clean_up_product_media"
+                  instance="ReadyData\Import\Observer\CleanUpProductMediaAfterDelete"/>
+    </event>
+</config>

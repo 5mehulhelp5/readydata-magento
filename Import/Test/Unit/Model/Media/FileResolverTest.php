@@ -94,9 +94,47 @@ class FileResolverTest extends TestCase
         $this->existing[self::BASE . '/s/h/shirt.jpg'] = 'bytes';
 
         self::assertSame(
-            ['/s/h/shirt.jpg' => ['file' => '/s/h/shirt.jpg', 'message' => null]],
+            // `downloaded` false is load-bearing, not incidental: a path that was
+            // already on disk is not ours to withdraw, so a rolled-back batch
+            // must leave it alone. See MediaProcessor::cleanUpAfterRollback().
+            ['/s/h/shirt.jpg' => ['file' => '/s/h/shirt.jpg', 'message' => null, 'downloaded' => false]],
             $this->resolver->resolve(['/s/h/shirt.jpg'])
         );
+    }
+
+    /**
+     * The other half of that distinction. A rolled-back batch discards only what
+     * it actually fetched, so the flag has to be set on the download path and
+     * nowhere else — if it were never true, rollback cleanup would silently do
+     * nothing; if it were always true, it would delete files it did not create.
+     */
+    public function testOnlyAFetchedFileIsMarkedAsDownloaded(): void
+    {
+        $adopted = '/h/e/hero_' . substr(sha1(self::HERO_URL), 0, 8) . '.jpg';
+        $this->existing[self::BASE . $adopted] = self::JPEG;
+        $this->existing[self::BASE . '/s/h/shirt.jpg'] = 'bytes';
+        $fetched = 'https://cdn.example.com/img/fresh.jpg';
+        $this->stubDownload([$fetched => self::JPEG]);
+
+        $results = $this->resolver->resolve([$fetched, self::HERO_URL, '/s/h/shirt.jpg']);
+
+        self::assertTrue($results[$fetched]['downloaded'], 'a URL this call fetched');
+        self::assertFalse($results[self::HERO_URL]['downloaded'], 'a URL skip-if-present adopted');
+        self::assertFalse($results['/s/h/shirt.jpg']['downloaded'], 'a local path');
+    }
+
+    /**
+     * A download that fails leaves nothing on disk, so there is nothing for a
+     * rollback to clean up and the flag must not claim otherwise.
+     */
+    public function testAFailedDownloadIsNotMarkedAsDownloaded(): void
+    {
+        $this->stubDownload([self::HERO_URL => null], status: 404);
+
+        $result = $this->resolver->resolve([self::HERO_URL])[self::HERO_URL];
+
+        self::assertNull($result['file']);
+        self::assertFalse($result['downloaded']);
     }
 
     /**

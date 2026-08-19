@@ -59,6 +59,7 @@ class Config
     private const XML_PATH_MEDIA_ALLOWED_HOSTS = 'readydata_import/media/allowed_hosts';
     private const XML_PATH_MEDIA_REDOWNLOAD_EXISTING = 'readydata_import/media/redownload_existing';
     private const XML_PATH_MEDIA_AUTO_ASSIGN_ROLES = 'readydata_import/media/auto_assign_roles';
+    private const XML_PATH_MEDIA_CLEANUP_OWNS_MEDIA = 'readydata_import/media_cleanup/owns_product_media';
 
     public function __construct(
         private readonly ScopeConfigInterface $scopeConfig
@@ -304,6 +305,28 @@ class Config
      * default: skipping makes a re-import cost no network I/O at all, and makes
      * a retry after a rolled-back batch converge on the same file.
      */
+    /**
+     * Whether this importer is the only thing that writes to
+     * pub/media/catalog/product.
+     *
+     * An assertion the operator makes, not something the module can detect, and
+     * the switch that lets it delete a file it has just made unreachable.
+     *
+     * ON by default, because the module is deployed where the importer owns the
+     * catalogue and the alternative is a pile that only grows. TURN IT OFF on a
+     * store where images also arrive through the admin or another integration:
+     * a file this module stops referencing may still be someone else's, and the
+     * safe reading of "unreferenced" is then "leave it alone".
+     *
+     * Deliberately its own group rather than a field under `media`: every field
+     * there depends on media IMPORT being enabled, and a store that has turned
+     * import off still wants the disk it already filled kept tidy.
+     */
+    public function ownsProductMedia(): bool
+    {
+        return $this->scopeConfig->isSetFlag(self::XML_PATH_MEDIA_CLEANUP_OWNS_MEDIA);
+    }
+
     public function isMediaRedownloadExisting(): bool
     {
         return $this->scopeConfig->isSetFlag(self::XML_PATH_MEDIA_REDOWNLOAD_EXISTING);

@@ -16,6 +16,7 @@ use ReadyData\Import\Model\Config;
 use ReadyData\Import\Model\Data\MediaEntry;
 use ReadyData\Import\Model\Data\Product;
 use ReadyData\Import\Model\ImportLocks;
+use ReadyData\Import\Model\Media\Cleanup\MediaCleanupService;
 use ReadyData\Import\Model\Media\FileResolver;
 use ReadyData\Import\Model\Processor\EntityProcessor;
 use ReadyData\Import\Model\Processor\MediaProcessor;
@@ -43,6 +44,7 @@ class MediaProcessorTest extends TestCase
     private FileResolver&MockObject $fileResolver;
     private Config&MockObject $config;
     private Logger&MockObject $logger;
+    private MediaCleanupService&MockObject $mediaCleanup;
     private MediaProcessor $processor;
 
     protected function setUp(): void
@@ -61,6 +63,9 @@ class MediaProcessorTest extends TestCase
             fn (string $code): ?array => $this->metaFor($code)
         );
         $this->config->method('isMediaAutoAssignRoles')->willReturn(false);
+        // Cleanup is opt-in and off by default; the hooks that consult it have
+        // their own tests.
+        $this->mediaCleanup = $this->createMock(MediaCleanupService::class);
 
         $this->processor = new MediaProcessor(
             $this->gallery,
@@ -69,6 +74,7 @@ class MediaProcessorTest extends TestCase
             $this->eavValue,
             $this->fileResolver,
             $this->config,
+            $this->mediaCleanup,
             $this->logger
         );
     }
@@ -1439,6 +1445,94 @@ class MediaProcessorTest extends TestCase
         $retained = $context->get(MediaProcessor::CONTEXT_RETAINED_FILES);
         sort($retained);
         self::assertSame([self::FILE_A, self::FILE_B], $retained);
+
+        // The rule that moved here from ImportEventDispatcher when the cleanup
+        // hook needed the same answer: P1 detached FILE_B but P2 gained it, so
+        // the batch did not let go of it. Deleting it on the strength of P1's
+        // removal would take away the image P2 now shows.
+        self::assertSame([], $context->get(MediaProcessor::CONTEXT_REMOVED_FILES));
+    }
+
+    /**
+     * A file nothing in the batch retains does reach the union — the other half
+     * of the rule above, and the input the post-commit cleanup acts on.
+     */
+    public function testTheRemovalUnionKeepsAFileNoProductInTheBatchStillHolds(): void
+    {
+        $context = $this->contextFor('P1', [], 10);
+        $this->gallery->method('getGallery')->willReturn([
+            10 => [$this->galleryRow(500, self::FILE_B)],
+        ]);
+        $this->eavValue->method('getValuesForStores')->willReturn([]);
+
+        $this->processor->process($context);
+
+        self::assertSame([self::FILE_B], $context->get(MediaProcessor::CONTEXT_CHANGES)['P1']['removed']);
+        self::assertSame([self::FILE_B], $context->get(MediaProcessor::CONTEXT_REMOVED_FILES));
+    }
+
+    /**
+     * The cleanup hooks are gated on the ownership flag, and with it off nothing
+     * is even asked about — the service is never handed a list.
+     */
+    public function testTheCleanupHooksDoNothingWhenTheStoreDoesNotOwnProductMedia(): void
+    {
+        $this->mediaCleanup->method('isEnabled')->willReturn(false);
+        $this->mediaCleanup->expects(self::never())->method('deleteUnreferenced');
+
+        $context = $this->contextFor('P1', [], 10);
+        $context->set(MediaProcessor::CONTEXT_REMOVED_FILES, [self::FILE_B]);
+
+        $this->processor->cleanUpAfterCommit($context);
+        $this->processor->cleanUpAfterRollback($context);
+    }
+
+    public function testCleanUpAfterCommitPassesTheRemovalUnionToTheService(): void
+    {
+        $this->mediaCleanup->method('isEnabled')->willReturn(true);
+        $this->mediaCleanup->expects(self::once())->method('deleteUnreferenced')
+            ->with([self::FILE_B])
+            ->willReturn([self::FILE_B]);
+
+        $context = $this->contextFor('P1', [], 10);
+        $context->set(MediaProcessor::CONTEXT_REMOVED_FILES, [self::FILE_B]);
+
+        $this->processor->cleanUpAfterCommit($context);
+    }
+
+    /**
+     * A rolled-back batch has to discard what it FETCHED — not a local path, and
+     * not a file that skip-if-present adopted, because those were already there
+     * and are not ours to withdraw.
+     */
+    public function testCleanUpAfterRollbackDiscardsOnlyWhatThisBatchDownloaded(): void
+    {
+        $this->mediaCleanup->method('isEnabled')->willReturn(true);
+        $this->mediaCleanup->expects(self::once())->method('deleteUnreferenced')
+            ->with([self::FILE_A])
+            ->willReturn([self::FILE_A]);
+
+        $context = $this->contextFor('P1', [], 10);
+        $context->set(MediaProcessor::CONTEXT_RESOLVED_FILES, [
+            'https://cdn/new.jpg' => ['file' => self::FILE_A, 'message' => null, 'downloaded' => true],
+            'https://cdn/kept.jpg' => ['file' => self::FILE_B, 'message' => null, 'downloaded' => false],
+            'https://cdn/bad.jpg' => ['file' => null, 'message' => 'nope', 'downloaded' => false],
+        ]);
+
+        $this->processor->cleanUpAfterRollback($context);
+    }
+
+    public function testCleanUpAfterRollbackDoesNothingWhenNothingWasDownloaded(): void
+    {
+        $this->mediaCleanup->method('isEnabled')->willReturn(true);
+        $this->mediaCleanup->expects(self::never())->method('deleteUnreferenced');
+
+        $context = $this->contextFor('P1', [], 10);
+        $context->set(MediaProcessor::CONTEXT_RESOLVED_FILES, [
+            'https://cdn/kept.jpg' => ['file' => self::FILE_B, 'message' => null, 'downloaded' => false],
+        ]);
+
+        $this->processor->cleanUpAfterRollback($context);
     }
 
     /**
@@ -1498,6 +1592,7 @@ class MediaProcessorTest extends TestCase
             $this->eavValue,
             $this->fileResolver,
             $config ?? $this->config,
+            $this->mediaCleanup,
             $this->logger
         );
     }

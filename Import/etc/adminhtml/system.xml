@@ -149,6 +149,19 @@
                     </depends>
                 </field>
             </group>
+            <!--
+                Its own group, NOT a field under "media": every field there depends on
+                media import being enabled, and a store that has turned import off
+                still wants the disk it already filled kept tidy.
+            -->
+            <group id="media_cleanup" translate="label" type="text" sortOrder="28" showInDefault="1">
+                <label>Media Cleanup</label>
+                <field id="owns_product_media" translate="label comment" type="select" sortOrder="10" showInDefault="1">
+                    <label>ReadyData Owns Product Media</label>
+                    <comment><![CDATA[Turn on only if <b>nothing but this importer</b> writes to pub/media/catalog/product. It then deletes a file as soon as it becomes unreferenced &mdash; when a feed detaches it, when a batch rolls back, and when a product is deleted &mdash; instead of leaving it on disk forever. A file another product still uses is never deleted. Leave this off if images also arrive through the admin or another integration: such a file may not be ours to remove. A reference inside CMS content cannot be detected either way, so a product image pasted into a page or block would be collected.]]></comment>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                </field>
+            </group>
             <group id="indexing" translate="label" type="text" sortOrder="30" showInDefault="1">
                 <label>Indexing &amp; Cache</label>
                 <field id="mode" translate="label comment" type="select" sortOrder="10" showInDefault="1">

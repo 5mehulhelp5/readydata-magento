@@ -390,11 +390,11 @@ class ImportEventDispatcherTest extends TestCase
             ],
         ];
         $context->set(MediaProcessor::CONTEXT_CHANGES, $changes);
-        $context->set(MediaProcessor::CONTEXT_RETAINED_FILES, [
-            '/s/h/shared.jpg',
-            '/a/a/a.jpg',
-            '/b/b/b.jpg',
-        ]);
+        // The removal union is MediaProcessor's to compute — the dispatcher only
+        // passes it through, so that both it and the cleanup hook act on one
+        // answer. MediaProcessorTest owns the "a file another product kept is
+        // withheld" rule.
+        $context->set(MediaProcessor::CONTEXT_REMOVED_FILES, ['/o/l/old.jpg']);
 
         $this->newDispatcher()->dispatchAfterCommit($context);
 
@@ -452,10 +452,13 @@ class ImportEventDispatcherTest extends TestCase
         $dispatcher->dispatchBeforeCommit($this->createContext(['SKU-A' => 10], existing: []));
     }
 
-    public function testRemovedFilesExcludeAFileTheBatchStillHolds(): void
+    /**
+     * The union arrives ready-made; what the dispatcher still owns is keeping
+     * the per-SKU delta exact next to it. SKU-A really did detach the shared
+     * file, and `changes` must say so even though the union withholds it.
+     */
+    public function testTheRemovalUnionIsPassedThroughWhileThePerSkuDeltaStaysExact(): void
     {
-        // SKU-A drops the shared file, SKU-B gains it. Purging it because it
-        // appeared in removed_files would delete a file the same batch needs.
         $context = $this->createContext(['SKU-A' => 10, 'SKU-B' => 20], existing: []);
         $context->set(MediaProcessor::CONTEXT_CHANGES, [
             'SKU-A' => [
@@ -475,7 +478,7 @@ class ImportEventDispatcherTest extends TestCase
                 'partial' => false,
             ],
         ]);
-        $context->set(MediaProcessor::CONTEXT_RETAINED_FILES, ['/s/h/shared.jpg']);
+        $context->set(MediaProcessor::CONTEXT_REMOVED_FILES, ['/g/o/gone.jpg']);
 
         $this->newDispatcher()->dispatchAfterCommit($context);
 

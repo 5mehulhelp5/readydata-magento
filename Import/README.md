@@ -1538,6 +1538,45 @@ The **Media Gallery** group governs the `media` block:
 | Re-Download Existing Files | off | Off makes re-imports do no network I/O at all. |
 | Auto-Assign Media Roles | on | See "Product media gallery" above. |
 
+### Media cleanup
+
+A group of its own rather than a field under *Media gallery*, because every
+field there depends on media **import** being enabled and a store that has
+turned import off still wants the disk it already filled kept tidy.
+
+| Setting | Default | Notes |
+|---|---|---|
+| ReadyData Owns Product Media | off | Turn on only if **nothing but this importer** writes to `pub/media/catalog/product`. |
+
+With it on, a file is deleted as soon as it stops being referenced, instead of
+accumulating forever. Three moments, which between them are the only ways this
+module can strand a file:
+
+- a feed **detaches** an image — cleaned up after the batch commits;
+- a batch **rolls back** after downloading — the files it fetched are discarded,
+  since downloads happen before the transaction opens and nothing will ever point
+  at them. Files it merely adopted from disk are left alone;
+- a product is **deleted** — its files go once the delete has committed. This one
+  also covers admin deletes, and the same setting registers core's own
+  `Gallery\DeleteHandler`, which Adobe wrote but never wired in, so the orphaned
+  gallery rows a delete leaves behind are cleared too.
+
+**A file another product still uses is never deleted.** Target paths are a
+deterministic function of the source URL, so two SKUs fed the same image URL
+share one file on disk; every deletion is checked against
+`MediaReferenceCheckerInterface` first.
+
+Two things to weigh before switching it on. A reference inside **CMS content**
+cannot be detected — a product image pasted into a page or block would be
+collected. And a concurrent import can adopt a file microseconds before it is
+deleted, leaving one product briefly showing a missing image; that repairs itself
+on the SKU's next feed run, because the path is deterministic and the file is
+simply fetched again.
+
+Cleanup never fails an import or a product delete: the work it follows has
+already committed, so a file that cannot be removed is logged and left. Nothing
+happens at all while the setting is off.
+
 ### Events
 
 Because the importer writes directly to the database, none of the usual

@@ -232,11 +232,9 @@ class ImportEventDispatcher
 
         $skuToId = [];
         $created = [];
-        $removed = [];
         foreach ($changes as $sku => $change) {
             $skuToId[(string)$sku] = $change['entity_id'];
             $created[] = $change['created'];
-            $removed[] = $change['removed'];
         }
 
         // The flat unions are for consumers working per file rather than per
@@ -245,16 +243,18 @@ class ImportEventDispatcher
         // another kept or gained is withheld from the removal union: it moved,
         // it is not gone, and purging it would break the product that has it.
         // The per-SKU "removed" stays exact — that one is per-product truth.
-        $retained = $context->get(MediaProcessor::CONTEXT_RETAINED_FILES, []);
+        //
+        // The removal union is taken from the context rather than recomputed:
+        // MediaProcessor publishes it because the cleanup hook needs the same
+        // answer, and two implementations of "what did this batch let go of"
+        // would eventually disagree.
 
         $this->eventManager->dispatch(self::EVENT_PRODUCT_MEDIA_CHANGED, [
             'store_id' => $context->getStoreId(),
             'changes' => $changes,
             'sku_to_id' => $skuToId,
             'created_files' => array_values(array_unique(array_merge(...$created))),
-            'removed_files' => array_values(
-                array_diff(array_unique(array_merge(...$removed)), $retained)
-            ),
+            'removed_files' => $context->get(MediaProcessor::CONTEXT_REMOVED_FILES, []),
         ]);
     }
 

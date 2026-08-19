@@ -12,6 +12,7 @@ use ReadyData\Import\Model\BatchContext;
 use ReadyData\Import\Model\Cache\AttributeMetadataCache;
 use ReadyData\Import\Model\Config;
 use ReadyData\Import\Model\ImportLocks;
+use ReadyData\Import\Model\Media\Cleanup\MediaCleanupService;
 use ReadyData\Import\Model\Media\FileResolver;
 use ReadyData\Import\Model\ResourceModel\EavValue;
 use ReadyData\Import\Model\ResourceModel\ProductEntity;
@@ -63,7 +64,7 @@ use ReadyData\Import\Model\ResourceModel\ProductMediaGallery;
  *    it touched, so the dispatcher can tell a genuine detachment from a file
  *    that merely moved between products.
  */
-class MediaProcessor implements ProcessorInterface, PreparableInterface, LockAwareInterface
+class MediaProcessor implements ProcessorInterface, PreparableInterface, LockAwareInterface, BatchCleanupInterface
 {
     public const CONTEXT_RESOLVED_FILES = 'media_resolved_files';
 
@@ -87,6 +88,18 @@ class MediaProcessor implements ProcessorInterface, PreparableInterface, LockAwa
      * gone. Says nothing about products the batch did not touch.
      */
     public const CONTEXT_RETAINED_FILES = 'media_retained_files';
+
+    /**
+     * Files this batch detached from every product that still has a claim on
+     * them — the deduplicated union, with anything another product in the same
+     * payload kept or gained already withheld.
+     *
+     * Computed once here rather than by each consumer, because there are now
+     * two (the media event and the cleanup hook) and a second implementation of
+     * "what did this batch actually let go of" is exactly the kind of duplicate
+     * that drifts.
+     */
+    public const CONTEXT_REMOVED_FILES = 'media_removed_files';
 
     public const MEDIA_GALLERY_CODE = 'media_gallery';
 
@@ -129,6 +142,7 @@ class MediaProcessor implements ProcessorInterface, PreparableInterface, LockAwa
         private readonly EavValue $eavValue,
         private readonly FileResolver $fileResolver,
         private readonly Config $config,
+        private readonly MediaCleanupService $mediaCleanup,
         private readonly Logger $logger
     ) {
     }
@@ -172,6 +186,61 @@ class MediaProcessor implements ProcessorInterface, PreparableInterface, LockAwa
      * can. Measured at 251 ms of hold — the cheapest of the four — so the
      * conservative answer is the affordable one.
      */
+    /**
+     * Delete the files this batch detached, if the store says they are ours.
+     *
+     * Runs after the commit and after the locks, which is the only safe moment:
+     * a file delete cannot be rolled back, so the database must already have
+     * decided. Uses the batch-level union rather than the per-SKU `removed`
+     * lists — the union already excludes a file another product in this payload
+     * kept or gained, whereas the per-SKU lists are deliberately exact and
+     * would delete a sibling's image.
+     *
+     * Products OUTSIDE the batch are invisible here, which is why the service
+     * runs a reference check before removing anything.
+     */
+    public function cleanUpAfterCommit(BatchContext $context): void
+    {
+        if (!$this->mediaCleanup->isEnabled()) {
+            return;
+        }
+
+        $removed = $context->get(self::CONTEXT_REMOVED_FILES, []);
+        if ($removed) {
+            $this->mediaCleanup->deleteUnreferenced($removed);
+        }
+    }
+
+    /**
+     * Discard what prepare() downloaded for a batch that then rolled back.
+     *
+     * Downloads happen before the transaction opens, so a failed batch leaves
+     * them on disk with no row anywhere pointing at them. Only the files this
+     * batch actually FETCHED are candidates: a local path, or one that
+     * skip-if-present adopted, was already there and is not ours to withdraw.
+     *
+     * The reference check still applies. Between the download and the rollback
+     * a concurrent batch may have resolved the same URL, found the file present,
+     * skipped its own download and bound a gallery row to it — in which case it
+     * is now referenced and stays.
+     */
+    public function cleanUpAfterRollback(BatchContext $context): void
+    {
+        if (!$this->mediaCleanup->isEnabled()) {
+            return;
+        }
+
+        $downloaded = [];
+        foreach ($context->get(self::CONTEXT_RESOLVED_FILES, []) as $result) {
+            if (!empty($result['downloaded']) && !empty($result['file'])) {
+                $downloaded[] = (string)$result['file'];
+            }
+        }
+        if ($downloaded) {
+            $this->mediaCleanup->deleteUnreferenced($downloaded);
+        }
+    }
+
     public function requiredLocks(BatchContext $context): array
     {
         foreach ($context->getValidProducts() as $product) {
@@ -394,6 +463,19 @@ class MediaProcessor implements ProcessorInterface, PreparableInterface, LockAwa
                     $rolePlans
                 ))
             ))));
+
+            // The removal union, minus everything still attached somewhere in
+            // this batch: a file one product dropped and another kept has moved,
+            // not gone. Products outside the batch are not visible here at all,
+            // which is why acting on this list requires a reference check.
+            $retained = $context->get(self::CONTEXT_RETAINED_FILES, []);
+            $removed = array_unique(array_merge(
+                ...array_values(array_map(
+                    static fn (array $change): array => $change['removed'],
+                    $changes
+                ))
+            ));
+            $context->set(self::CONTEXT_REMOVED_FILES, array_values(array_diff($removed, $retained)));
         }
     }
 

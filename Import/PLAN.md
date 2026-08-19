@@ -68,7 +68,10 @@ Model\ImportService (orchestrator)
         │      COMMIT / ROLLBACK      ─────────────────────────────────────
         │
         ├─ 5. release locks
-        └─ 6. dispatchAfterCommit()  catalog_product_save_commit_after +
+        ├─ 6. cleanUpAfterCommit() / cleanUpAfterRollback()  BatchCleanupInterface
+        │                    steps release what the transaction could not roll
+        │                    back. Outside the event layer on purpose (see §9.2)
+        └─ 7. dispatchAfterCommit()  catalog_product_save_commit_after +
                                      the batch-level readydata_import_* events
         │
         ▼
@@ -92,12 +95,14 @@ Design rules:
   the held-lock set, and a free-form data bag processors use to hand each other results).
   Processors never loop-query; they bulk-read and bulk-write.
 - Adding functionality later = adding a processor to the `di.xml` pool. No orchestrator
-  changes. Three opt-in interfaces extend a step beyond `process()`:
+  changes. Four opt-in interfaces extend a step beyond `process()`:
   **`PreparableInterface`** for work that must happen before the locks and the transaction
   (network, filesystem); **`LockAwareInterface`** for a step that performs an unkeyed
-  read-then-create and must declare which named lock covers it; and
+  read-then-create and must declare which named lock covers it;
   **`LockedPreparableInterface`** for a step whose write goes through a repository that
-  opens a transaction of its own, which cannot nest inside the batch's.
+  opens a transaction of its own, which cannot nest inside the batch's; and
+  **`BatchCleanupInterface`** for a step holding something the transaction cannot roll
+  back — today the media files a commit orphaned or a rollback stranded.
 - Each batch is one DB transaction: a failed batch rolls back and is reported; other
   batches proceed (configurable: fail-fast vs. continue). The transaction spans **every
   scope** a product names, so `continue_on_error` resumes at the next batch, never at the
@@ -310,6 +315,9 @@ app/code/ReadyData/                        # package + git root
     │                                      #   category, scoped-result and Amasty DTOs
     ├── Console/
     │   └── ReportOrphanMediaCommand.php   # readydata:media:report-orphans, read-only
+    ├── Observer/                          # §9.2, product-delete media cleanup
+    │   ├── CaptureProductMediaOnDelete.php    # reads paths before the transaction
+    │   └── CleanUpProductMediaAfterDelete.php # deletes after it commits
     ├── Model/
     │   ├── ProductImport.php              # Web API entry, thin
     │   ├── AttributeSync.php              #   "
@@ -332,6 +340,7 @@ app/code/ReadyData/                        # package + git root
     │   │   ├── PreparableInterface.php    # opt-in pre-lock, pre-transaction phase
     │   │   ├── LockAwareInterface.php     # opt-in "which lock will I need"
     │   │   ├── LockedPreparableInterface.php  # opt-in locked, pre-transaction phase
+    │   │   ├── BatchCleanupInterface.php  # opt-in post-commit/post-rollback release
     │   │   ├── AbstractPlaceholderProcessor.php   # base for inert steps; unused
     │   │   ├── AttributeProcessor.php     100
     │   │   ├── EntityProcessor.php        200
@@ -371,7 +380,9 @@ app/code/ReadyData/                        # package + git root
     │   │       ├── MediaPathNormalizer.php  # where disk and DB path forms meet
     │   │       ├── FileWalker.php           # per-directory descent, batched
     │   │       ├── OrphanScanner.php        # walk, then references; never reversed
-    │   │       └── OrphanReport.php
+    │   │       ├── OrphanReport.php
+    │   │       ├── MediaCleanupService.php  # §9.2: the ONE place a file is deleted
+    │   │       └── DeletedProductMedia.php  #   carries paths across a product delete
     │   ├── Category/
     │   │   ├── CategoryWriter.php         # the ONE creation path, store-0 emulated
     │   │   └── PathParser.php             # escaped-separator grammar
@@ -446,9 +457,15 @@ Built since, and never described by this plan until now:
    it answers how much of `pub/media/catalog/product` nothing points at, which is both
    the audit that §9.2's assumption still holds and the number that decides whether the
    existing backlog is worth clearing.
+10. **Media cleanup at source** — §9.2, the module's first observers and its fourth
+    opt-in processor interface (`BatchCleanupInterface`). Off by default behind
+    *ReadyData Owns Product Media*; when on, a file is deleted as soon as it stops
+    being referenced — on detach, on rollback, and on product delete — through one
+    `MediaCleanupService`. Also registers core's unwired `Gallery\DeleteHandler`.
 
 Still unbuilt: the delete endpoint, the async/queue mode and its status endpoint,
-integration tests, and the media cleanup of §9.2.
+integration tests, and §9.2's backlog mode (`--delete`), which waits on a production
+run of §9.1.
 
 ## 7. Known risks / decisions to revisit
 
@@ -903,8 +920,8 @@ answer the question within a day of merging.
 
 ### 9.2 Phase two: prevention at source
 
-Not written. It rests on an assumption the operator asserts rather than one the module
-infers: **nothing but this importer writes to `pub/media/catalog/product`.** Where that
+Built, except for the backlog mode below. It rests on an assumption the operator asserts
+rather than one the module infers: **nothing but this importer writes to `pub/media/catalog/product`.** Where that
 holds, an orphan is never a mystery to be discovered by sweeping — it is the direct result
 of an event the module itself just performed, and can be cleaned up in the same breath. One
 config flag, named after the assumption it encodes, enables the two hooks below; a store
@@ -1055,9 +1072,11 @@ And §9.1 keeps a job after §9.2 ships: it is the audit that proves prevention 
 its unreferenced count stops growing, the flag is doing what it claims. If it climbs,
 something is writing to `catalog/product` that the assumption says should not be.
 
-Roughly a day and a half with tests, plus half a day for the rollback path of 1b — which is
-optional only in the sense that without it §9.1's backlog mode has to keep clearing up after
-rolled-back batches forever.
+Implemented as `Model/Media/Cleanup/MediaCleanupService` behind
+`Model/Processor/BatchCleanupInterface` (post-commit and post-rollback, called from
+`ImportService`, deliberately not from the event dispatcher) and the two observers in
+`etc/events.xml`. The backlog mode remains unwritten and is blocked on a production run of
+§9.1 rather than on a decision.
 
 > **Keeping this document honest.** §1–§6 were rewritten against the code on
 > 2026-08-17, after the `[P]` markers and the single-endpoint framing had drifted

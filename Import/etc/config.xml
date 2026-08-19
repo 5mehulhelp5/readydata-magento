@@ -32,6 +32,9 @@
                 <redownload_existing>0</redownload_existing>
                 <auto_assign_roles>1</auto_assign_roles>
             </media>
+            <media_cleanup>
+                <owns_product_media>0</owns_product_media>
+            </media_cleanup>
             <indexing>
                 <mode>partial</mode>
                 <clean_cache>1</clean_cache>

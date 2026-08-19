@@ -102,8 +102,12 @@ class FileResolver
      * Resolve payload references to stored paths.
      *
      * @param string[] $references distinct payload values
-     * @return array<string, array{file: string|null, message: string|null}>
-     *         reference => stored path ("/a/b/file.jpg") or null plus the reason
+     * @return array<string, array{file: string|null, message: string|null, downloaded: bool}>
+     *         reference => stored path ("/a/b/file.jpg") or null plus the reason.
+     *         `downloaded` marks the ones this call actually FETCHED, as opposed
+     *         to a local path or a file skip-if-present adopted — the set a
+     *         rolled-back batch has to clean up, since nothing else will ever
+     *         point at them. See MediaProcessor::cleanUpAfterRollback().
      */
     public function resolve(array $references): array
     {
@@ -114,7 +118,7 @@ class FileResolver
             // the storefront while the gallery rows looked perfectly consistent.
             $message = 'Media import is not supported while database media storage is enabled.';
             foreach ($references as $reference) {
-                $results[$reference] = ['file' => null, 'message' => $message];
+                $results[$reference] = ['file' => null, 'message' => $message, 'downloaded' => false];
             }
             $this->logger->error($message);
 
@@ -179,6 +183,9 @@ class FileResolver
                             $error
                         )
                     );
+                    // Only this branch fetches anything: phase one either
+                    // resolved a local path or adopted a file already on disk.
+                    $results[$reference]['downloaded'] = $results[$reference]['file'] !== null;
                 }
             );
         }
@@ -192,14 +199,14 @@ class FileResolver
      * genuinely unexpected ones are additionally logged.
      *
      * @param callable(): (string|null) $resolve
-     * @return array{file: string|null, message: string|null}
+     * @return array{file: string|null, message: string|null, downloaded: bool}
      */
     private function guard(string $reference, callable $resolve): array
     {
         try {
-            return ['file' => $resolve(), 'message' => null];
+            return ['file' => $resolve(), 'message' => null, 'downloaded' => false];
         } catch (MediaReferenceException $e) {
-            return ['file' => null, 'message' => $e->getMessage()];
+            return ['file' => null, 'message' => $e->getMessage(), 'downloaded' => false];
         } catch (\Throwable $e) {
             $message = sprintf(
                 'Media reference "%s" could not be resolved: %s',
@@ -208,7 +215,7 @@ class FileResolver
             );
             $this->logger->warning($message, ['exception' => $e]);
 
-            return ['file' => null, 'message' => $message];
+            return ['file' => null, 'message' => $message, 'downloaded' => false];
         }
     }
 

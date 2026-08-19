@@ -24,6 +24,7 @@ use ReadyData\Import\Model\Exception\ImportLockedException;
 use ReadyData\Import\Model\Indexer\InvalidationHandler;
 use ReadyData\Import\Model\Processor\CategoryLinkProcessor;
 use ReadyData\Import\Model\Processor\LockAwareInterface;
+use ReadyData\Import\Model\Processor\BatchCleanupInterface;
 use ReadyData\Import\Model\Processor\LockedPreparableInterface;
 use ReadyData\Import\Model\Processor\PreparableInterface;
 use ReadyData\Import\Model\Processor\ProcessorInterface;
@@ -260,6 +261,14 @@ class ImportService
             $this->releaseLocks($locks);
         }
 
+        // Deliberately NOT inside dispatchAfterCommit(): that method returns
+        // early when product events are switched off, which is a setting about
+        // third-party observers. Releasing resources this batch acquired is our
+        // own business and must not vanish with the event layer. It also has no
+        // place behind the observer-failure guard, which exists for other
+        // people's code.
+        $this->runBatchCleanup($context, $committed);
+
         if ($committed) {
             // After the commit AND after the locks: an observer is someone
             // else's code doing an unknown amount of work, and everything this
@@ -424,6 +433,45 @@ class ImportService
                 sprintf('Post-import invalidation failed: %s', $e->getMessage()),
                 ['exception' => $e]
             );
+        }
+    }
+
+    /**
+     * Let every BatchCleanupInterface step release what the batch acquired
+     * outside the transaction — today, media files that a commit orphaned or a
+     * rollback stranded.
+     *
+     * Runs after the locks are released and whichever way the batch went, since
+     * a filesystem has no rollback and both outcomes leave something behind.
+     *
+     * Failures are swallowed on purpose. After a commit the products are saved
+     * and visible, and turning a tidying-up problem into a failed batch would
+     * misreport work that succeeded. After a rollback there is already a real
+     * error on its way to the caller, and replacing it with this one would hide
+     * the reason the batch failed.
+     */
+    private function runBatchCleanup(BatchContext $context, bool $committed): void
+    {
+        foreach ($this->processors as $processor) {
+            if (!$processor instanceof BatchCleanupInterface || !$processor->isEnabled()) {
+                continue;
+            }
+            try {
+                if ($committed) {
+                    $processor->cleanUpAfterCommit($context);
+                } else {
+                    $processor->cleanUpAfterRollback($context);
+                }
+            } catch (\Throwable $e) {
+                $this->logger->error(
+                    sprintf(
+                        'Batch cleanup after a %s batch failed: %s',
+                        $committed ? 'committed' : 'rolled-back',
+                        $e->getMessage()
+                    ),
+                    ['exception' => $e]
+                );
+            }
         }
     }
 

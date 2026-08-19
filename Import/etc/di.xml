@@ -125,6 +125,36 @@
         </arguments>
     </type>
 
+    <!--
+        Activates core's own Gallery\DeleteHandler, which Adobe wrote and never
+        registered: module-catalog's ExtensionPool lists gallery handlers under
+        read/create/update but has no `delete` entry, so deleting a product
+        cascades its _value and _value_to_entity rows away and leaves the main
+        catalog_product_entity_media_gallery row behind — its only foreign key is
+        on attribute_id. Those unbound rows are what make core's own
+        Gallery::countImageUses() report a deleted product's leftovers as live
+        uses, so clearing them is worth more than tidiness.
+
+        DeleteExtensions::execute() reads getActions($entityType, 'delete'), and
+        ResourceModel\Product::delete() does route through the EntityManager, so
+        this entry is all it takes. Nothing supplies `media_attribute_codes` on
+        delete, so only deleteGallery() runs — and nothing is lost by that,
+        because catalog_product_entity_varchar cascades on entity_id anyway.
+
+        Rows only. The FILES are the observers in etc/events.xml.
+    -->
+    <type name="Magento\Framework\EntityManager\Operation\ExtensionPool">
+        <arguments>
+            <argument name="extensionActions" xsi:type="array">
+                <item name="Magento\Catalog\Api\Data\ProductInterface" xsi:type="array">
+                    <item name="delete" xsi:type="array">
+                        <item name="mediaGalleryDelete" xsi:type="string">Magento\Catalog\Model\Product\Gallery\DeleteHandler</item>
+                    </item>
+                </item>
+            </argument>
+        </arguments>
+    </type>
+
     <!-- CLI -->
     <type name="Magento\Framework\Console\CommandListInterface">
         <arguments>
