@@ -376,7 +376,7 @@ app/code/ReadyData/                        # package + git root
     │   │   ├── DownloaderInterface.php
     │   │   ├── PooledDownloader.php       # bounded concurrent fetch (Guzzle Pool)
     │   │   ├── MediaReferenceChecker.php  # "still referenced?", for removed_files
-    │   │   └── Cleanup/                   # the §9.1 report; deletes nothing
+    │   │   └── Cleanup/                   # the §9.1 report and the §9.2 deleter
     │   │       ├── MediaPathNormalizer.php  # where disk and DB path forms meet
     │   │       ├── FileWalker.php           # per-directory descent, batched
     │   │       ├── OrphanScanner.php        # walk, then references; never reversed

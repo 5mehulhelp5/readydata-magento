@@ -301,32 +301,37 @@ class Config
     }
 
     /**
-     * Whether a URL is fetched again when its target file already exists. Off by
-     * default: skipping makes a re-import cost no network I/O at all, and makes
-     * a retry after a rolled-back batch converge on the same file.
-     */
-    /**
      * Whether this importer is the only thing that writes to
      * pub/media/catalog/product.
      *
      * An assertion the operator makes, not something the module can detect, and
      * the switch that lets it delete a file it has just made unreachable.
      *
-     * ON by default, because the module is deployed where the importer owns the
-     * catalogue and the alternative is a pile that only grows. TURN IT OFF on a
-     * store where images also arrive through the admin or another integration:
-     * a file this module stops referencing may still be someone else's, and the
-     * safe reading of "unreferenced" is then "leave it alone".
+     * OFF by default, and the default is the conservative one on purpose: a file
+     * this module stops referencing may still be someone else's, so on a store
+     * where images also arrive through the admin or another integration the safe
+     * reading of "unreferenced" is "leave it alone". TURN IT ON where the
+     * importer owns the catalogue and the alternative is a pile that only grows.
+     * Nothing is ever deleted while it is off — see MediaCleanupService.
      *
      * Deliberately its own group rather than a field under `media`: every field
      * there depends on media IMPORT being enabled, and a store that has turned
-     * import off still wants the disk it already filled kept tidy.
+     * import off still wants the disk it already filled kept tidy. That reach is
+     * real for the product-delete observers, which is where a store with import
+     * off still accumulates files; the batch hooks are gated on MediaProcessor
+     * being enabled anyway, and a batch that imported no media has nothing to
+     * clean up.
      */
     public function ownsProductMedia(): bool
     {
         return $this->scopeConfig->isSetFlag(self::XML_PATH_MEDIA_CLEANUP_OWNS_MEDIA);
     }
 
+    /**
+     * Whether a URL is fetched again when its target file already exists. Off by
+     * default: skipping makes a re-import cost no network I/O at all, and makes
+     * a retry after a rolled-back batch converge on the same file.
+     */
     public function isMediaRedownloadExisting(): bool
     {
         return $this->scopeConfig->isSetFlag(self::XML_PATH_MEDIA_REDOWNLOAD_EXISTING);

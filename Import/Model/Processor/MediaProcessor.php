@@ -223,6 +223,11 @@ class MediaProcessor implements ProcessorInterface, PreparableInterface, LockAwa
      * a concurrent batch may have resolved the same URL, found the file present,
      * skipped its own download and bound a gallery row to it — in which case it
      * is now referenced and stays.
+     *
+     * deleteAbandonedDownloads() rather than deleteUnreferenced(): these files
+     * were written minutes ago at most, so the grace period that protects the
+     * commit path would spare every one of them and nothing would ever be
+     * cleaned up. See that method for the window this accepts in exchange.
      */
     public function cleanUpAfterRollback(BatchContext $context): void
     {
@@ -237,7 +242,7 @@ class MediaProcessor implements ProcessorInterface, PreparableInterface, LockAwa
             }
         }
         if ($downloaded) {
-            $this->mediaCleanup->deleteUnreferenced($downloaded);
+            $this->mediaCleanup->deleteAbandonedDownloads($downloaded);
         }
     }
 

@@ -25,14 +25,29 @@ class MediaCleanupServiceTest extends TestCase
     private WriteInterface&MockObject $directory;
     private RemoveDeletedImagesFromCache&MockObject $cachePurge;
 
-    /** @var string[] paths that exist on the fake filesystem */
+    /**
+     * Old enough that the grace period never applies. Every test that is not
+     * about the grace period wants this.
+     */
+    private const LONG_AGO = 30 * 86400;
+
+    /** @var string[] files that exist on the fake filesystem */
     private array $existing = [];
+
+    /** @var string[] paths that exist but are directories */
+    private array $directories = [];
+
+    /** @var array<string, int> path => mtime, defaulting to LONG_AGO ago */
+    private array $mtimes = [];
 
     /** @var string[] paths delete() was called with */
     private array $deleted = [];
 
     /** @var string[] paths whose delete() throws */
     private array $undeletable = [];
+
+    /** @var string[] paths whose stat() throws */
+    private array $unstattable = [];
 
     protected function setUp(): void
     {
@@ -42,8 +57,19 @@ class MediaCleanupServiceTest extends TestCase
         $this->cachePurge = $this->createMock(RemoveDeletedImagesFromCache::class);
 
         $this->directory = $this->createMock(WriteInterface::class);
-        $this->directory->method('isExist')
+        $this->directory->method('isExist')->willReturnCallback(
+            fn (string $p): bool => in_array($p, $this->existing, true)
+                || in_array($p, $this->directories, true)
+        );
+        $this->directory->method('isFile')
             ->willReturnCallback(fn (string $p): bool => in_array($p, $this->existing, true));
+        $this->directory->method('stat')->willReturnCallback(function (string $p): array {
+            if (in_array($p, $this->unstattable, true)) {
+                throw new FileSystemException(__('cannot stat'));
+            }
+
+            return ['size' => 1024, 'mtime' => $this->mtimes[$p] ?? time() - self::LONG_AGO];
+        });
         $this->directory->method('delete')->willReturnCallback(function (string $p): bool {
             if (in_array($p, $this->undeletable, true)) {
                 throw new FileSystemException(__('permission denied'));
@@ -68,6 +94,7 @@ class MediaCleanupServiceTest extends TestCase
 
         self::assertFalse($service->isEnabled());
         self::assertSame([], $service->deleteUnreferenced(['/a/b/x.jpg']));
+        self::assertSame([], $service->deleteAbandonedDownloads(['/a/b/x.jpg']));
         self::assertSame([], $this->deleted);
     }
 
@@ -114,6 +141,90 @@ class MediaCleanupServiceTest extends TestCase
         $this->checker->expects(self::never())->method('getUnreferenced');
 
         self::assertSame([], $this->service()->deleteUnreferenced([]));
+    }
+
+    /**
+     * WriteInterface::delete() removes a directory RECURSIVELY and guards only
+     * the media root, so a stored path that names one would take the whole
+     * subtree. The reference check cannot catch it either: no gallery row ever
+     * equals a directory path, so every directory looks unreferenced.
+     */
+    public function testADirectoryIsRefusedRatherThanDeletedRecursively(): void
+    {
+        $this->directories = ['catalog/product/a'];
+        $this->checker->method('getUnreferenced')->willReturn(['/a']);
+
+        $logger = $this->createMock(Logger::class);
+        $logger->expects(self::once())->method('warning');
+
+        self::assertSame([], $this->service(null, $logger)->deleteUnreferenced(['/a']));
+        self::assertSame([], $this->deleted);
+    }
+
+    public function testADirectoryIsRefusedOnTheAbandonedDownloadPathToo(): void
+    {
+        $this->directories = ['catalog/product/a'];
+        $this->checker->method('getUnreferenced')->willReturn(['/a']);
+
+        self::assertSame([], $this->service()->deleteAbandonedDownloads(['/a']));
+        self::assertSame([], $this->deleted);
+    }
+
+    /**
+     * The reference check answers for the instant it runs. A concurrent batch
+     * that adopted this file during its unlocked prepare phase has not committed
+     * its gallery row yet, so deleting now would leave that row pointing at
+     * nothing — with no error anywhere.
+     */
+    public function testAFileWrittenInsideTheGracePeriodIsSpared(): void
+    {
+        $this->existing = ['catalog/product/a/b/fresh.jpg'];
+        $this->mtimes = ['catalog/product/a/b/fresh.jpg' => time() - 60];
+        $this->checker->method('getUnreferenced')->willReturn(['/a/b/fresh.jpg']);
+
+        self::assertSame([], $this->service()->deleteUnreferenced(['/a/b/fresh.jpg']));
+        self::assertSame([], $this->deleted);
+    }
+
+    public function testAFileOlderThanTheGracePeriodIsDeleted(): void
+    {
+        $this->existing = ['catalog/product/a/b/old.jpg'];
+        $this->mtimes = [
+            'catalog/product/a/b/old.jpg' => time() - MediaCleanupService::GRACE_PERIOD_SECONDS - 60,
+        ];
+        $this->checker->method('getUnreferenced')->willReturn(['/a/b/old.jpg']);
+
+        self::assertSame(['/a/b/old.jpg'], $this->service()->deleteUnreferenced(['/a/b/old.jpg']));
+    }
+
+    /**
+     * A rolled-back batch's downloads are seconds old by definition, so honouring
+     * the grace period there would spare every one of them and clean up nothing.
+     */
+    public function testAbandonedDownloadsAreDeletedHoweverRecentlyTheyWereWritten(): void
+    {
+        $this->existing = ['catalog/product/a/b/fresh.jpg'];
+        $this->mtimes = ['catalog/product/a/b/fresh.jpg' => time()];
+        $this->checker->method('getUnreferenced')->willReturn(['/a/b/fresh.jpg']);
+
+        self::assertSame(['/a/b/fresh.jpg'], $this->service()->deleteAbandonedDownloads(['/a/b/fresh.jpg']));
+        self::assertSame(['catalog/product/a/b/fresh.jpg'], $this->deleted);
+    }
+
+    /**
+     * An unreadable timestamp is not evidence of age. Same reading OrphanScanner
+     * gives an mtime of 0 when it buckets it as `unknown` rather than as the
+     * oldest files an operator would act on.
+     */
+    public function testAFileWhoseAgeCannotBeReadIsSpared(): void
+    {
+        $this->existing = ['catalog/product/a/b/x.jpg', 'catalog/product/a/b/y.jpg'];
+        $this->unstattable = ['catalog/product/a/b/x.jpg'];
+        $this->mtimes = ['catalog/product/a/b/y.jpg' => 0];
+        $this->checker->method('getUnreferenced')->willReturn(['/a/b/x.jpg', '/a/b/y.jpg']);
+
+        self::assertSame([], $this->service()->deleteUnreferenced(['/a/b/x.jpg', '/a/b/y.jpg']));
+        self::assertSame([], $this->deleted);
     }
 
     /**

@@ -149,6 +149,17 @@ class MediaOrphanScan
     /**
      * Read every reference source into the reference table.
      *
+     * Both passes filter on LENGTH(value), and the unit is why: the columns read
+     * from are varchar(255) — 255 CHARACTERS, up to 1020 bytes in utf8mb4 —
+     * while the reference table's key is VARBINARY(255), 255 bytes. Under
+     * SQL_MODE='' a longer value is not rejected but silently truncated, and a
+     * truncated key stops matching the path it came from. Excluding it instead
+     * keeps the two sides symmetrical: MediaPathNormalizer::exceedsColumnLimit()
+     * measures candidates in bytes too, so such a file is not a candidate
+     * either, and a path that is on neither side cannot be reported as an
+     * orphan. Only reachable with non-ASCII filenames long enough to exceed the
+     * byte limit while inside the character limit.
+     *
      * MUST run after the candidates are loaded, never before. References then
      * only grow relative to the disk snapshot, so a concurrent import skews
      * results toward "referenced"; the other order would report a file written
@@ -187,7 +198,8 @@ class MediaOrphanScan
             )
             ->columns(['path' => 'g.value', 'source' => new \Zend_Db_Expr((string)self::SOURCE_GALLERY)])
             ->where('g.value IS NOT NULL')
-            ->where("g.value != ''");
+            ->where("g.value != ''")
+            ->where('LENGTH(g.value) <= ?', self::pathLength());
 
         return $this->insertIgnoreFromSelect($select);
     }
@@ -211,7 +223,8 @@ class MediaOrphanScan
                 ->columns(['path' => 'v.value', 'source' => new \Zend_Db_Expr((string)self::SOURCE_ROLE)])
                 ->where('v.attribute_id IN (?)', $attributeIds)
                 ->where('v.value IS NOT NULL')
-                ->where("v.value != ''");
+                ->where("v.value != ''")
+                ->where('LENGTH(v.value) <= ?', self::pathLength());
 
             $inserted += $this->insertIgnoreFromSelect($select);
         }
@@ -447,8 +460,9 @@ class MediaOrphanScan
     }
 
     /**
-     * Both `value` columns compared against are varchar(255); matching that
-     * exactly is what makes an over-long path impossible rather than truncated.
+     * The byte width of both path columns, and the limit every value is filtered
+     * against before it is inserted — see loadReferences() for why a value that
+     * fits the source varchar(255) can still be too long for this.
      */
     private static function pathLength(): int
     {

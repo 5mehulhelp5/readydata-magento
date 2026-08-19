@@ -1566,12 +1566,21 @@ deterministic function of the source URL, so two SKUs fed the same image URL
 share one file on disk; every deletion is checked against
 `MediaReferenceCheckerInterface` first.
 
-Two things to weigh before switching it on. A reference inside **CMS content**
-cannot be detected — a product image pasted into a page or block would be
-collected. And a concurrent import can adopt a file microseconds before it is
-deleted, leaving one product briefly showing a missing image; that repairs itself
-on the SKU's next feed run, because the path is deterministic and the file is
-simply fetched again.
+**A file written in the last 15 minutes is never deleted either**, because the
+reference check answers only for the instant it runs. A concurrent import
+resolves an image URL during its unlocked download phase, finds the target
+already on disk, skips the fetch — and commits the gallery row that references it
+only after taking its locks and running its transaction. Deleting inside that
+window leaves a committed row pointing at nothing, with no error anywhere, so
+anything recent is left for the next pass instead. It costs nothing in the normal
+case: a file a feed detaches was written by an earlier import, so it is far older
+than the window. The exception is a rolled-back batch discarding its own
+downloads — those are seconds old by definition, so the window cannot apply to
+them, and that one narrow race remains.
+
+One thing left to weigh before switching it on: a reference inside **CMS
+content** cannot be detected, so a product image pasted into a page or block
+would be collected.
 
 Cleanup never fails an import or a product delete: the work it follows has
 already committed, so a file that cannot be removed is logged and left. Nothing
@@ -1698,19 +1707,26 @@ Two limits worth knowing before deleting anything on the strength of it. Only
 **product** references are visible: CMS pages and blocks, `{{media url=...}}` in
 a description, category images and third-party tables are not checked, so
 "unreferenced" is not "provably unused store-wide". And the answer is a
-point-in-time read taken outside any transaction. A concurrent import can adopt a
-file moments after this reports it unreferenced, by resolving it to the same
-deterministic path and skipping the download, so a caller that deletes on the
-strength of it can leave a committed gallery row pointing at a file that is gone.
-That window is seconds wide and repairs itself — the next import of that SKU finds
-the path absent and fetches it again — so the consequence is one product missing
-one image until its next feed run. Note also that deleting a source file leaves
+point-in-time read taken outside any transaction, so **it is not on its own a
+licence to delete**. A concurrent import can adopt a file moments after this
+reports it unreferenced, by resolving it to the same deterministic path and
+skipping the download; a caller that deletes on the strength of the check alone
+can leave a committed gallery row pointing at a file that is gone, and nothing
+errors when it does. The window spans that import's download-to-commit — long
+enough to matter, and it does not reliably repair itself, since only another feed
+run naming the same image would fetch the file again. This is why
+`MediaCleanupService` also refuses to delete anything written recently rather than
+trusting the check by itself; a caller of this interface that skips that
+protection is taking the risk on. Note also that deleting a source file leaves
 its resized renditions under `pub/media/catalog/product/cache` behind (core purges
 those separately, via
-`Magento\Catalog\Model\Product\Image\RemoveDeletedImagesFromCache`).
+`Magento\Catalog\Model\Product\Image\RemoveDeletedImagesFromCache`, which
+`MediaCleanupService` calls for what it deletes).
 
-The module itself never deletes a media file — see *Orphan media files* in
-`PLAN.md` for why that is a scoping decision rather than an omission.
+Deletion itself is `MediaCleanupService` and is gated on **ReadyData Owns Product
+Media** — see *Media cleanup* above. With that setting off, nothing in this module
+removes a media file, and *Orphan media files* in `PLAN.md` covers the rest of the
+disk it does not claim.
 
 ## Reporting unreferenced media
 

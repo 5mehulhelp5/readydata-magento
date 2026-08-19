@@ -164,6 +164,31 @@ class MediaOrphanScanTest extends TestCase
         self::assertSame([], $this->recordedCalls('joinLeft'));
     }
 
+    /**
+     * The source columns are varchar(255) — 255 CHARACTERS, up to 1020 bytes in
+     * utf8mb4 — and the reference key is VARBINARY(255), 255 bytes. Under
+     * SQL_MODE='' a longer value would be truncated on insert rather than
+     * rejected, and a truncated key stops matching the path it came from.
+     * Excluding it keeps both sides measured in bytes, as the candidate side
+     * already is.
+     */
+    public function testReferencesTooLongForTheKeyAreExcludedRatherThanTruncated(): void
+    {
+        $this->connection->method('query')->willReturn($this->statementMock());
+
+        $this->scan()->loadReferences();
+
+        $lengthFilters = array_values(array_filter(
+            $this->recordedCalls('where'),
+            static fn (array $args): bool => is_string($args[0]) && str_contains($args[0], 'LENGTH(')
+        ));
+
+        self::assertSame(
+            [['LENGTH(g.value) <= ?', 255], ['LENGTH(v.value) <= ?', 255]],
+            $lengthFilters
+        );
+    }
+
     public function testRoleAttributesAreGroupedByTheirBackendType(): void
     {
         $this->stubRoles(

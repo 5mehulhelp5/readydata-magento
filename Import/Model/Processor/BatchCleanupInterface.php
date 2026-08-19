@@ -10,7 +10,17 @@ use ReadyData\Import\Model\BatchContext;
 
 /**
  * A step that has resources to release once the batch has finished, whichever
- * way it finished.
+ * way it finished — but only once it has REACHED its transaction.
+ *
+ * A batch that fails earlier gets neither call. There are two such exits, both
+ * after the unlocked acquisition phase has already downloaded files:
+ * prepare() itself failing, and the batch being turned away because it cannot
+ * take its locks. That is deliberate rather than overlooked — ImportService
+ * documents the trade at processBatch(): acquisition is unlocked and first so a
+ * competing import waits for one transaction rather than a feed's worth of
+ * downloads, and the files a rejected request leaves behind are the ones its
+ * retry re-uses, since FileResolver maps a URL to a deterministic path. Anything
+ * a retry never comes back for is left to the orphan report.
  *
  * The fourth opt-in extension to {@see ProcessorInterface}, alongside
  * {@see PreparableInterface}, {@see LockAwareInterface} and

@@ -1479,6 +1479,7 @@ class MediaProcessorTest extends TestCase
     {
         $this->mediaCleanup->method('isEnabled')->willReturn(false);
         $this->mediaCleanup->expects(self::never())->method('deleteUnreferenced');
+        $this->mediaCleanup->expects(self::never())->method('deleteAbandonedDownloads');
 
         $context = $this->contextFor('P1', [], 10);
         $context->set(MediaProcessor::CONTEXT_REMOVED_FILES, [self::FILE_B]);
@@ -1504,11 +1505,16 @@ class MediaProcessorTest extends TestCase
      * A rolled-back batch has to discard what it FETCHED — not a local path, and
      * not a file that skip-if-present adopted, because those were already there
      * and are not ours to withdraw.
+     *
+     * Through deleteAbandonedDownloads(), not deleteUnreferenced(): a file this
+     * batch just downloaded is inside the grace period by definition, so the
+     * detach-path entry point would spare every one of them.
      */
     public function testCleanUpAfterRollbackDiscardsOnlyWhatThisBatchDownloaded(): void
     {
         $this->mediaCleanup->method('isEnabled')->willReturn(true);
-        $this->mediaCleanup->expects(self::once())->method('deleteUnreferenced')
+        $this->mediaCleanup->expects(self::never())->method('deleteUnreferenced');
+        $this->mediaCleanup->expects(self::once())->method('deleteAbandonedDownloads')
             ->with([self::FILE_A])
             ->willReturn([self::FILE_A]);
 
@@ -1525,7 +1531,7 @@ class MediaProcessorTest extends TestCase
     public function testCleanUpAfterRollbackDoesNothingWhenNothingWasDownloaded(): void
     {
         $this->mediaCleanup->method('isEnabled')->willReturn(true);
-        $this->mediaCleanup->expects(self::never())->method('deleteUnreferenced');
+        $this->mediaCleanup->expects(self::never())->method('deleteAbandonedDownloads');
 
         $context = $this->contextFor('P1', [], 10);
         $context->set(MediaProcessor::CONTEXT_RESOLVED_FILES, [

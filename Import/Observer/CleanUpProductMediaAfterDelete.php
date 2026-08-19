@@ -26,6 +26,10 @@ use ReadyData\Import\Model\Media\Cleanup\MediaCleanupService;
  * the same path on disk, so deleting one must not take the other's image with
  * it — which is exactly the case a per-product cleanup gets wrong if it trusts
  * "this product had it" to mean "nobody has it".
+ *
+ * Via deleteUnreferenced(), so the grace period applies: a file written moments
+ * ago may belong to an import that has not committed its gallery row yet, and a
+ * product delete has no way to tell.
  */
 class CleanUpProductMediaAfterDelete implements ObserverInterface
 {
