@@ -542,13 +542,18 @@ run of §9.1.
   not-visible cleanup that follows. `URL_REWRITE` serializes the concurrent case on a
   probe (new SKU, or a declared `url_key` differing from the stored one for that scope),
   and `append` re-checks its generated variant against the taken and claimed sets.
+  An appended path is now **queried before it is written** (§8.1): a second, conditional
+  `findConflicts()` probes the variants of every candidate whose collision is predictable,
+  and `firstFreeAppendage()` refuses a variant nobody asked about rather than writing it.
+  That was the one residual that could still produce a *wrong* answer rather than a
+  missing one — the victim of a takeover need not be in the feed, and a CMS page or a
+  product outside the imported subset does not heal on the next run.
+
   Residual, all bounded to "the last writer owns the path and the loser simply has no
   rewrite there", self-healing on that product's next import: non-ReadyData writers
   (admin save, CMS page, core's own generation) take no lock; two products with identical
   effective slugs concurrently gaining the same category can still collide on the shared
-  category-path rewrite; a deploy-overlap request takes no lock; and an `append` variant
-  can still hit a row the batch never queried — closing that last one needs the second
-  conflict lookup, which was deliberately deferred.
+  category-path rewrite; and a deploy-overlap request takes no lock.
 - **Async mode:** for very large feeds, accept-and-queue (bulk API pattern with
   `operation` status endpoint) is still the planned expansion. Nothing of it exists yet —
   the `products/delete` and `import/:id/status` routes sit commented out in
@@ -672,8 +677,36 @@ Deliberately **no `holdsLock()` degradation**, unlike every other lock-aware ste
 docblock says why: refusing the write would leave the product with no URL at all, because
 the step deletes its own rows before inserting.
 
-**Declined:** the transitional double-lock for deploy overlap, and the second
-`findConflicts()` over appended paths. Both are residuals in §7.
+**The second `findConflicts()` over appended paths is now shipped too**, having first been
+declined. The taken/claimed check above narrowed the hole without closing it: neither set
+contains an *invented* path, because an invented path is never in the list handed to the
+first lookup. So the append strategy still wrote exactly one unchecked path, and under
+ownership that is a takeover rather than a cross-wire — of a row whose owner may not be in
+the feed at all, which is what breaks the "self-healing on the next import" property the
+other residuals rely on.
+
+Two parts, because the query alone is not sufficient:
+
+- `probeAppendVariants()` collects the `MAX_APPEND_ATTEMPTS` variants of every candidate
+  whose collision is *predictable* — its path was reported by the first lookup, or an
+  earlier candidate already used that `(store, path)`. Both are decidable without replaying
+  the write loop, which matters because that loop emits per-SKU messages and fails SKUs; a
+  dry run would do so twice. One extra query, and **none at all** for a batch with nothing
+  to resolve, which is nearly all of them. Folding the variants into the first lookup
+  instead would widen every batch's `IN` list five-fold to serve the rare one.
+- `firstFreeAppendage()` now requires a variant to be **known free**, not merely
+  not-known-taken. One chain escapes the probe: a candidate whose own request path is the
+  variant an earlier candidate resolved to collides on `$claimed` alone, so its variants
+  were never queried. Refusing there costs that product its rewrite until its next import —
+  the benign class — where writing would not. `appendVariants()` is extracted so the probe
+  and the resolver cannot drift; a second implementation of that sequence would silently
+  defeat the check by asking about paths that are never returned.
+
+The escalation, if the refusal ever proves noisy, is an iterative probe that re-queries
+until the variant set stops growing. Not written: it buys a bounded extra query per round
+for a case this contrived.
+
+**Declined:** the transitional double-lock for deploy overlap. A residual in §7.
 
 ### 8.2 Category creation, decoupled
 

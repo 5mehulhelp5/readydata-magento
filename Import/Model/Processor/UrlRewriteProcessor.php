@@ -268,13 +268,46 @@ class UrlRewriteProcessor implements ProcessorInterface, LockAwareInterface
         $category = $this->buildCategoryCandidates($context, $skuByEntity, $urlKeys, $visibleEntitiesByStore);
 
         // Resolve conflicts (canonical first so it keeps the clean path), build rows.
+        $candidates = array_merge($canonical, $category);
         $allPaths = array_values(array_unique(array_map(
             static fn (array $c): string => $c['request_path'],
-            array_merge($canonical, $category)
+            $candidates
         )));
         $conflicts = $allPaths
             ? $this->urlRewriteResource->findConflicts($allPaths, $context->getValidEntityIds())
             : [];
+
+        // Every path whose database status is known, i.e. every path asked about.
+        // Not per store: findConflicts() filters on `request_path IN (...)` across
+        // all of them, so asking about a path answers it for every store.
+        $known = array_fill_keys($allPaths, true);
+
+        // The second conflict lookup. `append` is the only strategy that invents a
+        // path, and an invented path is never in $allPaths — so without this, the
+        // one path this step writes is the one it never checked, and the upsert's
+        // REPLACE_UPDATE_COLUMNS would take over whatever holds it.
+        //
+        // Only the variants of candidates that will actually collide are probed,
+        // which is nothing at all for the overwhelming majority of batches. The
+        // alternative — folding every candidate's variants into the first lookup —
+        // widens the IN list MAX_APPEND_ATTEMPTS-fold on every batch to serve the
+        // rare one.
+        if ($strategy === Config::URL_CONFLICT_APPEND) {
+            $variants = array_values(array_diff(
+                $this->probeAppendVariants($context, $candidates, $conflicts),
+                $allPaths
+            ));
+            if ($variants) {
+                $variantConflicts = $this->urlRewriteResource->findConflicts(
+                    $variants,
+                    $context->getValidEntityIds()
+                );
+                foreach ($variantConflicts as $storeId => $paths) {
+                    $conflicts[$storeId] = ($conflicts[$storeId] ?? []) + $paths;
+                }
+                $known += array_fill_keys($variants, true);
+            }
+        }
 
         $rows = [];
         $touchedEntityIds = [];
@@ -282,7 +315,7 @@ class UrlRewriteProcessor implements ProcessorInterface, LockAwareInterface
         $claimed = [];
         $finalByKey = [];
         $hasCategoryRows = false;
-        foreach (array_merge($canonical, $category) as $candidate) {
+        foreach ($candidates as $candidate) {
             $sku = $candidate['sku'];
             // A SKU failed during conflict resolution (error strategy) must not
             // still receive its remaining (e.g. category-path) rewrites.
@@ -302,7 +335,8 @@ class UrlRewriteProcessor implements ProcessorInterface, LockAwareInterface
                     // reported for this store, and what earlier candidates in
                     // this batch have claimed. The append strategy has to avoid
                     // both, or it hands back a path it never checked.
-                    ($conflicts[$storeId] ?? []) + ($claimed[$storeId] ?? [])
+                    ($conflicts[$storeId] ?? []) + ($claimed[$storeId] ?? []),
+                    $known
                 );
                 if ($requestPath === null) {
                     continue;
@@ -629,6 +663,8 @@ class UrlRewriteProcessor implements ProcessorInterface, LockAwareInterface
      * @param array<string, true> $taken request paths already spoken for in this
      *        store — the union of what the database reported and what earlier
      *        candidates in this batch have claimed
+     * @param array<string, true> $known every request path whose database status
+     *        was actually asked about, store-independent
      * @return string|null the request path to use, or null to skip this rewrite
      */
     private function resolveConflict(
@@ -637,11 +673,12 @@ class UrlRewriteProcessor implements ProcessorInterface, LockAwareInterface
         int $storeId,
         string $requestPath,
         string $strategy,
-        array $taken
+        array $taken,
+        array $known
     ): ?string {
         switch ($strategy) {
             case Config::URL_CONFLICT_APPEND:
-                $unique = $this->firstFreeAppendage($context, $sku, $storeId, $requestPath, $taken);
+                $unique = $this->firstFreeAppendage($context, $sku, $storeId, $requestPath, $taken, $known);
                 if ($unique === null) {
                     // Every candidate appendage was taken too. Skipping is the
                     // only honest outcome left: writing an unchecked path here
@@ -683,46 +720,114 @@ class UrlRewriteProcessor implements ProcessorInterface, LockAwareInterface
     }
 
     /**
-     * The first `<slug>-<entity_id>` variant of a taken path that nothing else
-     * has spoken for, or null when the bounded search is exhausted.
+     * The first `<slug>-<entity_id>` variant of a taken path that is KNOWN to be
+     * free, or null when the bounded search is exhausted.
      *
-     * The entity ID alone used to be assumed unique and was returned unchecked —
-     * the one path this step wrote having asked nothing about it, since an
-     * appended path is never in the set handed to findConflicts(). It usually IS
-     * unique, but it need not be: a product literally named "shirt-42" derives
-     * the same slug, and two candidates in one batch can both append to the same
-     * base. A discriminator is then added, bounded rather than unbounded because
-     * a caller that has collided this many times is sending data that needs
-     * fixing at the source, not a longer slug.
+     * The entity ID alone used to be assumed unique and was returned unchecked. It
+     * usually IS unique, but it need not be: a product literally named "shirt-42"
+     * derives the same slug, and two candidates in one batch can both append to
+     * the same base. A discriminator is then added, bounded rather than unbounded
+     * because a caller that has collided this many times is sending data that
+     * needs fixing at the source, not a longer slug.
      *
-     * $taken is checked, not re-queried: the database half of the answer arrived
-     * with findConflicts() and the batch half is $claimed. Paths taken by rows
-     * this batch never asked about remain possible, which is what the deferred
-     * second conflict lookup would close.
+     * Both conditions are load-bearing. `!isset($taken[...])` rules out the paths
+     * the database reported and the ones earlier candidates claimed;
+     * `isset($known[...])` additionally requires that somebody actually ASKED
+     * about the path. {@see probeAppendVariants()} makes that true for every
+     * variant of a candidate whose collision is predictable, which is all of them
+     * bar one chain: a candidate whose own request path is the variant an earlier
+     * candidate resolved to collides on $claimed alone, and its own variants were
+     * therefore never probed. Refusing there costs that product its rewrite until
+     * its next import — the same benign, self-healing outcome as every other
+     * residual in this area — where writing an unqueried path would take over
+     * whatever holds it, possibly a CMS page's or a product outside this feed's,
+     * neither of which heals.
      *
      * @param array<string, true> $taken
+     * @param array<string, true> $known
      */
     private function firstFreeAppendage(
         BatchContext $context,
         string $sku,
         int $storeId,
         string $requestPath,
-        array $taken
+        array $taken,
+        array $known
     ): ?string {
+        foreach ($this->appendVariants($context, $sku, $storeId, $requestPath) as $variant) {
+            if (!isset($taken[$variant]) && isset($known[$variant])) {
+                return $variant;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * The variants firstFreeAppendage() will consider, in the order it considers
+     * them. Its own generation logic, so the probe below and the resolver above
+     * cannot drift — a second implementation of this sequence would silently
+     * defeat the $known check by asking about paths that are never returned.
+     *
+     * @return string[]
+     */
+    private function appendVariants(
+        BatchContext $context,
+        string $sku,
+        int $storeId,
+        string $requestPath
+    ): array {
         $suffix = $this->urlRewriteResource->getProductUrlSuffix($storeId);
         $base = $suffix !== '' && str_ends_with($requestPath, $suffix)
             ? substr($requestPath, 0, -strlen($suffix))
             : $requestPath;
         $base .= '-' . $context->getEntityId($sku);
 
+        $variants = [];
         for ($attempt = 1; $attempt <= self::MAX_APPEND_ATTEMPTS; $attempt++) {
-            $candidate = ($attempt === 1 ? $base : $base . '-' . $attempt) . $suffix;
-            if (!isset($taken[$candidate])) {
-                return $candidate;
+            $variants[] = ($attempt === 1 ? $base : $base . '-' . $attempt) . $suffix;
+        }
+
+        return $variants;
+    }
+
+    /**
+     * Every appended path the write loop below could reach, for the second
+     * findConflicts() lookup.
+     *
+     * A candidate needs a variant exactly when its request path is already spoken
+     * for: reported by the first lookup for its store, or used by an earlier
+     * candidate for that same store. Both are decidable here without replaying the
+     * loop — which matters, because the loop reports per-SKU messages and fails
+     * SKUs, and a dry run of it would do so twice.
+     *
+     * Deliberately not filtered by $context->isFailed(): only the `error` strategy
+     * fails a SKU during resolution and this runs for `append` alone, so nothing is
+     * failed yet. Probing a path that turns out not to be needed costs one entry in
+     * an IN list.
+     *
+     * @param array<int, array<string, mixed>> $candidates
+     * @param array<int, array<string, true>> $conflicts store_id => taken paths
+     * @return string[] distinct paths
+     */
+    private function probeAppendVariants(BatchContext $context, array $candidates, array $conflicts): array
+    {
+        $seen = [];
+        $variants = [];
+        foreach ($candidates as $candidate) {
+            $storeId = $candidate['store_id'];
+            $requestPath = $candidate['request_path'];
+            $collides = isset($conflicts[$storeId][$requestPath]) || isset($seen[$storeId][$requestPath]);
+            $seen[$storeId][$requestPath] = true;
+            if (!$collides) {
+                continue;
+            }
+            foreach ($this->appendVariants($context, $candidate['sku'], $storeId, $requestPath) as $variant) {
+                $variants[$variant] = true;
             }
         }
 
-        return null;
+        return array_keys($variants);
     }
 
     public function isEnabled(): bool

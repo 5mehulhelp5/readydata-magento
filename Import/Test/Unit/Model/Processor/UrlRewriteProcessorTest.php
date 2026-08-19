@@ -47,6 +47,9 @@ class UrlRewriteProcessorTest extends TestCase
      */
     private ?array $deleted = null;
 
+    /** @var array<int, string[]> the request paths of each findConflicts() call, in order */
+    private array $conflictQueries = [];
+
     protected function setUp(): void
     {
         $this->urlRewriteResource = $this->createMock(UrlRewrite::class);
@@ -374,6 +377,191 @@ class UrlRewriteProcessorTest extends TestCase
         $context->set(WebsiteProcessor::CONTEXT_WEBSITE_IDS, $websiteIds);
 
         return $context;
+    }
+
+    // ---------------------------------------------------------------------
+    // The second conflict lookup. An appended path is never in the set handed
+    // to the first findConflicts(), so without a lookup of its own it is the
+    // one path this step writes having asked nothing about it — and since the
+    // upsert claims ownership, writing it takes over whatever holds it.
+    // ---------------------------------------------------------------------
+
+    /**
+     * The bug: the first variant is occupied by a row the batch never queried.
+     * Before the second lookup this wrote `shirt-8816.html` and took that row
+     * over — entity_id, entity_type and target included.
+     */
+    public function testAnAppendVariantOccupiedInTheDatabaseIsNotWritten(): void
+    {
+        $this->useConflicts([
+            [1 => ['shirt.html' => true]],
+            [1 => ['shirt-8816.html' => true]],
+        ]);
+
+        $this->processor->process($this->createContextPerSku(['SKU-A' => [8816, 'shirt']]));
+
+        self::assertNotNull($this->replaced);
+        $paths = array_column($this->replaced['rows'], 'request_path');
+        self::assertSame(['shirt-8816-2.html'], $paths);
+        self::assertNotContains('shirt-8816.html', $paths);
+    }
+
+    public function testTheSecondLookupAsksAboutExactlyTheVariantsItMightUse(): void
+    {
+        $this->useConflicts([[1 => ['shirt.html' => true]]]);
+
+        $this->processor->process($this->createContextPerSku(['SKU-A' => [8816, 'shirt']]));
+
+        self::assertCount(2, $this->conflictQueries);
+        self::assertSame(['shirt.html'], $this->conflictQueries[0]);
+        self::assertSame(
+            [
+                'shirt-8816.html',
+                'shirt-8816-2.html',
+                'shirt-8816-3.html',
+                'shirt-8816-4.html',
+                'shirt-8816-5.html',
+            ],
+            $this->conflictQueries[1]
+        );
+    }
+
+    /**
+     * The cost argument for probing only what collides: a batch with nothing to
+     * resolve must not pay for a second round trip.
+     */
+    public function testACleanBatchIssuesOnlyOneConflictLookup(): void
+    {
+        $this->useConflicts([]);
+
+        $this->processor->process($this->createContextPerSku(['SKU-A' => [8816, 'shirt']]));
+
+        self::assertCount(1, $this->conflictQueries);
+        // Nothing collided, so the clean path is kept — no appendage at all.
+        self::assertSame(['shirt.html'], array_column($this->replaced['rows'], 'request_path'));
+    }
+
+    /**
+     * Only `append` invents a path, so only `append` has anything to probe.
+     *
+     * @dataProvider nonAppendStrategyProvider
+     */
+    public function testANonAppendStrategyDoesNotProbeVariants(string $strategy): void
+    {
+        $this->config = $this->createMock(Config::class);
+        $this->config->method('getUrlRewriteConflictStrategy')->willReturn($strategy);
+        $this->useConflicts([[1 => ['shirt.html' => true]]]);
+
+        $this->processor->process($this->createContextPerSku(['SKU-A' => [8816, 'shirt']]));
+
+        self::assertCount(1, $this->conflictQueries);
+        self::assertNull($this->replaced);
+    }
+
+    /**
+     * @return array<string, array{0: string}>
+     */
+    public static function nonAppendStrategyProvider(): array
+    {
+        return [
+            'skip' => [Config::URL_CONFLICT_SKIP],
+            'error' => [Config::URL_CONFLICT_ERROR],
+        ];
+    }
+
+    /**
+     * The one chain the probe cannot predict, and the reason firstFreeAppendage()
+     * requires a variant to be KNOWN free rather than merely not-known-taken.
+     *
+     * SKU-A's slug is taken, so it appends to `shirt-8816.html` — which is
+     * SKU-B's own canonical path. B therefore collides on what A claimed, not on
+     * anything the probe saw, so B's own variants were never queried. Refusing
+     * costs B its rewrite until its next import; writing would have taken over
+     * whatever holds `shirt-8816-9000.html`.
+     */
+    public function testAVariantWhoseStatusWasNeverQueriedIsRefusedRatherThanWritten(): void
+    {
+        $this->useConflicts([[1 => ['shirt.html' => true]]]);
+
+        $context = $this->createContextPerSku([
+            'SKU-A' => [8816, 'shirt'],
+            'SKU-B' => [9000, 'shirt-8816'],
+        ]);
+        $this->processor->process($context);
+
+        self::assertNotNull($this->replaced);
+        $pathsByEntity = [];
+        foreach ($this->replaced['rows'] as $row) {
+            $pathsByEntity[$row['entity_id']] = $row['request_path'];
+        }
+        self::assertSame(['shirt-8816.html'], array_values($pathsByEntity));
+        self::assertArrayNotHasKey(9000, $pathsByEntity);
+        self::assertStringContainsString(
+            'no free variant was found',
+            $context->getMessages('SKU-B')[0]
+        );
+    }
+
+    /**
+     * Guards the extraction of appendVariants(): exhausting the bounded search
+     * must still skip with its own message rather than write an unchecked path.
+     */
+    public function testEveryVariantTakenSkipsTheRewrite(): void
+    {
+        $this->useConflicts([
+            [1 => ['shirt.html' => true]],
+            [1 => [
+                'shirt-8816.html' => true,
+                'shirt-8816-2.html' => true,
+                'shirt-8816-3.html' => true,
+                'shirt-8816-4.html' => true,
+                'shirt-8816-5.html' => true,
+            ]],
+        ]);
+
+        $context = $this->createContextPerSku(['SKU-A' => [8816, 'shirt']]);
+        $this->processor->process($context);
+
+        self::assertNull($this->replaced);
+        self::assertStringContainsString(
+            'no free variant was found',
+            $context->getMessages('SKU-A')[0]
+        );
+    }
+
+    /**
+     * Rebuilds the UrlRewrite mock with a scripted findConflicts(), recording
+     * each call's request paths. setUp() already stubs findConflicts() to [] and
+     * a mock's stubs cannot be replaced, so a test that needs conflicts needs a
+     * fresh mock.
+     *
+     * @param array<int, array<int, array<string, true>>> $responses one return
+     *        value per call, in order; missing entries answer []
+     */
+    private function useConflicts(array $responses): void
+    {
+        $this->conflictQueries = [];
+        $this->urlRewriteResource = $this->createMock(UrlRewrite::class);
+        $this->urlRewriteResource->method('getProductUrlSuffix')->willReturn('.html');
+        $this->urlRewriteResource->method('replaceProductRewrites')->willReturnCallback(
+            function (array $entityIds, array $storeIds, array $rows): void {
+                $this->replaced = ['entityIds' => $entityIds, 'storeIds' => $storeIds, 'rows' => $rows];
+            }
+        );
+        $this->urlRewriteResource->method('deleteAutogenerated')->willReturnCallback(
+            function (array $entityIds, array $storeIds): void {
+                $this->deleted = ['entityIds' => $entityIds, 'storeIds' => $storeIds];
+            }
+        );
+        $this->urlRewriteResource->method('findConflicts')->willReturnCallback(
+            function (array $requestPaths) use ($responses): array {
+                $this->conflictQueries[] = $requestPaths;
+
+                return $responses[count($this->conflictQueries) - 1] ?? [];
+            }
+        );
+
+        $this->rebuildProcessor();
     }
 
     /**

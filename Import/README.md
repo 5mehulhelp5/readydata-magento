@@ -723,9 +723,17 @@ mattered even without concurrency: a product adopting the slug of another produc
 in the same batch that just went *not visible* used to produce such a row, and the
 not-visible cleanup that runs immediately afterwards deletes by `entity_id`, so it
 removed the URL the batch had just created. `readydata_url_rewrite` then serializes
-the concurrent case, and the `append` strategy checks its generated
-`<slug>-<id>` variant against both the database's taken set and the paths this
-batch has already claimed instead of assuming it is free.
+the concurrent case.
+
+The `append` strategy no longer writes a path it has not checked. Its generated
+`<slug>-<id>` variant is checked against the database's taken set and the paths
+this batch has already claimed — and because an *invented* path is in neither by
+definition, a second, conditional `findConflicts()` asks about the variants first.
+Only candidates that will actually collide are probed, so a batch with nothing to
+resolve issues no extra query at all. Where even that cannot know — one product's
+canonical path being the variant another just resolved to — the rewrite is
+**skipped and reported** rather than written, which is why you may see a "no free
+variant was found" message where a path looked available.
 
 What remains, and is bounded to "the last writer owns the path, the other product
 simply has no rewrite there":
@@ -736,12 +744,11 @@ simply has no rewrite there":
   category can still collide on the shared category-path rewrite. Their canonical
   paths already collided, so the catalog already contained a duplicate-slug pair;
 - during a **deploy**, a request running the previous release does not take this
-  lock at all;
-- an `append` variant can still collide with a row this batch never asked about,
-  since only the paths it queried are known to be taken.
+  lock at all.
 
-None of these can corrupt a row any more; the next import of the losing product
-regenerates its rewrite through the ordinary conflict path.
+None of these can corrupt a row, and none can take over a row belonging to
+something outside the batch: the next import of the losing product regenerates its
+rewrite through the ordinary conflict path.
 
 ## Attribute definitions
 
